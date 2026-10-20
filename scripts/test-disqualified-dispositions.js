@@ -13,7 +13,8 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { planDisqualifiedCleanup, executeDisqualifiedCleanup, openEstimateAppointments, DISQUALIFIED_FIVE9_LISTS } =
+const { planDisqualifiedCleanup, executeDisqualifiedCleanup, openEstimateAppointments, DISQUALIFIED_FIVE9_LISTS,
+  dialListNames, resolveDisqualifiedFive9Lists, NON_DIAL_LIST_RX } =
   await import('../src/actions/handlers/disqualified-cleanup.js');
 const { buildMarkInvalidRows, AWE1_WORKFLOW_ID, REMINDER_TAGS } = await import('../src/appointments/mark-invalid.js');
 const { evaluateS52Entry } = await import('../src/s52-entry-gate.js');
@@ -21,6 +22,63 @@ const { evaluateS52Entry } = await import('../src/s52-entry-gate.js');
 const WE = 'aJj14ONxh1oFyDcQ706O';
 const AVILA = { lp_lead_id: '583486', disposition_code: 'ND', first_name: 'Maria', last_name: 'Avila', phone: '8135551234' };
 const appt = (over = {}) => ({ appointment_id: 'apptA', calendar_id: WE, status: 'new', start_time: '2026-10-20T10:00:00-04:00', ...over });
+
+// The live Five9 inventory shape, trimmed: two dialing lists, one texting list,
+// the inbound queue. A test NEVER reaches the real dialer.
+const STUB_LISTS = async () => ({ count: 4, lists: [
+  { name: 'LP_ASAP', size: 187360 }, { name: 'Data - Hot - STP less than 7', size: 101 },
+  { name: 'Simpletext_ASAP', size: 12 }, { name: 'Inbound Queue', size: 0 },
+] });
+
+// ── the live dialing-list resolution (2026-10-20) ──
+
+test('dialListNames keeps the dialing lists and drops texting and the inbound queue', () => {
+  const names = dialListNames({ lists: [
+    { name: 'LP_ASAP' }, { name: 'Simpletext_ASAP' }, { name: 'SimpleText-data' },
+    { name: 'Inbound Queue' }, { name: 'Data - Hot - ORL less than 7' }, { name: '  ' }, { name: null },
+  ] });
+  assert.deepEqual(names, ['LP_ASAP', 'Data - Hot - ORL less than 7']);
+  assert.deepEqual(dialListNames(null), []);
+  assert.deepEqual(dialListNames({}), []);
+  assert.ok(NON_DIAL_LIST_RX.test('SimpleText-data') && !NON_DIAL_LIST_RX.test('LP_ASAP'));
+});
+
+test('resolveDisqualifiedFive9Lists reads live, and falls back without throwing', async () => {
+  const live = await resolveDisqualifiedFive9Lists(STUB_LISTS);
+  assert.deepEqual([live.source, live.names], ['live', ['LP_ASAP', 'Data - Hot - STP less than 7']]);
+
+  // A SOAP fault must not fail the cleanup — the removal matters more than its reach.
+  const dead = await resolveDisqualifiedFive9Lists(async () => { throw new Error('is already locked'); });
+  assert.equal(dead.source, 'fallback');
+  assert.deepEqual(dead.names, [...DISQUALIFIED_FIVE9_LISTS]);
+  assert.match(dead.error, /already locked/);
+
+  // An empty read is a failed read, not "no lists".
+  const empty = await resolveDisqualifiedFive9Lists(async () => ({ lists: [] }));
+  assert.deepEqual([empty.source, empty.names.length], ['fallback', DISQUALIFIED_FIVE9_LISTS.length]);
+});
+
+test("the fallback names no list Five9 dropped — 'Data - Hot' faulted every removal to 2026-10-19", () => {
+  assert.ok(!DISQUALIFIED_FIVE9_LISTS.includes('Data - Hot'), "'Data - Hot' was split into Unmapped + 7 market lists");
+  assert.ok(DISQUALIFIED_FIVE9_LISTS.includes('Data - Hot - Unmapped'));
+  for (const mkt of ['FTL', 'STP', 'SAR', 'JAX', 'ORL', 'FTM', 'LKE']) {
+    assert.ok(DISQUALIFIED_FIVE9_LISTS.includes(`Data - Hot - ${mkt} less than 7`), `missing ${mkt}`);
+  }
+  assert.equal(new Set(DISQUALIFIED_FIVE9_LISTS).size, DISQUALIFIED_FIVE9_LISTS.length, 'no duplicates');
+});
+
+test('the handler names the LIVE lists on the queued removal, and says where they came from', async () => {
+  const db = fakeDb({ lead: AVILA });
+  const res = await executeDisqualifiedCleanup({ target_id: 'c1' }, {}, {
+    supabase: db, ghlFetch: async () => ({ contact: { tags: [], phone: '+18135551234' } }),
+    fetchUpcomingAppointments: async () => [], resolveWorkflowId: async () => null, env: {},
+    getListsInfo: STUB_LISTS,
+  });
+  const f9 = db.inserted.find((r) => r.action_type === 'five9_delete_record_from_list');
+  assert.deepEqual(f9.action_payload.list_names, ['LP_ASAP', 'Data - Hot - STP less than 7']);
+  assert.equal(f9.action_payload.list_source, 'live');
+  assert.deepEqual([res.five9_lists, res.five9_list_source], [2, 'live']);
+});
 
 test('mark_invalid: invalid status, then A.WE-1 out, then the reminder tags — in that order, never cancelled', () => {
   const rows = buildMarkInvalidRows({ contactId: 'c1', appointmentId: 'apptA', rule: 'X', why: 'test' });
@@ -160,6 +218,7 @@ test('handler re-reads the CURRENT lead: a lead that is no longer ND does nothin
   const db = fakeDb({ lead: { ...AVILA, disposition_code: 'Set' } });
   const res = await executeDisqualifiedCleanup({ target_id: 'c1' }, {}, {
     supabase: db, ghlFetch: async () => ({ contact: { tags: [] } }), fetchUpcomingAppointments: async () => [appt()],
+    getListsInfo: STUB_LISTS,
   });
   assert.equal(res.reason, 'current_lead_not_disqualified');
   assert.equal(db.inserted.length, 0);
@@ -169,6 +228,7 @@ test('handler: a failed appointment read throws (the executor retries), nothing 
   const db = fakeDb({ lead: AVILA });
   await assert.rejects(executeDisqualifiedCleanup({ target_id: 'c1' }, {}, {
     supabase: db, ghlFetch: async () => ({ contact: { tags: [] } }), fetchUpcomingAppointments: async () => null,
+    getListsInfo: STUB_LISTS,
   }), /appointment lookup failed/);
   assert.equal(db.inserted.length, 0);
 });
@@ -178,6 +238,7 @@ test('handler queues the full plan for a current ND lead', async () => {
   const res = await executeDisqualifiedCleanup({ target_id: 'c1', event_id: 9 }, {}, {
     supabase: db, ghlFetch: async () => ({ contact: { tags: ['active-s5.2'], phone: '+18135551234' } }),
     fetchUpcomingAppointments: async () => [appt()], resolveWorkflowId: async () => 'wf-s52', env: {},
+    getListsInfo: STUB_LISTS,
   });
   assert.equal(res.action, 'disqualified_cleanup_queued');
   assert.deepEqual(res.invalidated_appointments, ['apptA']);
