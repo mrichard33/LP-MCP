@@ -83,6 +83,7 @@ import { checkStageMoveEvidence } from '../stage-evidence.js';
 import { emitEvent } from '../../event-emitter.js';
 import { openJobValueForContact } from '../../lp-job-value.js';
 import { checkP2Win, pickOpenCard } from '../../p2-won-guard.js';
+import { removeFromCustomerWorkflows } from '../../p2-parity/customer-workflows.js';
 import { opportunitySourceField } from '../../lp-source-attribution.js';
 import {
   loadP2CreateContext, terminalGuardMode, eventJobIdForAction, readOppJobId, OPP_CF_LP_JOB_ID,
@@ -555,6 +556,13 @@ export async function executeUpdateOpportunity(action) {
     console.log(`[ActionExecutor] ✅ update_opportunity: opp ${oppId} updated — ${Object.keys(updateBody).join(', ')}`);
   }
 
+  // A P2 loss takes the customer out of C.0–C.5 (2026-10-20): GHL L.6 removes a lost
+  // customer from its marketing list, which has none of them. Fail-soft per workflow.
+  let cSeriesRemoved = null;
+  if (updateBody.status === 'lost' && oppPipelineId === PIPELINE_IDS.P2 && contactId && !isLPLeadId(contactId)) {
+    cSeriesRemoved = (await removeFromCustomerWorkflows(contactId)).removed.length;
+  }
+
   // Optionally update contact source (core field, not custom field)
   if (payload.contact_source && contactId && !isLPLeadId(contactId)) {
     await ghlFetch('PUT', `/contacts/${contactId}`, { source: payload.contact_source });
@@ -574,5 +582,6 @@ export async function executeUpdateOpportunity(action) {
     fields_updated: Object.keys(updateBody),
     contact_source_updated: !!payload.contact_source,
     contact_custom_fields_updated: payload.contact_custom_fields?.length || 0,
+    ...(cSeriesRemoved !== null ? { c_series_removed: cSeriesRemoved } : {}),
   };
 }

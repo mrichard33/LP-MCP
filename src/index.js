@@ -333,6 +333,7 @@ import { startOpsMorningDigestScheduler } from './jobs/ops-morning-digest.js';  
 import { startOfficePowerRankingScheduler } from './jobs/office-power-ranking.js';  // 2026-09-24
 import { startSaleBackstopScheduler } from './jobs/sale-announce-backstop.js';  // 2026-09-25
 import { startSaleP2BackstopScheduler } from './jobs/sale-p2-backstop.js';  // 2026-10-03 — every LP sale gets a P2 card
+import { startP2ParitySweepScheduler } from './jobs/p2-parity-sweep.js';  // 2026-10-20 — every P2 card matches LP
 // 2026-10-12 — marketing cost ledger (migration 20261012222106): invoice ingest, nightly costs, Brad-format report.
 import { registerMarketingInvoiceRoutes, invoiceBodyParser, INVOICE_INGEST_PATH } from './jobs/marketing-invoice-ingest.js';
 import { registerMarketingCostRoutes, startMarketingCostNightlyScheduler } from './jobs/marketing-cost-nightly.js';
@@ -1033,6 +1034,7 @@ const server = app.listen(PORT, async () => {
   startOfficePowerRankingScheduler();
   startSaleBackstopScheduler();
   startSaleP2BackstopScheduler();
+  startP2ParitySweepScheduler();
   startMarketingCostNightlyScheduler();
   startStaleLeadRefreshScheduler();
   startSaleContactBackstopScheduler();
