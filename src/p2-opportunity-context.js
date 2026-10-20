@@ -13,7 +13,7 @@
  */
 import { latestJob, latestJobValue, jobsForContact } from './lp-job-value.js';
 import { combinedSourceLabel } from './format-helpers.js';
-import { WON_JOB_STATUSES, LOST_JOB_STATUSES } from './lp-job-terminal.js';
+import { LOST_JOB_STATUSES, isWonJob } from './lp-job-terminal.js';
 
 const MODES = new Set(['off', 'shadow', 'enforce']);
 /** P2_TERMINAL_CREATE_GUARD_MODE — off | shadow (default) | enforce. Read per call. */
@@ -56,11 +56,12 @@ export function readOppJobId(opp) {
   return s === '' ? null : s;
 }
 
-const isTerminalStatus = (status) => WON_JOB_STATUSES.has(trimmed(status)) || LOST_JOB_STATUSES.has(trimmed(status));
+// Won needs the install too (isWonJob, 2026-10-20): a job paid in full before its
+// install is still live, so it keeps its open card and can still be tracked.
 const verdictFor = (job) => {
   if (!job) return 'no_job';
   const s = trimmed(job.job_status);
-  if (WON_JOB_STATUSES.has(s)) return 'terminal_won';
+  if (isWonJob(job)) return 'terminal_won';
   if (LOST_JOB_STATUSES.has(s)) return 'terminal_lost';
   return 'live';
 };
@@ -82,10 +83,10 @@ export function resolveTrackedJob({ jobs = [], stampedJobId = null, eventJobId =
   const latest = decidingJob(rows).job;
   let job = null; let via = 'none';
   if (stamped) { job = stamped; via = 'stamped'; }
-  else if (ev && !isTerminalStatus(ev.job_status)) { job = ev; via = 'event'; }
+  else if (ev && verdictFor(ev) === 'live') { job = ev; via = 'event'; }
   else if (latest) { job = latest; via = 'latest'; }
   else if (ev) { job = ev; via = 'event'; }
-  const otherJob = Boolean(ev && job && String(ev.lp_job_id) !== String(job.lp_job_id) && isTerminalStatus(ev.job_status));
+  const otherJob = Boolean(ev && job && String(ev.lp_job_id) !== String(job.lp_job_id) && verdictFor(ev) !== 'live');
   return { job, via, verdict: verdictFor(job), otherJob, eventJob: ev };
 }
 
@@ -201,10 +202,7 @@ export function decidingJob(jobs = []) {
     const newest = rows.reduce((a, b) => (jobIdOf(b) > jobIdOf(a) ? b : a), rows[0]);
     return { job: newest, verdict: 'terminal_lost' };
   }
-  const status = trimmed(live.job_status);
-  if (WON_JOB_STATUSES.has(status)) return { job: live, verdict: 'terminal_won' };
-  if (LOST_JOB_STATUSES.has(status)) return { job: live, verdict: 'terminal_lost' };
-  return { job: live, verdict: 'live' };
+  return { job: live, verdict: verdictFor(live) };
 }
 
 /** Pure. "Source, Subsource" of the lead that owns the job; single-label fallback when no job. */

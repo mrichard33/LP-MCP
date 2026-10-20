@@ -288,6 +288,34 @@ export function mapJobFields(job, existing = {}, now = new Date()) {
  * same keys, so a sparse return would fail the batch and drop the whole job's
  * milestones to the slow per-row fallback on every single sync.
  */
+/**
+ * The date the install finished, or null: an actual Install End (F) or Completion (C)
+ * date that has already PASSED. The same test jobStage() uses for 'complete'.
+ *
+ * Reads either milestone shape: LP's raw payload (`mdt_id` + `actdate`, what
+ * jobsForContact projects) or lp_job_milestones rows (`mdt_id` + `act_date`).
+ * A booked install (a future actdate) is not an install.
+ */
+export function installCompletedAt(job, now = new Date()) {
+  const cutoff = now.getTime();
+  for (const ms of getField(job, 'milestones', 'Milestones') || []) {
+    const code = trimOrNull(getField(ms, 'mdt_id', 'MDT_ID', 'MdtId'))
+      ?? INSTALL_DATETYPE_CODE[trimOrNull(getField(ms, 'datetype', 'DateType')) ?? ''] ?? null;
+    if (code !== MS_INSTALL_END && code !== MS_COMPLETION) continue;
+    // lp_job_milestones can hand back a bare 'YYYY-MM-DD'; LP sends a timestamp.
+    let raw = trimOrNull(getField(ms, 'actdate', 'ActDate', 'act_date'));
+    if (raw && /^\d{4}-\d{2}-\d{2}$/.test(raw)) raw = `${raw}T00:00:00`;
+    const date = plausibleActDate(raw, now);
+    const t = date ? Date.parse(date) : NaN;
+    if (!Number.isNaN(t) && t <= cutoff) return date;
+  }
+  return null;
+}
+
+// A milestone row without mdt_id (older fixtures, some report shapes) still names
+// its datetype.
+const INSTALL_DATETYPE_CODE = { 'Install End': MS_INSTALL_END, Completion: MS_COMPLETION };
+
 export function mapMilestoneChangeFields(ms, now = new Date()) {
   const by = trimOrNull(getField(ms, 'lastchangedby', 'LastChangedBy', 'last_changed_by'));
   let on = lpTimestamp(getField(ms, 'lastchangedon', 'LastChangedOn', 'last_changed_on'));

@@ -82,6 +82,7 @@ import { updateGHLContactFields } from '../../ghl.js';
 import { checkStageMoveEvidence } from '../stage-evidence.js';
 import { emitEvent } from '../../event-emitter.js';
 import { openJobValueForContact } from '../../lp-job-value.js';
+import { checkP2Win, pickOpenCard } from '../../p2-won-guard.js';
 import { opportunitySourceField } from '../../lp-source-attribution.js';
 import {
   loadP2CreateContext, terminalGuardMode, eventJobIdForAction, readOppJobId, OPP_CF_LP_JOB_ID,
@@ -470,6 +471,8 @@ export async function executeUpdateOpportunity(action) {
   const payload = action.action_payload || {};
 
   let oppId = payload.opportunity_id;
+  let opp = null;
+  const p2Win = payload.status === 'won';
 
   // If no direct opp ID, search by contact + pipeline
   if (!oppId) {
@@ -480,8 +483,41 @@ export async function executeUpdateOpportunity(action) {
 
     const searchRes = await ghlFetch('GET', `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
     const opps = searchRes?.opportunities || [];
+    if (opps.length === 0 && p2Win && pipelineId === PIPELINE_IDS.P2) {
+      // The install milestone rules close Won on every F/C/I/B, card or not.
+      return { skipped: true, reason: 'won_no_p2_card', contact_id: contactId };
+    }
     if (opps.length === 0) throw new Error(`No ${pipeline} opportunity found for contact ${contactId}`);
-    oppId = opps[0].id;
+    if (p2Win && pipelineId === PIPELINE_IDS.P2) {
+      // A win closes the OPEN card, never one already Won or Lost (2026-10-20).
+      opp = pickOpenCard(opps);
+      if (!opp) return { skipped: true, reason: 'won_no_open_p2_card', contact_id: contactId };
+    } else {
+      opp = opps[0];
+    }
+    oppId = opp.id;
+  } else if (p2Win && (!payload.pipeline || payload.pipeline === 'P2')) {
+    const res = await ghlFetch('GET', `/opportunities/${oppId}`);
+    opp = res?.opportunity || null;
+    if (!opp) throw new Error(`Opportunity ${oppId} not found`);
+  }
+
+  // A P2 card is Won only once its job is installed AND paid (the user, 2026-10-20).
+  // Rule 366 closed 106 cards Won before Install Completed on the job status alone.
+  // Fails closed: an unreadable job writes nothing. See src/p2-won-guard.js.
+  let wonStageId = null;
+  const oppPipelineId = opp?.pipelineId || (payload.pipeline ? PIPELINE_IDS[payload.pipeline] : null);
+  if (p2Win && opp && oppPipelineId === PIPELINE_IDS.P2) {
+    const verdict = await checkP2Win({ contactId: opp.contactId || contactId, opp });
+    if (!verdict.allow) {
+      console.log(`[ActionExecutor] ⏭️ update_opportunity: P2 won refused for opp ${oppId}: ${verdict.reason}`
+        + (verdict.job ? ` (job ${verdict.job.lp_job_id} ${verdict.job.job_status})` : ''));
+      return {
+        skipped: true, reason: verdict.reason, opportunity_id: oppId, contact_id: contactId,
+        lp_job_id: verdict.job?.lp_job_id ?? null, job_status: verdict.job?.job_status ?? null,
+      };
+    }
+    wonStageId = verdict.stageId;
   }
 
   // Build the update body — only include fields that are provided
@@ -493,6 +529,8 @@ export async function executeUpdateOpportunity(action) {
   if (payload.lostReasonId) updateBody.lostReasonId = payload.lostReasonId;
   if (payload.status) updateBody.status = payload.status;
   if (payload.name) updateBody.name = payload.name;
+  // An installed job's card belongs at Install Completed (forward only).
+  if (wonStageId) updateBody.pipelineStageId = wonStageId;
 
   // Freeze at the win, not before it (v5.2, 2026-08-31). This action type
   // passes payload.monetaryValue through verbatim and the loss/win rules do not

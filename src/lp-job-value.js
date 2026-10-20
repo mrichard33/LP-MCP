@@ -196,7 +196,10 @@ export async function jobsForContact(ghlContactId) {
   // in src/p2-opportunity-context.js needs to tell a real job from its
   // placeholder copy. JSON-path projection verified against this deployment
   // the same day (lp_jobs 58867 / 59236 → 2 payments vs 0).
-  const cols = 'lp_job_id, lp_lead_id, job_status, job_value, contractdate:raw_lp_data->>contractdate, '
+  // job_stage / install_completed_date (2026-10-20) feed isWonJob(): a P2 card is
+  // won only once the job is installed, not merely paid.
+  const cols = 'lp_job_id, lp_lead_id, job_status, job_value, job_stage, install_completed_date, '
+    + 'contractdate:raw_lp_data->>contractdate, '
     + 'payments:raw_lp_data->payments, milestones:raw_lp_data->milestones';
 
   const { data: leads, error: leadErr } = await supabase.from('lp_leads')

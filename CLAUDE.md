@@ -1007,6 +1007,21 @@ kinds, so a wide `since` can fill live jobs without minting Won/Lost cards for s
 half of `checkLeadTriggers`: its filter never matched, and a "fixed" one would onboard every historical
 sale.
 
+**A P2 card is Won only once the job is installed AND paid (the user, 2026-10-20).** "The only time an opportunity in
+pipeline 2 should be considered won is if the project is installed." Rule 366 `P2_JOB_TERMINAL_WON` closed cards Won on
+the job status alone (Paid In Full, PIF Survey Ready, PIF NO Survey, Assumed Complete) and left the stage: 106 Won cards
+sat before "7. Install Completed". `isWonJob` (`src/lp-job-terminal.js`: a collected status AND `isInstalled`, a passed
+Install End (F) or Completion (C) date, `job_stage` 'complete' or a passed `install_completed_date`; `install_completed`
+is never written) is the one test, used by `decidingJob` (so the sale backstop's `create_won` and the create guard), the
+reconciler, and the executor guard `decideP2Win` (`src/p2-won-guard.js`), which every P2 `update_opportunity` won runs
+through: it refuses (`skipped`, `won_before_install` / `won_job_not_collected` / `won_no_lp_job` / `won_jobs_unreadable`,
+fail closed), closes only the OPEN card, and moves it forward to Install Completed. Installed & Unpaid stays open until
+paid. A job paid before its install is won when the install lands: the F/C/I/B milestone rules carry a win step
+AFTER their move (`sql/seeds/2026-10-20_p2_won_requires_install.sql`), so the card enters Install Completed open
+and GHL C.2 (stage 7 AND status open) still starts; a separate win rule would race the move. Backlog:
+`scripts/repair-p2-won-before-install.js` (dry run default). GHL's C.4 Review Solicitation fires 14 days after a card
+reaches Install Completed with no status condition, so moving long-installed customers there can send a review ask.
+
 **Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; `supabase/migrations/20261012222106_158_marketing_cost_ledger.sql`).** Report 136 and LP cost entry
 are retired: nobody types a cost into LP again, and no code reads `mcost_cents` for a cost. The money lives in
 `marketing_expenses` (invoice lines, Lead Gurus feed days, commission rules) and is split per month and market in
