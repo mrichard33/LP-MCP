@@ -29,6 +29,7 @@ import { buildMilestoneStageMap } from '../p2-milestone-map.js';
 import { readOppJobId } from '../p2-opportunity-context.js';
 import { PIPELINE_IDS } from '../actions/constants.js';
 import { removeFromCustomerWorkflows } from './customer-workflows.js';
+import { selectAllIn } from '../supabase-page.js';
 
 export const HEAL_TAG = 'p2-stage-heal';
 export const SETTLE_MS = 30 * 60 * 1000;
@@ -109,30 +110,29 @@ export async function readJobsByContact({ supabase }, contactIds) {
     if (!byContact.has(cid)) byContact.set(cid, new Map());
     byContact.get(cid).set(String(j.lp_job_id), j);
   };
+  // Every read is PAGED (selectAllIn: an exact count, ordered pages, a short read
+  // throws). The first live day (2026-10-20) read lp_job_milestones in unpaged chunks
+  // of 150 jobs: PostgREST caps a response at 1,000 rows and the rows came back in no
+  // order, so each pass dropped a different random set of milestones and about 15
+  // cards went Install Completed -> Referral -> Install Completed every 30 minutes.
+  const read = (table, columns, column, values, orderBy, refine) =>
+    selectAllIn(supabase, table, { columns, column, values, orderBy, refine, chunkKeys: CHUNK });
+  for (const j of await read('lp_jobs', cols, 'ghl_contact_id', contactIds, 'lp_job_id')) add(j.ghl_contact_id, j);
   const leadContact = new Map();
-  for (let i = 0; i < contactIds.length; i += CHUNK) {
-    const chunk = contactIds.slice(i, i + CHUNK);
-    for (const j of must(await supabase.from('lp_jobs').select(cols).in('ghl_contact_id', chunk), 'lp_jobs by contact')) add(j.ghl_contact_id, j);
-    for (const l of must(await supabase.from('lp_leads').select('lp_lead_id, ghl_contact_id').in('ghl_contact_id', chunk), 'lp_leads by contact')) {
-      leadContact.set(String(l.lp_lead_id), l.ghl_contact_id);
-    }
+  for (const l of await read('lp_leads', 'lp_lead_id, ghl_contact_id', 'ghl_contact_id', contactIds, 'lp_lead_id')) {
+    leadContact.set(String(l.lp_lead_id), l.ghl_contact_id);
   }
-  const leadIds = [...leadContact.keys()];
-  for (let i = 0; i < leadIds.length; i += CHUNK) {
-    for (const j of must(await supabase.from('lp_jobs').select(cols).in('lp_lead_id', leadIds.slice(i, i + CHUNK)), 'lp_jobs by lead')) {
-      add(leadContact.get(String(j.lp_lead_id)), j);
-    }
+  for (const j of await read('lp_jobs', cols, 'lp_lead_id', [...leadContact.keys()], 'lp_job_id')) {
+    add(leadContact.get(String(j.lp_lead_id)), j);
   }
   const jobIds = [...new Set([...byContact.values()].flatMap((m) => [...m.keys()]))];
   const tableMs = new Map();
-  for (let i = 0; i < jobIds.length; i += CHUNK) {
-    const rows = must(await supabase.from('lp_job_milestones').select('lp_job_id, mdt_id, act_date')
-      .in('lp_job_id', jobIds.slice(i, i + CHUNK)).not('act_date', 'is', null), 'lp_job_milestones');
-    for (const m of rows) {
-      const k = String(m.lp_job_id);
-      if (!tableMs.has(k)) tableMs.set(k, []);
-      tableMs.get(k).push({ mdt_id: m.mdt_id, act_date: m.act_date });
-    }
+  const msRows = await read('lp_job_milestones', 'id, lp_job_id, mdt_id, act_date', 'lp_job_id', jobIds, 'id',
+    (q) => q.not('act_date', 'is', null));
+  for (const m of msRows) {
+    const k = String(m.lp_job_id);
+    if (!tableMs.has(k)) tableMs.set(k, []);
+    tableMs.get(k).push({ mdt_id: m.mdt_id, act_date: m.act_date });
   }
   const out = new Map();
   for (const [cid, jobs] of byContact) {
