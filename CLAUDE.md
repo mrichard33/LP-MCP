@@ -868,9 +868,11 @@ synced and pushed to GHL as before). `POST /webhooks/revin` (`src/revin/webhook.
 ## Call Intelligence audio comes from Five9 when the archive is down (2026-10-20)
 
 ETG's SFTP archive (nas1.etgts.com:2282) has reset every connection since 2026-09-28. `CI_RECORDING_SOURCE=five9_api`
-switches the fetch stage to `src/ci/five9-recordings.js`. That module runs the saved report `CI Call Recordings` (data
-source "Call Recording", built by Mark in the VCC UI) once per date per tick, and downloads through the Five9 REST API
-(`src/ci/five9-rest.js`). Anything else, unset included, is `sftp`. The SFTP adapter stays as the fallback.
+switches the fetch stage to `src/ci/five9-recordings.js`. That module runs the saved report `CI Call Recordings` once per
+date per tick, and downloads through the Five9 REST API (`src/ci/five9-rest.js`). This domain has NO "Call Recording"
+data source, so the report is built on **Call Log**: CALL ID, SESSION ID, RECORDINGS, CAMPAIGN, CALL TYPE, AGENT, AGENT ID,
+ANI, DNIS, TIMESTAMP. There is no RECORDING ID field, so the SESSION ID is the download key (a RECORDING ID column wins
+if a report ever has one), and a row with an empty RECORDINGS cell was never recorded and is skipped (`not_recorded`). Anything else, unset included, is `sftp`. The SFTP adapter stays as the fallback.
 `createRecordingAdapter` is the one place either is built.
 - **Never write to Five9 from it.** It only lists and downloads. Never change the VCC recordings server or a campaign's
   FTP setting: in Five9 a campaign FTP REPLACES the domain one and would cut GoCloud off.

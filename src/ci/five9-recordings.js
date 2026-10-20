@@ -38,7 +38,7 @@ import { getConfig } from './config.js';
 import { createSftpAdapter, FORBIDDEN_OPS, FFMPEG_BIN } from './recordings.js';
 import { classifyExclusion, DEFAULT_EXCLUDED_IVR_MODULES, isSkippedDir } from './filenames.js';
 import { parseDateDir, parsePacificReportTimestamp, last4 } from './time.js';
-import { customerNumberFor, durationToSeconds } from './discovery.js';
+import { customerNumberFor, durationToSeconds, parseRecordingSegments } from './discovery.js';
 import { parseReportTimestamp, toReportCriteriaString, cellText } from '../five9/call-journey.js';
 import { runReportAndWait } from '../five9-admin.js';
 import { createFive9RestClient, sourceOutageError } from './five9-rest.js';
@@ -82,10 +82,23 @@ export const RECORDING_COLUMNS = Object.freeze({
   duration: ['length', 'duration', 'recording length', 'recording duration'],
   fileBytes: ['file size', 'size', 'file_size', 'bytes'],
   callType: ['call type', 'type', 'direction'],
+  // The Call Log's RECORDINGS cell: one 'HH:MM:SS(M:SS)' segment per
+  // recording, empty when the call was not recorded.
+  recordings: ['recordings'],
 });
 
-/** Without these a row cannot be keyed, timed, filed or downloaded. */
-export const REQUIRED_RECORDING_COLUMNS = Object.freeze(['callId', 'recordingId', 'campaign', 'timestamp']);
+/**
+ * Without these a row cannot be keyed, timed or filed. The download key is
+ * checked separately: RECORDING ID or, failing that, SESSION ID.
+ *
+ * 2026-10-20: this domain has no "Call Recording" data source (the custom
+ * report wizard offers Call Log, Call Segment, … but not it), so the report
+ * is built on CALL LOG, which has CALL ID, SESSION ID and RECORDINGS and no
+ * RECORDING ID. The archive's old filenames carried the same 32-character
+ * session id, so it is the key we have; GET /ci/five9-recording-probe is
+ * what proves Five9's stream accepts it before the source is switched on.
+ */
+export const REQUIRED_RECORDING_COLUMNS = Object.freeze(['callId', 'campaign', 'timestamp']);
 
 /**
  * Report headers → column indexes. Pure.
@@ -107,6 +120,7 @@ export function resolveRecordingColumns(columns) {
     if (at >= 0) { index[field] = at; taken.add(at); }
   }
   const missing = REQUIRED_RECORDING_COLUMNS.filter((f) => index[f] === undefined);
+  if (index.recordingId === undefined && index.sessionId === undefined) missing.push('recordingId or sessionId');
   return { index, missing };
 }
 
@@ -156,10 +170,16 @@ export function descriptorFromRow(cells, index, { cfg = getConfig(), dateDir, ex
   const get = (field) => (index[field] === undefined ? null : cellText(cells?.[index[field]]));
 
   const five9CallId = get('callId');
-  const five9RecordingId = get('recordingId');
+  // RECORDING ID when the report has one, else the SESSION ID (Call Log).
+  const five9RecordingId = get('recordingId') || get('sessionId');
+  const recordingIdSource = get('recordingId') ? 'recording_id' : 'session_id';
   const campaignDir = get('campaign');
   const tsText = get('timestamp');
+  // A Call Log row with an empty RECORDINGS cell was never recorded: there is
+  // nothing to download, and asking for it would only be a 404 per call.
+  const segments = index.recordings === undefined ? null : parseRecordingSegments(get('recordings'));
   if (!five9CallId) return { reject: 'no_call_id' };
+  if (segments && segments.length === 0) return { reject: 'not_recorded' };
   if (!five9RecordingId) return { reject: 'no_recording_id' };
   if (!campaignDir) return { reject: 'no_campaign' };
   const recordedAt = parseRecordingTimestamp(tsText, cfg.five9Api.reportTz);
@@ -168,7 +188,12 @@ export function descriptorFromRow(cells, index, { cfg = getConfig(), dateDir, ex
   const callType = get('callType');
   const ani = customerNumberForRecording({ callType, ani: get('ani'), dnis: get('dnis') });
   const fileBytes = sizeToBytes(get('fileBytes'));
-  const durationSeconds = durationToSeconds(get('duration'));
+  // Recorded seconds from the RECORDINGS segments when the report has them
+  // (the length of the audio, not of the call), else the duration column.
+  const segmentSeconds = segments
+    ? segments.reduce((sum, seg) => sum + (durationToSeconds(seg.duration) ?? 0), 0)
+    : null;
+  const durationSeconds = segmentSeconds || durationToSeconds(get('duration'));
 
   // Campaign case is kept EXACTLY: near-duplicate campaigns differ only by
   // case, and candidateDistanceSeconds compares without folding.
@@ -200,6 +225,8 @@ export function descriptorFromRow(cells, index, { cfg = getConfig(), dateDir, ex
       five9CallId,
       five9SessionId: get('sessionId'),
       five9RecordingId,
+      recordingIdSource,
+      recordingSegments: segments ? segments.length : null,
       agentFive9Id: get('agentFive9Id'),
     },
   };
@@ -570,6 +597,15 @@ export function describeDownload({ status, contentType, buffer }) {
 }
 
 /**
+ * The newest recording worth testing a download on: not excluded, and at least
+ * 30 seconds of audio when there is one (a 3-second hang-up proves little).
+ */
+function newestUsable(rows) {
+  const usable = [...rows].filter((r) => !r.excluded).sort((a, b) => b.recordedAt - a.recordedAt);
+  return usable.find((r) => (r.durationSeconds ?? 0) >= 30) || usable[0] || null;
+}
+
+/**
  * GET /ci/five9-recording-probe — the handoff's Phase 0.4, run against the
  * deployed service because that is where the Five9 credential lives.
  *
@@ -604,7 +640,7 @@ export async function probeFive9Recording({ cfg = getConfig(), date, recordingId
 
   const pick = rows.find((r) => (recordingId && r.five9RecordingId === String(recordingId))
       || (five9CallId && r.five9CallId === String(five9CallId)))
-    || (!recordingId && !five9CallId ? [...rows].filter((r) => !r.excluded).sort((a, b) => b.recordedAt - a.recordedAt)[0] : null);
+    || (!recordingId && !five9CallId ? newestUsable(rows) : null);
   if (!pick) return { ...out, stage: 'pick', error: 'no matching recording in that day\'s report' };
 
   out.picked = {
@@ -616,6 +652,8 @@ export async function probeFive9Recording({ cfg = getConfig(), date, recordingId
     age_hours: Math.round((nowMs - pick.recordedAt.getTime()) / 3600000),
     duration_seconds: pick.durationSeconds,
     file_bytes: pick.fileBytes,
+    recording_id_source: pick.recordingIdSource,
+    recording_segments: pick.recordingSegments,
   };
 
   const variants = [

@@ -104,7 +104,7 @@ test('columns resolve by name, AGENT and AGENT ID kept apart; missing required c
   assert.equal(IDX.agentFive9Id, 5);
   assert.equal(IDX.recordingId, 2);
   const { missing } = resolveRecordingColumns(['CAMPAIGN', 'TIMESTAMP']);
-  assert.deepEqual(missing.sort(), ['callId', 'recordingId']);
+  assert.deepEqual(missing.sort(), ['callId', 'recordingId or sessionId']);
 });
 
 test('customer number: ANI on inbound, DNIS on outbound, nothing when the direction is unknown and they differ', () => {
@@ -138,7 +138,11 @@ test('report clock is Pacific: PDT in October, PST in December', () => {
 test('unusable rows are rejected, never guessed', () => {
   assert.equal(descriptorFromRow(row({ ts: 'yesterday-ish' }), IDX, { cfg: FIVE9 }).reject, 'unparseable_timestamp');
   assert.equal(descriptorFromRow(row({ callId: '' }), IDX, { cfg: FIVE9 }).reject, 'no_call_id');
-  assert.equal(descriptorFromRow(row({ recId: '[None]' }), IDX, { cfg: FIVE9 }).reject, 'no_recording_id');
+  // An empty RECORDING ID falls back to the SESSION ID; with neither, no row.
+  assert.equal(descriptorFromRow(row({ recId: '[None]' }), IDX, { cfg: FIVE9 }).descriptor.five9RecordingId, 'S1');
+  const noIds = row({ recId: '[None]' });
+  noIds[1] = null;
+  assert.equal(descriptorFromRow(noIds, IDX, { cfg: FIVE9 }).reject, 'no_recording_id');
 });
 
 test('a tiny file is excluded like the SFTP crawl excludes it', () => {
@@ -582,4 +586,56 @@ test('requeue: dry run counts only; live is refused while the source is sftp', a
   const live = await requeueFive9Backlog({ cfg: FIVE9, dryRun: false, runSQL });
   assert.equal(live.dry_run, false);
   assert.ok(sql.every((q) => q.startsWith('WITH u AS (UPDATE ci_calls')));
+});
+
+/* ─── the Call Log shape (2026-10-20: no "Call Recording" data source) ──── */
+
+// The columns the user ticked in the Call Log data source, in the order the
+// live Call Log report prints them. No RECORDING ID: SESSION ID is the key.
+const CALL_LOG_COLUMNS = ['TIMESTAMP', 'CALL ID', 'CAMPAIGN', 'CALL TYPE', 'AGENT', 'AGENT ID', 'ANI', 'DNIS', 'SESSION ID', 'RECORDINGS'];
+const { index: LOG_IDX, missing: LOG_MISSING } = resolveRecordingColumns(CALL_LOG_COLUMNS);
+
+function logRow({ callId = '300000010559106', session = '8E01BCDF830F4A1A93CA04D5F689E4B5', recordings = '08:00:06(0:40)', type = 'Preview' } = {}) {
+  return ['Tue, 20 Oct 2026 08:00:04', callId, 'DIAL ASAP', type, 'cdeer', '4321', '8005551212', '5615591936', session, recordings];
+}
+
+test('Call Log columns are enough: SESSION ID stands in for a recording id', () => {
+  assert.deepEqual(LOG_MISSING, []);
+  const { descriptor: d } = descriptorFromRow(logRow(), LOG_IDX, { cfg: FIVE9, dateDir: '10_20_2026' });
+  assert.equal(d.five9RecordingId, '8E01BCDF830F4A1A93CA04D5F689E4B5');
+  assert.equal(d.recordingIdSource, 'session_id');
+  assert.equal(d.sourcePath, 'five9api://300000010559106/8E01BCDF830F4A1A93CA04D5F689E4B5');
+  assert.equal(d.durationSeconds, 40, 'recorded seconds come from RECORDINGS');
+  assert.equal(d.recordingSegments, 1);
+  assert.equal(d.ani, '5615591936', 'Preview is outbound: the customer is the DNIS');
+});
+
+test('a Call Log row with no RECORDINGS was never recorded and is not a candidate', () => {
+  assert.equal(descriptorFromRow(logRow({ recordings: null }), LOG_IDX, { cfg: FIVE9 }).reject, 'not_recorded');
+  assert.equal(descriptorFromRow(logRow({ recordings: '' }), LOG_IDX, { cfg: FIVE9 }).reject, 'not_recorded');
+});
+
+test('several RECORDINGS segments add up', () => {
+  const { descriptor: d } = descriptorFromRow(logRow({ recordings: '08:00:06(0:40) 08:02:10(1:05)' }), LOG_IDX, { cfg: FIVE9 });
+  assert.equal(d.durationSeconds, 105);
+  assert.equal(d.recordingSegments, 2);
+});
+
+test('a RECORDING ID column, when a report has one, wins over the session id', () => {
+  const cols = [...CALL_LOG_COLUMNS, 'RECORDING ID'];
+  const { index } = resolveRecordingColumns(cols);
+  const { descriptor: d } = descriptorFromRow([...logRow(), '300000002871679'], index, { cfg: FIVE9 });
+  assert.equal(d.five9RecordingId, '300000002871679');
+  assert.equal(d.recordingIdSource, 'recording_id');
+});
+
+test('neither RECORDING ID nor SESSION ID is a missing column, named', () => {
+  const { missing } = resolveRecordingColumns(['TIMESTAMP', 'CALL ID', 'CAMPAIGN', 'RECORDINGS']);
+  assert.deepEqual(missing, ['recordingId or sessionId']);
+});
+
+test('RECORD COUNTER and PARENT SESSION ID are not mistaken for the ids', () => {
+  const { index } = resolveRecordingColumns(['RECORD COUNTER', 'PARENT SESSION ID', 'CALL ID', 'CAMPAIGN', 'TIMESTAMP']);
+  assert.equal(index.recordingId, undefined);
+  assert.equal(index.sessionId, undefined);
 });
