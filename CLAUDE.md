@@ -1022,6 +1022,21 @@ and GHL C.2 (stage 7 AND status open) still starts; a separate win rule would ra
 `scripts/repair-p2-won-before-install.js` (dry run default). GHL's C.4 Review Solicitation fires 14 days after a card
 reaches Install Completed with no status condition, so moving long-installed customers there can send a review ask.
 
+**Every P2 card sits where LP says the customer is, and drift is healed (the user, 2026-10-20: "zero deviation from the
+source or what is in LP").** The 2026-10-20 audit found 325 of 3,270 cards out of step: cards moved only on events and
+only forward, so a lost, suppressed or mis-ranked event (H over R, fixed in `src/milestone-order.js`) was never retried.
+Job `p2-parity-sweep` (`src/jobs/p2-parity-sweep.js`, every 30 min; rules `src/p2-parity/rules.js` pure, I/O
+`src/p2-parity/sweep.js`) compares every card with LP: the tracked job's status (lost → lost with its reason and L.6;
+`isWonJob` → won at Install Completed or later; else open), the furthest PASSED milestone from BOTH `raw_lp_data` and
+`lp_job_milestones` (each misses rows), mapped by the live `P2_MILESTONE_*` rules (`src/p2-milestone-map.js`), and the
+job's value. Rulings: a card ahead of LP moves BACK; a repeat buyer's one card follows the NEWER live job (re-stamped,
+reopened; never a placeholder or near-duplicate). Every difference is re-read live from GHL first; a card changed in the
+last 30 min waits; anything unreadable writes nothing; `P2_PARITY_MAX_WRITES` (50) a pass, status first. A repair that
+moves an open card adds `p2-stage-heal`, which GHL C.1/C.2/C.4 must consume and exit on
+(`docs/ghl-p2-customer-workflow-fixes.md`, which also lists C.0-IN's backward reset and L.6's missing C-series
+removals). `P2_PARITY_MODE` off|shadow|live, default shadow (`p2.parity` would_change events), live after 3 reviewed
+days. No LP job is a report, never a write (`scripts/repair-p2-missing-lp-jobs.js`).
+
 **Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; `supabase/migrations/20261012222106_158_marketing_cost_ledger.sql`).** Report 136 and LP cost entry
 are retired: nobody types a cost into LP again, and no code reads `mcost_cents` for a cost. The money lives in
 `marketing_expenses` (invoice lines, Lead Gurus feed days, commission rules) and is split per month and market in

@@ -186,6 +186,39 @@ async function p2BackstopSection(deps, nowMs) {
   return { title: `Sale → P2 backstop: needs a person`, lines, record };
 }
 
+// 2026-10-20: the P2 parity sweep (src/p2-parity/) puts every P2 card where LP says the
+// customer is. One line per day: what it changed (or, in shadow, would have), and the
+// writes that failed, which are the only thing a person acts on.
+async function p2ParitySection(deps, nowMs) {
+  const since = new Date(nowMs - DAY_MS).toISOString();
+  const { data, error } = await deps.supabase.from('system_events')
+    .select('ghl_contact_id, event_subtype, payload')
+    .eq('event_type', 'p2.parity')
+    .gte('created_at', since);
+  if (error) throw new Error(`P2 parity read failed: ${error.message}`);
+  const rows = data || [];
+  const lines = [];
+  const { data: runs, error: runErr } = await deps.supabase.from('job_runs')
+    .select('status').eq('job_id', 'p2-parity-sweep').gte('started_at', since).in('status', ['failed', 'unknown']);
+  if (!runErr && runs?.length) lines.push(`the P2 parity sweep itself failed ${runs.length} time${runs.length === 1 ? '' : 's'} in 24h · check its job runs`);
+  const tally = (subtype) => {
+    const out = {};
+    for (const r of rows.filter((x) => x.event_subtype === subtype)) for (const k of r.payload?.kinds || []) out[k] = (out[k] || 0) + 1;
+    return Object.entries(out).map(([k, n]) => `${k.replace('_', ' ')} ${n}`).join(', ');
+  };
+  const done = rows.filter((r) => r.event_subtype === 'done').length;
+  const would = rows.filter((r) => r.event_subtype === 'would_change').length;
+  if (done) lines.push(`${done} card${done === 1 ? '' : 's'} put back in line with LP (${tally('done')})`);
+  if (would) lines.push(`shadow: ${would} card${would === 1 ? '' : 's'} would be changed to match LP (${tally('would_change')})`);
+  const failed = rows.filter((r) => r.event_subtype === 'failed');
+  if (failed.length) {
+    const names = await loadNames(deps, failed.map((r) => r.ghl_contact_id));
+    lines.push(...capLines(failed.map((r) => `${nameOf(names, r.ghl_contact_id)} (${r.ghl_contact_id}) · P2 card ${r.payload?.opportunity_id} could not be updated · ${String(r.payload?.error || '').slice(0, 120)}`), SECTION_MAX));
+  }
+  if (!lines.length) return null;
+  return { title: 'P2 cards vs LP', lines };
+}
+
 // 2026-10-04: sales the sale-contact backstop (src/services/lp-sale-contact-backstop.js)
 // gave a GHL contact in the last 24h. Their P2 card follows on the Sale → P2 pass.
 async function saleContactSection(deps, nowMs) {
@@ -687,7 +720,7 @@ export async function runOpsMorningDigest({ post = true, deps: depsArg } = {}) {
   };
 
   deps.autoFixed = {};
-  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['LP date/time looks wrong', lpLooksWrongSection], ['Duplicate LP leads', duplicateLeadsSection], ['Disqualified Five9 removals', disqualifiedFive9Section], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection], ['Five9 call cap', callCapSection], ['Siro recordings with no lead', siroNoLeadSection], ['F.0 v2 yesterday', f0V2Section]]) {
+  for (const [label, build] of [['P2 won/lost summary', p2Section], ['Sale → P2 backstop summary', p2BackstopSection], ['P2 parity summary', p2ParitySection], ['Sale → contact backstop summary', saleContactSection], ['Appointment parity summary', paritySection], ['LP date/time looks wrong', lpLooksWrongSection], ['Duplicate LP leads', duplicateLeadsSection], ['Disqualified Five9 removals', disqualifiedFive9Section], ['Post-issue rebook summary', postIssueSection], ['Shadow-mode review', shadowModesSection], ['System health', systemHealthSection], ['Five9 call cap', callCapSection], ['Siro recordings with no lead', siroNoLeadSection], ['F.0 v2 yesterday', f0V2Section]]) {
     try { sections.push(await build(deps, nowMs)); } catch (err) { await couldNotRun(label, err.message); }
   }
   try { sections.push(...await nightlySummarySections(deps, nowMs)); } catch (err) { await couldNotRun('Nightly summaries (tag sweep, inbound callers, rule targets)', err.message); }

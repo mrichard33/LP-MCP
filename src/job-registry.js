@@ -380,6 +380,18 @@ export const JOBS = Object.freeze([
     isEnabled: () => true,
   },
   {
+    // 2026-10-20: every P2 card must sit where LP says the customer is (the user:
+    // "zero deviation from the source"). Mirrors parityMode() in
+    // src/p2-parity/sweep.js: off | shadow (default) | live.
+    id: 'p2-parity-sweep',
+    label: 'P2 card ↔ LP parity sweep',
+    group: 'notifications',
+    cadence: 'every 30 min',
+    enabledEnv: 'P2_PARITY_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.P2_PARITY_MODE || 'shadow').toLowerCase().trim() !== 'off',
+  },
+  {
     // 2026-10-03: every recent LP sale must have a P2 (Client Lifecycle)
     // opportunity. LP's webhook to I.LP-IN stopped on 09-24, so `deal-won` —
     // and with it C.0-IN's P2 card — stopped too. Mirrors backstopMode() in

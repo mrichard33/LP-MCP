@@ -405,6 +405,11 @@ export const MODES = Object.freeze([
     goLive: 'sale_p2_backstop_run (dry run) lists only the writes the CLAUDE.md rules allow',
     note: 'Every LP sale gets a P2 card even when LP\'s webhook does not arrive.',
   }),
+  m('P2_PARITY_MODE', 'sales', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-20', decider: 'the user', evidence: job('p2-parity-sweep'),
+    goLive: '3 days of shadow (p2.parity would_change events), reviewed by the user (2026-10-20)',
+    note: 'Every P2 card is put where LP says the customer is, backward too.',
+  }),
   m('SALE_CONTACT_BACKSTOP_MODE', 'sales', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-04', evidence: job('sale-contact-backstop'),
     goLive: 'sale_contact_backstop_run (dry run) finds or creates only real customer contacts',
