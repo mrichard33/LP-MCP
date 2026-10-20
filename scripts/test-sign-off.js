@@ -304,3 +304,59 @@ test('an evening asked for before the gate questions is honored once the decisio
   const named = planNepqTurn({ channel: 'livechat', nowMs: OPEN_MS, slots: [ALL[0], ALL[2]], allSlots: ALL, tzLabel: 'ET', conversation: conv, trigger: 'Just me. Thursday morning works', discipline });
   assert.ok(named.slots_to_offer.some(s => s.time === '10:00 AM'), JSON.stringify(named.slots_to_offer));
 });
+
+// 2026-10-20 bot gate (book_it_evening_spouse): after two evening offers, "Yes, book it"
+// got "tomorrow at 6:00 PM or Wed at 10:00 AM" on live chat (the soonest pair), and on
+// SMS "Evenings work best" got "What day works best?" with no times.
+const EVE_ALL = [
+  { iso: '2026-10-14T14:00:00-04:00', day: 'Wed, Oct 14', rel: 'tomorrow', time: '2:00 PM' },
+  { iso: '2026-10-14T18:00:00-04:00', day: 'Wed, Oct 14', rel: 'tomorrow', time: '6:00 PM' },
+  { iso: '2026-10-15T10:00:00-04:00', day: 'Thu, Oct 15', time: '10:00 AM' },
+  { iso: '2026-10-15T18:00:00-04:00', day: 'Thu, Oct 15', time: '6:00 PM' },
+];
+const EVE_DISCIPLINE = { booking: { allowed: true, reason: 'lead_answered_decision_maker_ask' }, decision_makers: { status: 'sole' } };
+const eveConv = (...more) => T(
+  ['i', 'I need new windows. Can someone come out in the evening?'],
+  ['o', 'Evenings work for us. How many windows and doors are you looking to get a quote on?'],
+  ['i', 'About 10 windows.'],
+  ['o', 'Got it, 10 windows. Is anyone else part of the decision on this, like a spouse or partner?'],
+  ['i', 'Just me.'],
+  ['o', 'Evenings work for us. I have tomorrow at 6:00 PM ET or Thu, Oct 15 at 6:00 PM ET. Which works better?'],
+  ...more,
+);
+
+test('"Yes, book it" after an evening offer re-offers the two evening times, never the soonest pair', () => {
+  const conv = eveConv(
+    ['i', 'My wife will be there too. Evenings work best for us'],
+    ['o', 'Perfect, both of you in the evening. Which works better, tomorrow at 6:00 PM ET or Thu, Oct 15 at 6:00 PM ET?'],
+  );
+  for (const channel of ['livechat', 'sms']) {
+    const p = planNepqTurn({ channel, nowMs: OPEN_MS, slots: [EVE_ALL[1], EVE_ALL[2]], allSlots: EVE_ALL, tzLabel: 'ET', conversation: conv, trigger: 'Yes, book it', discipline: EVE_DISCIPLINE });
+    assert.equal(p.step, 'offer_slots', channel);
+    assert.deepEqual(p.slots_to_offer.map(s => s.time), ['6:00 PM', '6:00 PM'], channel);
+  }
+});
+
+test('"Evenings work best" to an open evening offer re-offers it even when the read returned one slot', () => {
+  const p = planNepqTurn({ channel: 'sms', nowMs: OPEN_MS, slots: [EVE_ALL[1]], allSlots: EVE_ALL, tzLabel: 'ET', conversation: eveConv(), trigger: 'My wife will be there too. Evenings work best for us', discipline: EVE_DISCIPLINE });
+  assert.equal(p.step, 'offer_slots');
+  assert.deepEqual(p.slots_to_offer.map(s => s.time), ['6:00 PM', '6:00 PM']);
+});
+
+test('"Yes, book it" after our day question, with the evening offer still open, is not the soonest pair', () => {
+  const conv = eveConv(
+    ['i', 'My wife will be there too. Evenings work best for us'],
+    ['o', 'Good to know your wife will be there too. What day works best for you both?'],
+  );
+  const p = planNepqTurn({ channel: 'sms', nowMs: OPEN_MS, slots: [EVE_ALL[1], EVE_ALL[2]], allSlots: EVE_ALL, tzLabel: 'ET', conversation: conv, trigger: 'Yes, book it', discipline: EVE_DISCIPLINE });
+  assert.ok((p.slots_to_offer || []).length === 2, JSON.stringify(p));
+  assert.ok(p.slots_to_offer.every(s => s.time === '6:00 PM'), JSON.stringify(p.slots_to_offer));
+});
+
+test('a part of day stands until the lead names a clock time or turns the times down', async () => {
+  const { standingPreference } = await import('../src/agentic/nepq-planner.js');
+  const ins = (...t) => t.map(text => ({ direction: 'inbound', text }));
+  assert.equal(standingPreference(ins('Can someone come out in the evening?', 'About 10 windows.', 'Just me.'))?.part, 'evening');
+  assert.equal(standingPreference(ins('Mornings are best', 'Neither of those')), null);
+  assert.equal(standingPreference(ins('About 10 windows.')), null);
+});
