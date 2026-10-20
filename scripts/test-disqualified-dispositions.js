@@ -321,3 +321,16 @@ test('lp_disposition_not_in: an ND / No Demo current lead blocks; CXL and no lea
   assert.equal(await evaluateContextConditions(spec, {}, cancelEvt, ctx(leadsDb({ rows: [] }))), true);
   assert.equal(await evaluateContextConditions(spec, {}, cancelEvt, ctx(leadsDb({ error: 'boom' }))), false);
 });
+
+test('Five9 per-minute upload limit is a wait, not a failure (2026-10-20 backlog: 25 rows failed on it)', async () => {
+  const { rateLimitDeferral, RATE_LIMIT_MAX_WAITS, RATE_LIMIT_WAIT_MS } = await import('../src/five9/admin-writes.js');
+  const fault = new Error('Five9 deleteRecordFromList fault: 60 seconds limit (160) for single upload operation is reached.');
+  const now = Date.parse('2026-10-20T16:25:00Z');
+  const d = rateLimitDeferral(fault, {}, now);
+  assert.deepEqual([d.deferred, d.reason, d.rate_limit_waits], [true, 'five9_rate_limited', 1]);
+  assert.equal(Date.parse(d.retry_at) - now, RATE_LIMIT_WAIT_MS);
+  assert.equal(rateLimitDeferral(fault, { execution_result: { rate_limit_waits: 3 } }, now).rate_limit_waits, 4);
+  // After the cap the fault stands; any other fault is never a wait.
+  assert.equal(rateLimitDeferral(fault, { execution_result: { rate_limit_waits: RATE_LIMIT_MAX_WAITS } }, now), null);
+  assert.equal(rateLimitDeferral(new Error('Five9 deleteRecordFromList fault: List "Data - Hot" doesn\'t exist.'), {}, now), null);
+});

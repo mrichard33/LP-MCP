@@ -459,7 +459,9 @@ the one exception, below).
   by market. `disqualifiedTargetLists` takes every list but Sale / Rehash / Inbound Queue (a failed or empty read throws,
   the executor retries), queued as rows of 10 (`MAX_DELETE_LISTS_PER_ACTION`) in one `group`, each with
   `skip_missing_lists` (`missingListsToSkip`: a renamed list is `list_missing`, not a fault); the last chunk to finish posts
-  the one notice. The 08:00 digest names a FAILED removal once, whatever the mode. The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
+  the one notice. The 08:00 digest names a FAILED removal once, whatever the mode. Five9 refuses more than 160 single
+  uploads a minute account-wide ("60 seconds limit (160)"): every `deleteRecordFromList` refusal of that kind defers the
+  row 65s (`rateLimitDeferral`, up to `RATE_LIMIT_MAX_WAITS`), never fails it (the 36-lead backlog failed 25 rows on it). The S5.2 gate and rule 171 (`lp_disposition_not_in`) refuse them up front.
 - **`invalid` is the no-notification kill status** (`src/appointments/mark-invalid.js`): status `invalid` (never
   `cancelled`, which fires cancel / rebook), then A.WE-1 removed, then the reminder tags off. The watchdog treats an
   `invalid` row at LP's slot as SETTLED: never restored, never re-created over, never flagged.
