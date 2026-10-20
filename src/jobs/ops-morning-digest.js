@@ -676,13 +676,37 @@ async function duplicateLeadsSection(deps, nowMs) {
 
 // Fix 2: Five9 removals for disqualified leads waiting on a person's approval
 // (only while DISQUALIFIED_FIVE9_AUTO_REMOVE=false; automatic by default since 2026-10-19).
-async function disqualifiedFive9Section(deps) {
-  if (String(deps.env?.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? '').trim().toLowerCase() !== 'false') return null;
-  const { data, error } = await deps.supabase.from('agent_actions')
-    .select('id').eq('action_type', 'five9_delete_record_from_list').eq('rule_applied', 'LP_DISP_DISQUALIFIED').eq('status', 'pending_approval');
-  if (error) throw new Error(`disqualified Five9 removal read failed: ${error.message}`);
-  const n = (data || []).length;
-  return n ? { title: 'Five9 removals for ND / No Demo leads', lines: [`waiting on approval: ${n} · approve in Slack`] } : null;
+// 2026-10-20: a FAILED removal is named too, whatever the mode. Every removal
+// failed for four days on the retired "Data - Hot" list while the Auto-fixed
+// line said the leads were "cleaned up". Each failed row once (audit
+// disqualified_five9_failed), by the contact's name.
+async function disqualifiedFive9Section(deps, nowMs = Date.now()) {
+  const lines = [];
+  let record = null;
+  const { data: failed, error: fErr } = await deps.supabase.from('agent_actions')
+    .select('id, target_id, error_message').eq('action_type', 'five9_delete_record_from_list')
+    .eq('rule_applied', 'LP_DISP_DISQUALIFIED').eq('status', 'failed')
+    .gte('created_at', new Date(nowMs - 7 * DAY_MS).toISOString());
+  if (fErr) throw new Error(`disqualified Five9 removal read failed: ${fErr.message}`);
+  if ((failed || []).length) {
+    const items = failed.map((r) => ({ key: String(r.id), reason: 'disqualified_five9_failed', contact: r.target_id, error: r.error_message }));
+    const { fresh } = await deps.filterNew({ audit: 'disqualified_five9_failed', items, ttlDays: 30, nowMs, deps: { supabase: deps.supabase } });
+    if (fresh.length) {
+      const names = await loadNames(deps, fresh.map((i) => i.contact).filter(Boolean));
+      const contacts = new Set(fresh.map((i) => i.contact));
+      lines.push(`Five9 removal FAILED for ${contacts.size} ND / No Demo lead${contacts.size === 1 ? '' : 's'}, still on a dialing list:`);
+      lines.push(...capLines(fresh.map((i) => `${nameOf(names, i.contact)} · ${String(i.error || 'no error recorded').slice(0, 160)}`), SECTION_MAX));
+      record = { audit: 'disqualified_five9_failed', items: fresh };
+    }
+  }
+  if (String(deps.env?.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE ?? '').trim().toLowerCase() === 'false') {
+    const { data, error } = await deps.supabase.from('agent_actions')
+      .select('id').eq('action_type', 'five9_delete_record_from_list').eq('rule_applied', 'LP_DISP_DISQUALIFIED').eq('status', 'pending_approval');
+    if (error) throw new Error(`disqualified Five9 removal read failed: ${error.message}`);
+    const n = (data || []).length;
+    if (n) lines.push(`waiting on approval: ${n} · approve in Slack`);
+  }
+  return lines.length ? { title: 'Five9 removals for ND / No Demo leads', lines, ...(record ? { record } : {}) } : null;
 }
 
 /** Pure. The digest text. */

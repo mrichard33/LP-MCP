@@ -1455,6 +1455,16 @@ export function executeAddRecordsToList(action) {
  */
 export const MAX_DELETE_LISTS_PER_ACTION = 10;
 
+/**
+ * Pure (2026-10-20): the lists a delete skips because Five9 no longer has them.
+ * Only with payload.skip_missing_lists === true; otherwise none, and a missing
+ * list faults as before.
+ */
+export function missingListsToSkip(lists, inventoryNames, payload = {}) {
+  if (payload?.skip_missing_lists !== true || !inventoryNames) return new Set();
+  return new Set(lists.filter((n) => !inventoryNames.has(n)));
+}
+
 /** listRecordsDeleted from a deleteRecordFromList response, or null. */
 export function listRecordsDeletedFrom(xml) {
   const m = /<listRecordsDeleted>(\d+)<\/listRecordsDeleted>/i.exec(String(xml ?? ''));
@@ -1491,13 +1501,20 @@ export function executeDeleteRecordFromList(action) {
   const bodies = lists.map((listName) => ({ listName, xml: buildDeleteRecordFromListXml(listName, payload.field_names, payload.values, mode) }));
   const entityId = lists.join(', ');
   return withFive9WriteGate({ action, subtype: 'delete_record_from_list', entityType: 'five9_list', entityId }, async (ctx) => {
+    let inventory = null;
     const sizes = async () => {
       const all = (await getListsInfo()).lists;
+      inventory = new Set(all.map((l) => l.name));
       return lists.map((name) => all.find((l) => l.name === name) ?? { name, size: null });
     };
     ctx.previous_state = await sizes();
     const perList = [];
-    for (const { listName, xml: bodyXml } of bodies) {
+    // 2026-10-20 — "Data - Hot" was split by market and every ND / No Demo
+    // removal faulted on it half way through. With skip_missing_lists, a list
+    // Five9 no longer has is reported, not sent; without it, nothing changes.
+    const missing = missingListsToSkip(lists, inventory, payload);
+    for (const listName of missing) perList.push({ list: listName, deleted: null, outcome: 'list_missing' });
+    for (const { listName, xml: bodyXml } of bodies.filter((b) => !missing.has(b.listName))) {
       const xml = await ctx.soap('deleteRecordFromList', bodyXml);
       if (xml !== null) assertNoRecordFailures('deleteRecordFromList', xml);
       const deleted = xml === null ? null : listRecordsDeletedFrom(xml);

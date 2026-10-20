@@ -650,6 +650,8 @@ function disqualifiedCleanupDeps() {
     ghlFetch,
     fetchUpcomingAppointments,
     resolveWorkflowId: resolveWorkflowIdByCanonicalCode,
+    // 2026-10-20: the Five9 lists come from the live inventory, never a fixed set.
+    getListsInfo: async () => (await import('../five9-admin.js')).getListsInfo(),
   };
 }
 
