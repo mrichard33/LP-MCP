@@ -56,6 +56,7 @@ function depsFor(supabase, { ai = GOOD_AI, posts = [], guardRows = [] } = {}) {
     analyzeDeps: { callJson: aiStub(ai), guard: async (args) => { guardRows.push(args); return { mode: 'shadow', verdict: /ignore (all )?previous instructions/i.test(args.text) ? 'injection' : 'clean', score: 0, block: false }; } },
     postToSlack: async (text, channel, opts) => { posts.push({ text, channel, opts }); return { ok: true, ts: `${posts.length}.0`, channel }; },
     signedLink: async () => 'https://signed.example/x',
+    ingestVerified: true, // n8n's x-ghl-signature checked against LP_REPORT_INGEST_SECRET
   };
 }
 

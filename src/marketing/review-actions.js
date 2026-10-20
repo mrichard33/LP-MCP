@@ -29,8 +29,6 @@ import { vendorLearnPatch, normalizeName } from './vendors.js';
 import { splitsEvenly, callCenterLineKind, DISPUTED_MARKET } from './allocation.js';
 
 const LOG = '[MktReview]';
-const INVOICES_BUCKET = 'marketing-invoices';
-const SIGNED_TTL_S = 7 * 24 * 3600;
 
 export function reviewChannelId(env = process.env) {
   return String(env.SLACK_MKT_INVOICE_CHANNEL_ID || '').trim();
@@ -84,14 +82,6 @@ export async function updateSlackView(viewId, view, { hash = '', token = process
   }
 }
 
-export async function signedOriginalLink(document, { supabase = supabaseDefault } = {}) {
-  if (!document?.storage_path || !supabase) return null;
-  try {
-    const { data } = await supabase.storage.from(document.storage_bucket || INVOICES_BUCKET).createSignedUrl(document.storage_path, SIGNED_TTL_S);
-    return data?.signedUrl || null;
-  } catch { return null; }
-}
-
 /** Everything the card needs for one document. */
 export async function loadReviewContext(documentId, { supabase = supabaseDefault } = {}) {
   const { data: document, error } = await supabase.from('marketing_invoice_documents').select('*').eq('id', documentId).maybeSingle();
@@ -130,8 +120,7 @@ export async function renderCard(ctx, { decision = null, note = null } = {}, dep
   const allocation = decision
     ? (await loadAllocations(ctx.rows.map((r) => r.id), deps)).map((a) => ({ ...a, kind: kindOf.get(a.expense_id) || null }))
     : await previewRows(ctx.rows, deps);
-  const link = deps.signedLink ? await deps.signedLink(ctx.document) : await signedOriginalLink(ctx.document, deps);
-  return buildReviewCard({ ...ctx, allocation, link, decision, note });
+  return buildReviewCard({ ...ctx, allocation, decision, note });
 }
 
 async function loadAllocations(expenseIds, { supabase = supabaseDefault } = {}) {

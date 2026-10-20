@@ -64,6 +64,14 @@ export const SIGNALS = Object.freeze([
     re: /(\b(drop|truncate|delete\s+from|insert\s+into|update\s+\w+\s+set|alter\s+table|grant\s+all)\b\s+\w+|;\s*--|\b(curl|wget)\s+https?:\/\/|\brm\s+-rf\b)/i },
   { id: 'url_with_payload', weight: 0.3,
     re: /https?:\/\/[^\s]+[?&][^\s=]{1,30}=\{?[^\s]{0,10}(prompt|secret|key|token|data)/i },
+  // Invoice-shaped (security review, 2026-10-19): a vendor document that talks
+  // to "the AI processing this invoice" or tells it to approve, set the vendor
+  // or set its confidence. Each scores suspicious; either flags the invoice for
+  // a person (it is never auto-approved), which is all an invoice needs.
+  { id: 'addressed_to_model', weight: 0.3,
+    re: /\b(note|message|instructions?|attention)\s+(to|for)\s+(the\s+|any\s+)?(ai|a\.i\.|assistant|model|llm|bot|automated\s+(system|reader|processor))\b|\b(ai|assistant|model|llm|bot|system)\s+(reading|processing|parsing|reviewing|analy[sz]ing)\s+this\b/i },
+  { id: 'invoice_override', weight: 0.3,
+    re: /\b(auto[\s-]?approve|pre[\s-]?approved?\s+(invoice|payment)|mark\s+(this|it)\s+(invoice\s+)?(as\s+)?(approved|paid|verified)|set\s+(the\s+)?(confidence|vendor(_match_id)?)\b|vendor_match_id|confidence\s*[:=]\s*(1(\.0+)?|100\s*%))/i },
   { id: 'encoded_payload', weight: 0.3,
     re: /(?:[A-Za-z0-9+/]{80,}={0,2})|(?:\\x[0-9a-f]{2}){12,}|(?:%[0-9a-f]{2}){20,}/i },
 ]);

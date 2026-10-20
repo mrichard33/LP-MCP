@@ -1021,6 +1021,25 @@ uploaded (rule basis `net_sales_estimate` → rows `provisional` + flags `{estim
 LeadPilotData 15%, Previous Customer / Referral 1%; all are lead-source cost. Net = jobs released to production (RTP) or
 completed, so a commission on net is a commission on RTP'd dollars. Seed: `sql/seeds/2026-10-19_commission_rules_leadpilot_canvass_estimate.sql`. The dashboard and
 Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_market_subsource_cost`.
+- **No routing or account number is ever saved (the user, 2026-10-19).** "We do not save any of the Lightfire Routing
+  and Account numbers. Or any routing or account numbers." `redactBankDetails` (`src/security/bank-redact.js`, pure)
+  runs once in `ingestInvoice` right after extraction, before the text is stored, triaged, screened or sent to the
+  model (a retry's stored text too), and again over the email-body `.txt` copy, the subject, the model's analysis
+  (`redactBankDeep`), ledger descriptions and error lines. Labelled values (routing / ABA / RTN / transit, account /
+  acct / A/C, IBAN), the rows under such a header, and an ABA-checksum 9-digit run near a bank word become
+  `[routing number removed]` / `[account number removed]`; no last four. Already-saved numbers: MCP
+  `invoice_bank_redact_run` (counts only, dry run default; `scripts/redact-saved-bank-numbers.js`). Original PDFs and
+  photos are KEPT but open for dashboard admins only (the user's ruling); the Slack card carries no file link. A new
+  place that stores invoice text runs the same function.
+- **The invoice decision routes fail closed; the email intake does not (security review, 2026-10-19).**
+  `LP_REPORT_INGEST_SECRET` was unset, so `/n8n/admin/marketing-invoices/*` (`/decide`, `/dispute`, `/refresh-cards`)
+  and `/marketing-expenses/*` took anyone's request. They pass `FAIL_CLOSED` to `refuseIngest` (503 with no secret,
+  whatever `AUTH_ENFORCE_MODE` says); the Slack buttons are signed separately and keep working. The ingest route and the
+  scheduled report / nightly triggers keep the old posture (open while unset, enforced once set) so emailed invoices and
+  the OPS.MCRP report never stop on a deploy (the user: "people can still email the invoice"); an invoice that arrives
+  with no secret configured is flagged `arrived_without_intake_password` and never auto-approved.
+  A vendor only the model matched (`vendor_matched_by_ai_only`) or a revision of an approved invoice number
+  (`replaces_approved_invoice`) is never auto-approved, and a commission invoice looks up at most 20 lines in LP live.
 - **An invoice file never reaches a paid model (D9).** n8n `I.MCIN` POSTs the attachment to
   `/n8n/admin/marketing-invoice-ingest`; `src/marketing/extract-client.js` gets the TEXT for free from reece-speech-api
   `/v1/extract` (pdfplumber + Tesseract) or in-process for CSV/XLSX/body text; only that text goes to

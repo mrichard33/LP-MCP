@@ -80,5 +80,6 @@ test('the tools register as rehash_tag_cleanup_run, check_rule_targets and stale
   registerMaintenanceTools({ tool: (name) => names.push(name) });
   // 2026-10-12: check_rule_targets (F-L, read-only) joined the file.
   // 2026-10-14: rehash_tag_cleanup_run (no dates or ids in GHL tags).
-  assert.deepEqual(names, ['ghl_attribution_cleanup_run', 'rehash_tag_cleanup_run', 'check_rule_targets', 'stale_lp_tags_cleanup_run']);
+  // 2026-10-19: invoice_bank_redact_run (no saved routing or account numbers).
+  assert.deepEqual(names, ['invoice_bank_redact_run', 'ghl_attribution_cleanup_run', 'rehash_tag_cleanup_run', 'check_rule_targets', 'stale_lp_tags_cleanup_run']);
 });
