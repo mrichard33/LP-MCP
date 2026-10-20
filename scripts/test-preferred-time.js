@@ -78,6 +78,24 @@ test('an outbound turn WITHOUT an acceptance marker is not captured', () => {
   assert.equal(p, null);
 });
 
+// 2026-10-20 (book_it_evening_spouse): "works" in our own question was read as the lead
+// accepting the first offered time, so the SMS slot read kept one day.
+test('our own slot offer ending "Which works better?" is not an accepted time', () => {
+  const p = extractPreferredTime(
+    [{ direction: 'outbound', text: 'We have Tue, Jul 28 at 6:00 PM ET or Wed, Jul 29 at 6:00 PM ET for someone to come out. Which works better?' }],
+    { now: FRIDAY },
+  );
+  assert.equal(p, null);
+});
+
+test('"What day works best for you?" is not an accepted time', () => {
+  const p = extractPreferredTime(
+    [{ direction: 'outbound', text: 'Good to know. What day works best for you both, Monday?' }],
+    { now: FRIDAY },
+  );
+  assert.equal(p, null);
+});
+
 test('inbound wins as source over a plain (non-accepting) outbound', () => {
   const p = extractPreferredTime(
     [

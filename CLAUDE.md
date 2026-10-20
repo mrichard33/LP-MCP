@@ -1544,6 +1544,14 @@ The row becomes ONE IMPORTANT LP prospect note (`writeLpNote`) from `syncAppoint
 `LP_NOTE_ALERT_AFTER_MINUTES`; failed after 24h). The row is claimed before the write, so the hook and the sweep never
 both write it.
 
+**An evening the lead asked for stays evening through "book it" (bot gate, 2026-10-20).** `book_it_evening_spouse`
+failed on both bots: live chat answered "Yes, book it" with the two SOONEST openings (6 PM and 10 AM), and SMS read our
+own "…6:00 PM ET. Which works better?" as the lead accepting Tuesday (`ACCEPTANCE_RE`'s bare "works"), kept one slot and
+asked the day. Now `extractPreferredTime` reads only an outbound STATEMENT (question sentences and an "X or Y" offer never
+accept a time), a yes or a schedule ask to an open offer re-offers the times on the table (`openPair` in step 5; step 4b
+defers to it), and a fresh pair follows the part of day the lead stated (`standingPreference`: newest first, ended by
+"neither", a typed clock time is the 6:00 path's).
+
 **No line twice, one reply per burst (Mark, 2026-10-02).** Lines that recur in a thread come in variants
 (`bridgeLine`, `LINES.offer_slots(slots, n)`, `ALT_LINES`); `pickFresh` never picks one whose opening words were
 already sent, and `enforceNepqPlan` drops a sentence already sent word for word. Every offer variant keeps

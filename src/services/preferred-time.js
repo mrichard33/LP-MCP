@@ -42,6 +42,14 @@ const MONTHS = {
 // commitment when one of these co-occurs with a day/time token.
 const ACCEPTANCE_RE = /\b(works great|works for me|that works|works\b|perfect|got you down|locked in|lock it in|see you|sounds good|book(ed)? you|you're (all )?set)\b/i;
 
+// Two clock times joined by "or": an offer of ours, never an accepted time.
+const OFFER_PAIR_RE = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b[^.?!]*\bor\b[^.?!]*\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i;
+
+/** An outbound message without its question sentences. */
+function outboundStatements(text) {
+  return String(text || '').split(/(?<=[.!?])\s+/).filter(sent => !/\?\s*$/.test(sent.trim())).join(' ');
+}
+
 // Vague timeframe markers that must NEVER unlock the far-date path.
 const VAGUE_RE = /\b(sometime|some time|whenever|any ?day|any ?time|no rush|flexible|next week|this week|next month|in a (few|couple)|soon|later)\b/i;
 
@@ -291,9 +299,14 @@ export function extractPreferredTime(messages, opts = {}) {
     if (!text) continue;
 
     const isOutbound = dir === 'outbound' || dir === 'out';
-    if (isOutbound && !ACCEPTANCE_RE.test(text)) continue; // only accepted outbounds count
+    // 2026-10-20 (book_it_evening_spouse): our own offer "Tue 6:00 PM or Wed 6:00 PM. Which
+    // works better?" read as an ACCEPTED Tuesday (the bare "works" sits in the question), so
+    // the slot read kept one day and the SMS planner had one time to offer. Only a statement
+    // can accept a time: question sentences are dropped, and an offer of two times is not one.
+    const scanText = isOutbound ? outboundStatements(text) : text;
+    if (isOutbound && (!ACCEPTANCE_RE.test(scanText) || OFFER_PAIR_RE.test(scanText))) continue; // only accepted outbounds count
 
-    const parsed = parseTimeExpr(text, today);
+    const parsed = parseTimeExpr(scanText, today);
     if (!parsed) continue;
 
     // A bare vague phrase with no concrete day/time is not a preference.

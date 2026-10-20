@@ -1553,6 +1553,16 @@ function planNepqTurnCore({
   const allPool = Array.isArray(allSlots) ? allSlots.map(s => ({ ...s, tz: s.tz || tzLabel || '' })) : [];
   // A weekday named without its date is the nearest one (2026-10-16, soonestPerWeekday).
   const offeredInThread = lastOfferOut ? offeredIn(lastOfferOut, allPool) : offerSlots;
+  // 2026-10-20 (book_it_evening_spouse): "Can someone come out in the evening?" and
+  // "Evenings work best for us" were honored on the turn that said them, then "Yes, book
+  // it" got the two SOONEST openings (6 PM and 10 AM). A part of day the lead stated
+  // stands until they name another or turn the times down (standingPreference), and a
+  // re-offer repeats the times already on the table (openPair).
+  const standing = standingPreference(inbound);
+  const prefPick = standing && allPool.length >= 2 ? slotsForPreference(allPool, standing, { nowMs }) : null;
+  const freshPair = prefPick?.matched && prefPick.slots.length === 2 ? prefPick.slots : offerSlots;
+  const openPair = offeredInThread.length >= 2 ? offeredInThread.slice(0, 2) : freshPair;
+  const withPair = (pair, line) => { withSlots(line); plan.slots_to_offer = pair; return line; };
   if (offerSlots.length && allPool.length >= 2 && !nowAsks && !PREF_WORD_RX.test(now) && !/\b(?:can'?t|cannot|not|won'?t|busy|except)\b/i.test(now) && typedClock(now) != null && !exactSlotFor(now, offeredInThread)) {
     const all = allPool;
     // A day AND time they typed that is open ("Sunday at 2 PM") is the pick.
@@ -1643,7 +1653,10 @@ function planNepqTurnCore({
 
   // 4b. They typed a day and a time with no offer on the table: two real
   // times near it. A question in the same burst is answered first.
-  if (timeRequest) {
+  // A schedule ask with no day or time of its own ("Yes, book it") while our offer is
+  // still open answers that offer (step 5), never a fresh pair (2026-10-20).
+  const answersOpenOffer = !!lastOfferOut && offeredInThread.length >= 2 && !DAY_OR_TIME_RX.test(now) && typedClock(now) == null;
+  if (timeRequest && !answersOpenOffer) {
     const asked = nowAsks && !TIME_REQUEST_RX.test(now);
     // 2026-10-02 (Mark's 5:22 PM chat, SMS replay): "Fine lets book for 2 PM"
     // got two times back instead of the 2 PM it asked for. A typed time that
@@ -1670,28 +1683,26 @@ function planNepqTurnCore({
     if (NEITHER_RX.test(now)) return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
     const picked = DAY_OR_TIME_RX.test(now) || BARE_PICK_RX.test(now);
     // "Sure" / "yes" to two times picks neither: ask which, with the times.
-    if (!picked && YES_RX.test(now) && offerSlots.length === 2) return fixed('offer_slots', withSlots(vary(LINES.which(offerSlots), ALT_LINES.which(offerSlots))), { step: 'offer_slots' });
+    if (!picked && (YES_RX.test(now) || SCHEDULE_ASK_RX.test(now)) && openPair.length === 2) return fixed('offer_slots', withPair(openPair, vary(LINES.which(openPair), ALT_LINES.which(openPair))), { step: 'offer_slots' });
     if (picked || YES_RX.test(now)) return Object.assign(plan, { step: 'confirm', required_move: 'confirm', last_offer: lastOfferOut, booking: { allowed: true, reason: 'nepq:confirm' } });
     // Something else came between (a corrected phone, a name), or they
     // answered the offer with a detail instead of a pick (2026-10-03 SMS
     // replay: an address after the offer got "Good news, 12 Main St is in our
     // service area." and no question). Back to the times, in other words.
     // Asked three times with no pick: ask the day instead of a fourth time.
-    if (!nowAsks && !objType && offerSlots.length === 2) {
+    if (!nowAsks && !objType && openPair.length === 2) {
       // 2026-10-13 (Erica Hilts): the same two times never go out a third time.
       const offersInARow = outbound.slice(-2).filter(t => SLOT_OFFER_RX.test(t.text || '')).length;
       if (offersInARow >= 2) return fixed('ask_day', vary(LINES.ask_day, ALT_LINES.ask_day), { step: 'ask_day', booking: { allowed: true, reason: 'nepq:ask_day' } });
       // The same two times we just offered, not a fresh pair (2026-10-03
       // replay: "Sun 2 PM or Mon 2 PM", then "Sun 10 AM or Sun 2 PM").
-      const pair = offeredInThread.length >= 2 ? offeredInThread.slice(0, 2) : offerSlots;
-      const line = withSlots(vary(LINES.which(pair), ALT_LINES.which(pair)));
-      plan.slots_to_offer = pair;
-      return fixed('offer_slots', line, { step: 'offer_slots' });
+      const pair = openPair;
+      return fixed('offer_slots', withPair(pair, vary(LINES.which(pair), ALT_LINES.which(pair))), { step: 'offer_slots' });
     }
   }
   // "ok" / "sure" to "what day works best?": the two real times, not more questions.
   if (ASK_DAY_RX.test(lastOut) && !DAY_OR_TIME_RX.test(now) && (YES_RX.test(now) || MAYBE_RX.test(now) || VAGUE_ANSWER_RX.test(now))) {
-    if (offerSlots.length === 2) return fixed('offer_slots', withSlots(LINES.offer_slots(offerSlots, counters.slot_offers)), { step: 'offer_slots' });
+    if (freshPair.length === 2) return fixed('offer_slots', withPair(freshPair, LINES.offer_slots(freshPair, counters.slot_offers)), { step: 'offer_slots' });
     return Object.assign(plan, { step: 'offer_slots', required_move: 'offer_slots', booking: { allowed: true, reason: 'nepq:offer_slots' } });
   }
   // They named a day after "what day works best?": offer two times that day.
@@ -2321,6 +2332,23 @@ export function nearestToClock(slots, minutes, text = '', nowMs = Date.now()) {
  * The day the lead named in their last few messages ("sunday at 2" → "Sunday"),
  * or null. Read from the lead's own words only. Pure.
  */
+/**
+ * The part of day the lead said works for them ("in the evening", "after work",
+ * "mornings"), newest first. It stands until they name another or turn our times
+ * down ("neither"); a typed clock time is its own request (the 6:00 path), not this.
+ * Pure. 2026-10-20 (book_it_evening_spouse).
+ */
+export function standingPreference(inbound = []) {
+  for (let i = inbound.length - 1; i >= 0; i--) {
+    const text = String(inbound[i]?.text || '');
+    if (NEITHER_RX.test(text)) return null;
+    if (typedClock(text) != null) continue;
+    const pref = parseDayPreference(text);
+    if (pref && (pref.part || pref.after != null || pref.before != null)) return { ...pref, days: null };
+  }
+  return null;
+}
+
 export function namedDayInThread({ conversation = [], trigger = '' } = {}) {
   const turns = normalizeThread(conversation, trigger);
   const inbound = turns.filter(t => t.direction === 'inbound').slice(-4).reverse();
