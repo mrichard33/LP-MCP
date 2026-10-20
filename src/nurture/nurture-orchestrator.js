@@ -152,7 +152,7 @@ import { slackPhone, prospectLabel } from '../format-helpers.js';
 import { loadF0Context } from '../siro/f0-context.js';
 import { postDemoInterrupt } from '../siro/f0-interrupts.js';
 import { checkF0Copy, f0RetryNote } from '../siro/f0-copy-checks.js';
-import { parseFourStepOutput, FOUR_STEP_WAIT_HOURS } from '../siro/f0-four-step.js';
+import { parseFourStepOutput, dropTrailingSignature, FOUR_STEP_WAIT_HOURS } from '../siro/f0-four-step.js';
 import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from '../agentic/human-takeover.js';
 import { newestManualOutbound, lastInboundAt } from '../services/human-takeover-io.js';
 import { siroConfig, siroModes, siroRecordingUrl } from '../siro/config.js';
@@ -547,7 +547,7 @@ function fourStepOutput(output, f0, request) {
   if (!parsed.ok) return { ...(output || {}), sms_body: String(output?.text || output?.sms_body || ''), four_step_invalid: parsed.error };
   return {
     ...output,
-    sms_body: parsed.text,
+    sms_body: dropTrailingSignature(parsed.text, position),
     next_wait_hours: FOUR_STEP_WAIT_HOURS[position] ?? output?.next_wait_hours ?? 48,
     four_step_slots: parsed.slots,
   };

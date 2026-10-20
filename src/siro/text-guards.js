@@ -114,8 +114,8 @@ export function dropSensitiveDetail(text) {
 // visit: "this is Alex Cocco from Reece …", "reconnect tomorrow at 2:00 PM".
 // Neither is ours to repeat: the bot is the Reece Team, and the rep's time is
 // not a booking. Only Siro's follow-up text runs these.
-const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s?(?:a\.?m\.?|p\.?m\.?)(?![a-z])|\b(?:at|by)\s+(?:noon|\d{1,2}(?::\d{2})?)\b|\b(?:tomorrow|tonight|this\s+(?:afternoon|evening|morning))\b/i;
-const SELF_INTRO_RX = /\b(?:this\s+is|it'?s|my\s+name\s+is)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z'-]+)?\s+(?:from|with|at|of)\s+Reece\b/;
+const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s?(?:a\.?m\.?|p\.?m\.?)(?![a-z])|\b\d{1,2}:\d{2}\b|\b(?:at|by)\s+(?:noon|\d{1,2}(?::\d{2})?)\b|\b(?:tomorrow|tonight|this\s+(?:afternoon|evening|morning))\b/i;
+const SELF_INTRO_RX = /\b(?:this\s+is|it'?s|my\s+name\s+is)\s+[A-Z][A-Za-z'’-]+(?:\s+[A-Z][A-Za-z'’-]+){0,2}\s+(?:from|with|at|of)\s+Reece\b/;
 export function dropClockTimes(text) {
   return dropMatching(text, CLOCK_RX);
 }

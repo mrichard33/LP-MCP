@@ -88,3 +88,12 @@ test('2026-10-20 reprocess: the rep\'s self-intro, the rep\'s next time, a manag
   assert.match(t, /^Hi Dana\./);
   assert.match(t, /lanai slider will finally stop rattling/);
 });
+
+test('2026-10-20 re-scan: a surname with a capital inside and a bare "6:30" go too', () => {
+  const t = followupTextFrom(withDraft(
+    'Hi Dana, this is Brian DeMarco from Reece Windows & Doors. I arrived for our 6:30 appointment but we missed each other. '
+    + 'The lanai slider will finally stop rattling in storms.',
+  ).followups[0]);
+  for (const bad of ['DeMarco', 'Reece', '6:30']) assert.ok(!t.includes(bad), `followup_text must not hold ${bad}: ${t}`);
+  assert.match(t, /lanai slider/);
+});
