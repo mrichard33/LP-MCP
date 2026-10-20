@@ -28,6 +28,14 @@ import { copiesSiroDraft, repQuoteRx } from './presentation-guard.js';
 import { groundingSources, FOUR_STEP_SLOTS } from './f0-four-step.js';
 
 export const F0_SMS_MAX = 300;
+// 2026-10-20 (the first Four-Step previews): name + four parts + the call
+// question ran 301-330 characters on 3 of 10 leads with nothing to cut. The
+// prompt still asks for 300; the check allows two full SMS segments.
+export const F0_FOUR_STEP_SMS_MAX = 320;
+// The affirm slot is a short stock phrase ("that's fair with everything going
+// on") the model often folds into the hesitation ("… makes sense"): either
+// one word of the slot or an affirm phrase in the text counts.
+const AFFIRM_PHRASE_RX = /\b(?:fair|makes?\s+(?:total\s+|complete\s+)?sense|understandable|reasonable|completely\s+understand|i\s+understand|smart)\b/i;
 export const HINT_POSITION = 4;
 export const CLOSE_POSITION = 5;
 
@@ -111,6 +119,10 @@ function fourStepFailures(body, { facts, position, repFirstName, slots, firstNam
     const words = [...contentStems(s[k])];
     const have = contentStems(body);
     const need = Math.min(2, words.length);
+    if (k === 'affirm') {
+      if (!words.some(w => have.has(w)) && !AFFIRM_PHRASE_RX.test(body)) fail.push('slot_not_in_text:affirm');
+      continue;
+    }
     if (need && words.filter(w => have.has(w)).length < need) fail.push(`slot_not_in_text:${k}`);
   }
   // No visit on file (the no-visit-data variant): nothing to ground a slot in.
@@ -141,7 +153,7 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
   const fail = [];
   if (!body) return ['empty'];
   const fourStep = formula === 'four_step';
-  if (body.length > F0_SMS_MAX) fail.push('too_long');
+  if (body.length > (fourStep ? F0_FOUR_STEP_SMS_MAX : F0_SMS_MAX)) fail.push('too_long');
 
   const questions = (body.match(/\?/g) || []).length;
   if (position >= CLOSE_POSITION ? questions !== 0 : questions !== 1) fail.push('question_count');

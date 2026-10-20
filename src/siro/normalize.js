@@ -36,7 +36,7 @@
  */
 import { scrubPii, OBJECTION_TYPES } from '../knowledge/ci-moments-core.js';
 import { normalizePhone10 } from '../lead-leak-classify.js';
-import { dropDiscountTalk, dropMoneyTalk, dropSensitiveDetail } from './text-guards.js';
+import { dropDiscountTalk, dropMoneyTalk, dropSensitiveDetail, dropClockTimes, dropSelfIntro } from './text-guards.js';
 
 const OBJECTION_NAME_RX = /objection|concern|hesitat/i;
 const QUESTION_NAME_RX = /question/i;
@@ -214,13 +214,19 @@ const FOLLOWUP_TEXT_HEADERS = ['followuptextheader', 'followuptext', 'textmessag
 const headerKey = (h) => String(h || '').toLowerCase().replace(/[^a-z]/g, '');
 export const FOLLOWUP_TEXT_MAX = 400;
 
-/** Siro's drafted follow-up text, cleaned for the bot, or null. Pure. */
+/**
+ * Siro's drafted follow-up text, cleaned for the bot, or null. Pure.
+ * 2026-10-20: the first reprocess (136 drafts) showed what else rides in it:
+ * the rep's self-introduction ("this is Alex Cocco from Reece …"), the rep's
+ * own next time ("reconnect tomorrow at 2:00 PM"), a manager concession ("go
+ * to bat with my GM … best number") and credit trouble. All four go.
+ */
 export function followupTextFrom(fu) {
   for (const c of Array.isArray(fu?.context) ? fu.context : []) {
     const k = headerKey(c?.header);
     if (!k || k.includes('email') || !FOLLOWUP_TEXT_HEADERS.includes(k)) continue;
     const raw = scrubPii(cleanSiroText(valueText(c.value)));
-    const t = dropSensitiveDetail(dropMoneyTalk(dropDiscountTalk(raw))).trim();
+    const t = dropSelfIntro(dropClockTimes(dropSensitiveDetail(dropMoneyTalk(dropDiscountTalk(raw))))).trim();
     if (!t || NONE_RX.test(t)) return null;
     return t.length > FOLLOWUP_TEXT_MAX ? `${t.slice(0, FOLLOWUP_TEXT_MAX - 1).trimEnd()}…` : t;
   }

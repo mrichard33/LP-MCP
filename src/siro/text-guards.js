@@ -60,7 +60,10 @@ function dropMatching(text, rx, { keepRest = true } = {}) {
 // Siro's follow-up advice often names a concession. The bot must never offer
 // one, so any sentence about a discount, a price cut or a promotion is dropped
 // from what the bot reads. The quotes themselves stay (the user's ruling).
-const DISCOUNT_RX = /\b(?:discount\w*|rebate\w*|promo(?:tion|tional)?s?|coupon\w*|price\s+(?:cut|drop|reduction|match)\w*|(?:reduce|lower|cut|drop)\w*\s+(?:the\s+|their\s+|her\s+|his\s+)?(?:price|cost|quote|number)|manager[-\s]approved|special\s+(?:pricing|offer|deal)|incentive\w*|knock\w*\s+off)\b/i;
+// 2026-10-20 (the first reprocess of Siro's follow-up texts): "go to bat with
+// my GM Craig to get you the absolute best number" and "I'll see what extra
+// room I have with management" are concessions too.
+const DISCOUNT_RX = /\b(?:discount\w*|rebate\w*|promo(?:tion|tional)?s?|coupon\w*|price\s+(?:cut|drop|reduction|match)\w*|(?:reduce|lower|cut|drop)\w*\s+(?:the\s+|their\s+|her\s+|his\s+)?(?:price|cost|quote|number)|manager[-\s]approved|special\s+(?:pricing|offer|deal)|incentive\w*|knock\w*\s+off|go(?:ing|es)?\s+to\s+bat|(?:extra|wiggle)\s+room|with\s+(?:my|our|the)\s+(?:GM|general\s+manager|manager|management)|best\s+(?:possible\s+)?(?:number|price|pricing|rate))\b/i;
 export function dropDiscountTalk(text) {
   // "…review the brochures, confirm door specs, and offer the discount." keeps
   // its first clauses; a sentence that opens on the concession goes whole.
@@ -98,11 +101,26 @@ const SENSITIVE_RX = new RegExp([
   String.raw`\b(?:laid\s+off|layoffs?|unemploy\w*|out\s+of\s+work|lost\s+(?:his|her|their|my)\s+job|job\s+loss|got\s+fired)\b`,
   // debt and hardship
   String.raw`\b(?:debt\w*|bankrupt\w*|foreclos\w*|can'?t\s+afford|cannot\s+afford|could\s*n[o']t\s+afford|hardship|struggling\s+financially|behind\s+on\s+(?:bills|payments|the\s+mortgage)|collections)\b`,
+  // credit trouble (2026-10-20: "credit restoration program" in a Siro draft)
+  String.raw`\b(?:credit\s+(?:restoration|repair|problems?|issues?|trouble|history)|(?:bad|poor|low)\s+credit)\b`,
   // age
   String.raw`\b(?:elderly|senior\s+citizens?|retirees?|retired|retirement|\d{1,3}[-\s]years?[-\s]old|old\s+age|aging\s+(?:parent|parents|mother|father|mom|dad)|in\s+(?:his|her|their)\s+(?:60|70|80|90)s)\b`,
 ].join('|'), 'i');
 export function dropSensitiveDetail(text) {
   return dropMatching(text, SENSITIVE_RX);
+}
+
+// 2026-10-20: Siro's drafted text is written AS the rep, for the day of the
+// visit: "this is Alex Cocco from Reece …", "reconnect tomorrow at 2:00 PM".
+// Neither is ours to repeat: the bot is the Reece Team, and the rep's time is
+// not a booking. Only Siro's follow-up text runs these.
+const CLOCK_RX = /\b\d{1,2}(?::\d{2})?\s?(?:a\.?m\.?|p\.?m\.?)(?![a-z])|\b(?:at|by)\s+(?:noon|\d{1,2}(?::\d{2})?)\b|\b(?:tomorrow|tonight|this\s+(?:afternoon|evening|morning))\b/i;
+const SELF_INTRO_RX = /\b(?:this\s+is|it'?s|my\s+name\s+is)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z'-]+)?\s+(?:from|with|at|of)\s+Reece\b/;
+export function dropClockTimes(text) {
+  return dropMatching(text, CLOCK_RX);
+}
+export function dropSelfIntro(text) {
+  return dropMatching(text, SELF_INTRO_RX, { keepRest: false });
 }
 
 /** True when the text carries something dropSensitiveDetail would remove. Pure. */

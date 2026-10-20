@@ -33,6 +33,10 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
   const fourStep = f0.vars.formula === 'four_step';
   context.siro = { ...f0.vars, selector_objection: fourStep ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data') };
   context.nurture_request = { workflow_code: 'F.0', sequence_position: pos };
+  // 2026-10-20: as the orchestrator: a couple's first person for {{lead.first_name}}.
+  if (fourStep && !context.lead?.first_name && f0.vars.first_name) {
+    context.lead = { ...(context.lead || {}), first_name: f0.vars.first_name };
+  }
   const interrupt = postDemoInterrupt(f0.interruptInput);
 
   const prompt = await (deps.selectPrompt || selectPrompt)(context, request);
@@ -52,7 +56,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
     const safety = validateSafety(out, p, context);
     const f0Failures = invalid ? ['four_step_output'] : checkF0Copy(out?.sms_body, {
       facts: f0.facts, position: pos, repFirstName: f0.vars.rehash_rep_first_name,
-      formula: fourStep ? 'four_step' : 'v1', slots, firstName: context?.lead?.first_name || null,
+      formula: fourStep ? 'four_step' : 'v1', slots, firstName: (fourStep ? f0.vars?.first_name : null) || context?.lead?.first_name || null,
       followupText: f0.vars.followup_text_line ? f0.facts?.followup_text || null : null,
     });
     return { out, safety, f0Failures, slots };

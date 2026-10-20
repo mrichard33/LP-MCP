@@ -176,3 +176,23 @@ test('the retry note names every new failure in plain words', () => {
   const n = f0RetryNote(['sensitive_detail', 'no_if_i_could', 'slot_ungrounded:hesitation', 'slot_not_in_text:reframe', 'four_step_output'], { position: 1 });
   for (const w of ['death', 'If I could', 'hesitation slot', 'reframe slot', 'JSON']) assert.ok(n.includes(w), w);
 });
+
+test('2026-10-20 previews: an affirm folded into the hesitation counts; Four-Step allows 320 characters', () => {
+  const folded = 'James, wanting your grandson to look over the numbers first makes sense. Getting those rotting windows done before the family visits for Christmas still matters. If I could make the numbers work better for you both, would you be open to a quick call with John?';
+  assert.deepEqual(checkF0Copy(folded, opts(1, { slots: { ...SLOTS, affirm: "that's reasonable for a decision this size" } })), []);
+  const noAffirm = 'James, you want your grandson to look over the numbers first. Getting those rotting windows done before the family visits for Christmas still matters. If I could make the numbers work better for you both, would you be open to a quick call with John?';
+  assert.ok(checkF0Copy(noAffirm, opts(1, { slots: { ...SLOTS, affirm: 'that is wise with everything going on' } })).includes('slot_not_in_text:affirm'));
+  const long = `${GOOD} `.padEnd(315, 'x').trim();
+  assert.ok(!checkF0Copy(long, opts(1)).includes('too_long'));
+  assert.ok(checkF0Copy(`${GOOD} `.padEnd(330, 'x'), opts(1)).includes('too_long'));
+  assert.ok(checkF0Copy(`${GOOD} `.padEnd(310, 'x'), opts(1, { formula: 'v1' })).includes('too_long'));
+});
+
+test('2026-10-20: a couple\'s name field gives its first person (the text opens on a real name, never a guess)', async () => {
+  const { firstPersonName } = await import('../src/services/lp-identity-fill.js');
+  assert.equal(firstPersonName('Dale/Rita'), 'Dale');
+  assert.equal(firstPersonName('Nora & Daughter'), 'Nora');
+  assert.equal(firstPersonName('Ann / Neil'), 'Ann');
+  assert.equal(firstPersonName('n/a'), '');
+  assert.ok(checkF0Copy(GOOD.replace(/^James/, 'Jmaes'), opts(1)).includes('first_name_not_first'));
+});

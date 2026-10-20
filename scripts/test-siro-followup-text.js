@@ -74,3 +74,17 @@ test('siro_draft_copied: 60% of the reply taken from the draft fails', () => {
   const ok = checkReply('Did you get a chance to look over the proposal?', { channel: 'sms', presentation });
   assert.ok(!ok.violations.some(v => v.code === 'siro_draft_copied'));
 });
+
+test('2026-10-20 reprocess: the rep\'s self-intro, the rep\'s next time, a manager concession and credit trouble go', () => {
+  const t = followupTextFrom(withDraft(
+    'Hi Dana, this is Brian Smith from Reece Windows & Doors. It was great meeting you today. '
+    + 'I have us scheduled to reconnect tomorrow at 2:00 PM to look over the door designs. '
+    + 'I will go to bat with my GM to get you the absolute best number. '
+    + 'We also talked about the credit restoration program. '
+    + 'The lanai slider will finally stop rattling in storms.',
+  ).followups[0]);
+  assert.ok(t);
+  for (const bad of ['Brian', 'Reece', '2:00', 'tomorrow', 'GM', 'best number', 'credit']) assert.ok(!t.includes(bad), `followup_text must not hold ${bad}: ${t}`);
+  assert.match(t, /^Hi Dana\./);
+  assert.match(t, /lanai slider will finally stop rattling/);
+});

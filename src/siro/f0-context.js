@@ -18,6 +18,7 @@ import { ensureRecordingForLead } from './ensure-recording.js';
 import { buildPresentationFacts, presentationTemplateVars, repFirstName } from './presentation-facts.js';
 import { siroConfig, siroModes } from './config.js';
 import { buildVisitFacts, fourStepObjectionType, STORY_ANGLES } from './f0-four-step.js';
+import { firstPersonName } from '../services/lp-identity-fill.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { lpSold, isUnsoldPostDemo } from '../agentic/post-demo-owner.js';
 import { isInRehash, rehashLeadFromContext, stageFromRows } from '../agentic/rehash-state.js';
@@ -152,11 +153,23 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   // type, so 8 of 10 preview leads got the price variant, Mr. Jackson's
   // "decision maker not present" included.
   if (modes.f0Formula === 'four_step') {
+    // 2026-10-20: the formula opens on the first name. A couple's field
+    // ("George/Paula") is no name to the reply writer, so it is read here and
+    // its first person used; with none at all the text opens without a name.
+    let firstName = lead.first_name || '';
+    if (!firstName && demoLeadId) {
+      firstName = await safe('lp_leads first_name', async () => {
+        const { data, error } = await supabase.from('lp_leads').select('first_name').eq('lp_lead_id', demoLeadId).limit(1);
+        if (error) throw new Error(error.message);
+        return firstPersonName(data?.[0]?.first_name);
+      }, '');
+    }
+    vars.first_name = firstName || '';
     const objectionType = fourStepObjectionType(facts);
     vars.formula = 'four_step';
     vars.objection_type = objectionType;
     vars.story_angle = STORY_ANGLES[objectionType] || STORY_ANGLES.none;
-    vars.visit_facts = buildVisitFacts(facts, { firstName: lead.first_name || '', repFirstName: rehashRepFirst, followupTextLive });
+    vars.visit_facts = buildVisitFacts(facts, { firstName: vars.first_name, repFirstName: rehashRepFirst, followupTextLive });
   }
   return {
     facts,

@@ -220,6 +220,11 @@ export async function runNurtureGeneration(request) {
       selector_objection: f0.vars.formula === 'four_step' ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data'),
     };
     context.nurture_request = { workflow_code: request.workflow_code, sequence_position: request.sequence_position };
+    // 2026-10-20: the Four-Step prompt reads {{lead.first_name}}; a couple's
+    // field ("George/Paula") left it empty and the model guessed "Gorge".
+    if (f0.vars.formula === 'four_step' && !context.lead?.first_name && f0.vars.first_name) {
+      context.lead = { ...(context.lead || {}), first_name: f0.vars.first_name };
+    }
     await stampSiroRecording(generation_id, f0.recordingId);
     if (request.force_send !== true) {
       const pd = postDemoInterrupt(f0.interruptInput);
@@ -517,7 +522,7 @@ function runOutputChecks(output, prompt, context, f0, request) {
       repFirstName: f0.vars?.rehash_rep_first_name || null,
       formula: fourStep ? 'four_step' : 'v1',
       slots: output?.four_step_slots || null,
-      firstName: context?.lead?.first_name || null,
+      firstName: (fourStep ? f0.vars?.first_name : null) || context?.lead?.first_name || null,
       followupText: f0.vars?.followup_text_line ? f0.facts?.followup_text || null : null,
     });
   if (!f0Failures.length) return safety;
