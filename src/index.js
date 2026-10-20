@@ -355,6 +355,8 @@ import { startRehashReplyDigestScheduler } from './jobs/rehash-reply-digest.js';
 import { startCapacityGateJobs } from './jobs/capacity-gate-jobs.js';  // 2026-10-15 — evening-request LP notes + unfiled-availability alert
 import { startIdentityFillScheduler } from './jobs/lp-identity-fill-sweep.js';  // 2026-10-11
 import { registerLpIdentityFillRoutes } from './admin/lp-identity-fill.js';  // 2026-10-11
+import { startPartnerFastPollScheduler } from './jobs/partner-fast-poll.js';  // 2026-10-20 partner lead ownership
+import { registerPartnerOwnerRoutes } from './partners/routes.js';  // 2026-10-20
 import { startPostIssueRetryScheduler } from './jobs/post-issue-rebook-retry.js';  // 2026-10-09
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
 import { startChatLeadIntakeScheduler } from './jobs/chat-lead-intake-sweep.js';  // 2026-09-28
@@ -916,6 +918,9 @@ registerConfirmationPipelineRoutes(app, authenticate); // 2026-10-16 — 4. Conf
 registerStaleAppointmentRefreshRoutes(app, authenticate); // 2026-10-15 — one-time re-read of pre-2026-07-08 lp_leads appointment rows from LP (dry-run default, never GHL)
 registerLpContactBackstopRoutes(app); // 2026-07-09 — LP contact auto-create backstop (scheduler env-gated, default off)
 registerLpIdentityFillRoutes(app, { authenticate }); // 2026-10-11 — fill nameless contacts from LP (dry-run default)
+// 2026-10-20 — partner lead ownership (LP branch → GHL owner). These routes write GHL owners, so the
+// check is strict and fails closed: no soft launch (production runs AUTH_SOFT_LAUNCH=true), no token → 503.
+registerPartnerOwnerRoutes(app, { authenticate: makeAuthenticate({ token: MCP_AUTH_TOKEN, softLaunch: false, mode: 'enforce' }) });
 registerLpMirrorBackfillRoutes(app); // 2026-07-10 — windowed cursor-independent mirror recovery (dry-run default)
 registerRtpJobBackfillRoutes(app); // 2026-07-10 (#512) — one-shot RTP job-axis backfill (dry-run default)
 registerGhlAppointmentDedupeRoutes(app); // 2026-07-10 — WE same-slot de-dupe (dry-run default)
@@ -1054,6 +1059,7 @@ const server = app.listen(PORT, async () => {
   startRehashReplyDigestScheduler();
   startCapacityGateJobs();
   startIdentityFillScheduler();
+  startPartnerFastPollScheduler();  // 2026-10-20 — partner owner fast lane (every PARTNER_POLL_MS)
   startPostIssueRetryScheduler();
   startLeadLeakScheduler();
   startLeadUncalledScheduler();

@@ -1104,6 +1104,24 @@ C.1/C.2/C.4 have the first step that consumes it, or the tags sit and swallow ea
 edits only a person can make are `docs/ghl-p2-customer-workflow-fixes.md` (C.0-IN's backward reset first; until then the
 sweep reverts it within 30 minutes). No LP job is a report, never a write (`scripts/repair-p2-missing-lp-jobs.js`).
 
+**A partner's LP leads are owned by the partner in GHL (Mark, 2026-10-19).** A NEW lead in an outside sales partner's
+LP branch (Ross Erstling → RFED, any rep) gets the partner's GHL user as the contact owner AND on every open opportunity;
+when it leaves the branch the owner returns to `PARTNER_DEFAULT_OWNER_ID` (the Reece team user). LP → GHL only, never a
+write to LP, never a messaging, tag or workflow change. The mapping is data (`partner_owner_map`: branch + optional rep;
+an exact branch + rep row beats the branch-only row; migration `20261020200000_partner_owner_sync.sql`). The decision is
+`syncPartnerOwner` (`src/partners/owner-sync.js`), called by `processProspect` after every lead write (a branch or rep
+change now always writes the row) and by job `partner-fast-poll` (every `PARTNER_POLL_MS`, 90 s: LP changes since its own
+cursor, filtered locally to partner branches, plus retries of `failed` / `no_ghl_contact`). Rules: the contact's CURRENT
+lead decides (`pickCurrentLead`; the user, 2026-10-20); only leads created after `PARTNER_GO_LIVE_AT`, moved into the
+branch after it, or already aimed at a partner count (no backfill of older RFED leads); with no match the owner changes
+only when GHL's owner is a partner user (an internal owner is never touched); a dispositioned lead that stays in the
+branch keeps the partner. Every write is read back (a kept owner is `failed`), noted on the contact, logged in
+`partner_owner_log`, and posts ONE card per lead + reason + owner to `PARTNER_ALERT_SLACK_CHANNEL` (`alert-posted`, unset
+= log only). A partner is an OWNER, never a follower: GHL's "Only Assigned Data" keys on the owner. Off with
+`PARTNER_SYNC_ENABLED=false` or `PARTNER_GO_LIVE_AT` unset. `POST /n8n/admin/partner-owner/run {lp_lead_id, dry_run}`
+(strict operator token, no soft launch) and `GET /n8n/admin/partner-owner/status`. Side effect: GHL credits a bot message
+with no `userId` to the contact owner, so bot texts to a partner lead show as the partner in GHL.
+
 **Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; `supabase/migrations/20261012222106_158_marketing_cost_ledger.sql`).** Report 136 and LP cost entry
 are retired: nobody types a cost into LP again, and no code reads `mcost_cents` for a cost. The money lives in
 `marketing_expenses` (invoice lines, Lead Gurus feed days, commission rules) and is split per month and market in
