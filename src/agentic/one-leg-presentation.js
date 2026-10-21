@@ -62,9 +62,21 @@ export function isOneLegContact(objectionState) {
   return String(objectionState?.state_code || '') === ONE_LEG_STATE;
 }
 
+// 2026-10-21 (the user): a lead assigned to an outside partner's phone team
+// (GHL tag `phone-team`, added by our partner sync for RFED and by S5.2's
+// 1 Leg branch) is worked by phone: "Our chatbot should still respond to any SMS
+// messaging and try to book the call." Same calendar, same two real times, same
+// both-decision-makers hold as the 1 Leg branch.
+export const PHONE_TEAM_TAG = 'phone-team';
+
+/** Does this contact carry the phone-team tag? Pure. */
+export function isPhoneTeamContact(tags) {
+  return Array.isArray(tags) && tags.some((t) => String(t || '').trim().toLowerCase() === PHONE_TEAM_TAG);
+}
+
 /** Does this reply turn get the phone presentation branch? Pure. */
-export function phonePresentationActive({ objectionState, postDemo = false, rehash = false, channel = 'sms', env = process.env } = {}) {
-  return channel === 'sms' && !postDemo && !rehash && isOneLegContact(objectionState)
+export function phonePresentationActive({ objectionState, tags = [], postDemo = false, rehash = false, channel = 'sms', env = process.env } = {}) {
+  return channel === 'sms' && !postDemo && !rehash && (isOneLegContact(objectionState) || isPhoneTeamContact(tags))
     && onePresentationMode(env) === 'live' && !!phonePresentationCalendarId(env);
 }
 

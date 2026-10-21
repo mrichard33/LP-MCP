@@ -231,10 +231,19 @@ for (const mode of ['live', 'shadow']) {
     const t = r.transcript[0];
     assert.equal(t.customer, 'Still got a couple more quotes to come in\nSounds good 👍', 'the buffer hands both texts to one turn');
     assert.equal(t.turn_lock.second.skip_reason, 'already_answered');
-    const failed = scoreResult(r).failures.some(f => f.code === 'two_texts_not_one_reply');
-    assert.equal(failed, mode === 'shadow', 'shadow still sends the second reply today; live does not');
+    // 2026-10-21: the lock's decision is the measure in both modes (shadow
+    // records the would-skip), so a healthy run passes either way.
+    const codes = scoreResult(r).failures.map(f => f.code);
+    assert.ok(!codes.includes('two_texts_not_one_reply'), codes.join(','));
+    assert.ok(!codes.includes('second_rule_not_locked'), codes.join(','));
   });
 }
+
+test('two_texts_one_reply_sms fails when the second rule claims the turn', () => {
+  const r = { scenario: 'two_texts_one_reply_sms', channel: 'sms', transcript: [{ turn: 1, customer: 'a\nb', bot: ['Sounds good.'], turn_lock: { mode: 'shadow', claimed: true, second: { rule: 'X', claimed: true, skip_reason: null, mode: 'shadow' } } }], would_do: [] };
+  const codes = scoreResult(r).failures.map(f => f.code);
+  assert.ok(codes.includes('two_texts_not_one_reply'), codes.join(','));
+});
 
 test('the simulator carries the previous reply\'s plan step to the next turn', async () => {
   const seen = [];

@@ -208,7 +208,11 @@ import {
 // write-through) rather than a raw DELETE from here.
 import { executeRemoveTag } from './tags.js';
 import { withGhlToken } from '../../ghl-rate-limiter.js';
-import { gateS52Enrollment } from '../../s52-entry-gate.js';
+import { gateS52Enrollment, isS52Target } from '../../s52-entry-gate.js';
+import { isPhoneTeamContact } from '../../agentic/one-leg-presentation.js';
+
+// PHONE_TEAM_HOLD_ENABLED=false turns the phone-team enrollment hold off (2026-10-21).
+const phoneTeamHoldEnabled = (env = process.env) => String(env.PHONE_TEAM_HOLD_ENABLED ?? '').trim().toLowerCase() !== 'false';
 // 2026-10-07 — the one send gate (src/services/may-message.js).
 import { applySendGate } from '../../services/send-gate-report.js';
 import { matchMutationSuppression } from '../../services/suppression-check.js';
@@ -679,6 +683,27 @@ export async function executeAddToWorkflow(action) {
         route: 'skip',
       };
     }
+  }
+
+  // ── 2026-10-21 Phone-team hold (the user) ─────────────────────
+  // A lead assigned to an outside partner's phone team (tag phone-team: Ross
+  // Erstling, RFED) gets the one SMS and one email GHL already sends, and no
+  // other drip we start: "we are not going to know when they got ahold of the
+  // lead". S5.2 stays open: its 1 Leg branch IS that one SMS + one email, and it
+  // is what adds phone-team for 1 Leg leads. The bot still answers their texts
+  // (the send gate's operational hold blocks outreach only).
+  // PHONE_TEAM_HOLD_ENABLED=false is the rollback.
+  if (tags && phoneTeamHoldEnabled() && isPhoneTeamContact(tags) && !isS52Target(payload)) {
+    console.log(`[ActionExecutor] ⏭️ add_to_workflow skipped — ${contactId} is on the phone team (${wfLabel})`);
+    return {
+      action: 'skipped_phone_team',
+      contact_id: contactId,
+      canonical_code: canonicalCode,
+      canonical_name: canonicalName,
+      guard_tag: 'phone-team',
+      workflow_name: payload.workflow_name || null,
+      route: 'skip',
+    };
   }
 
   const s52Block = await gateS52Enrollment(action);

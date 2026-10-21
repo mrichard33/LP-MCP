@@ -19,7 +19,7 @@ const ENV = {
   PARTNER_ALERT_SLACK_CHANNEL: 'CPARTNER',
   GHL_LOCATION_ID: 'loc1',
 };
-const MAP = [{ id: 'm1', partner_name: 'Ross Erstling', lp_branch_id: 'RFED', lp_rep_name: null, ghl_user_id: ROSS, active: true }];
+const MAP = [{ id: 'm1', partner_name: 'Ross Erstling', lp_branch_id: 'RFED', lp_rep_name: null, ghl_user_id: ROSS, active: true, ghl_tag: 'phone-team' }];
 const NEW_LEAD_AT = '2026-10-21T10:00:00+00:00'; // stored ET wall clock, after go-live
 const OLD_LEAD_AT = '2026-10-13T17:08:37+00:00'; // before go-live
 const OLD = { created_at_lp: OLD_LEAD_AT, updated_at_lp: '2026-10-14T09:00:00+00:00' }; // and LP has not touched it since
@@ -32,12 +32,13 @@ function lead(over = {}) {
   };
 }
 
-function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, keepOwner = false, env = ENV, assignments = [], noAccess = [] } = {}) {
+function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, keepOwner = false, env = ENV, assignments = [], noAccess = [], tags = [] } = {}) {
   clearCache();
   __resetForTests();
   const db = fakeSupabase({ partner_owner_map: map, lp_leads: leads, partner_owner_log: log, partner_owner_assignments: assignments });
   const contacts = new Map();
-  for (const l of leads) if (l.ghl_contact_id) contacts.set(l.ghl_contact_id, { id: l.ghl_contact_id, firstName: 'Pat', lastName: 'Lee', assignedTo: owner });
+  for (const l of leads) if (l.ghl_contact_id) contacts.set(l.ghl_contact_id, { id: l.ghl_contact_id, firstName: 'Pat', lastName: 'Lee', assignedTo: owner, tags: [...tags] });
+  const tagCalls = [];
   const opportunities = opps ?? [
     { id: 'o1', contactId: 'cAAAAAAAAAAAAAAAAAA1', status: 'open', assignedTo: owner },
     { id: 'o2', contactId: 'cAAAAAAAAAAAAAAAAAA1', status: 'won', assignedTo: owner },
@@ -45,6 +46,13 @@ function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, kee
   const writes = [];
   const ghlFetch = async (method, path, body) => {
     let m;
+    if ((m = path.match(/^\/contacts\/([^/?]+)\/tags$/))) {
+      const c = contacts.get(m[1]);
+      tagCalls.push({ method, id: m[1], tags: body.tags });
+      if (method === 'POST') c.tags = [...new Set([...(c.tags || []), ...body.tags])];
+      if (method === 'DELETE') c.tags = (c.tags || []).filter((t) => !body.tags.includes(t));
+      return { succeeded: true };
+    }
     if ((m = path.match(/^\/contacts\/([^/?]+)$/))) {
       const c = contacts.get(m[1]);
       if (method === 'GET') return c ? { contact: { ...c } } : null;
@@ -83,7 +91,7 @@ function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, kee
     now: () => NOW,
     log: () => {},
   };
-  return { db, deps, contacts, opportunities, writes, notes, slack };
+  return { db, deps, contacts, opportunities, writes, notes, slack, tagCalls };
 }
 
 const logRows = (w) => w.db.tables.partner_owner_log || [];
@@ -180,6 +188,61 @@ test('2e. a failed pass on a no-access card heals on the next pass after this fi
   const r = await syncPartnerOwner(lead(), { prevRow: lead(), deps: w.deps });
   assert.equal(r.reason, 'assigned');
   assert.equal(logRows(w).at(-1).reason, 'assigned');
+});
+
+test('2f. assigning Ross adds phone-team (GHL U.RFED assigns + texts Ross on it), read back and logged', async () => {
+  const w = world();
+  const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r.reason, 'assigned');
+  assert.deepEqual(w.contacts.get('cAAAAAAAAAAAAAAAAAA1').tags, ['phone-team']);
+  assert.deepEqual(r.tag, { tag: 'phone-team', present: true, added: true });
+  assert.deepEqual(logRows(w).at(-1).detail.tag, { tag: 'phone-team', present: true, added: true });
+  // The next pass is a memo: no second tag add (GHL fires on every add).
+  const again = await syncPartnerOwner(lead(), { prevRow: lead(), deps: w.deps });
+  assert.equal(again.reason, 'memo');
+  assert.equal(w.tagCalls.filter((c) => c.method === 'POST').length, 1);
+});
+
+test('2g. a contact already Ross\'s without phone-team gets the tag (noop path); one that has it gets no second add', async () => {
+  const w = world({ owner: ROSS });
+  const r = await syncPartnerOwner(lead(), { prevRow: lead(), deps: w.deps });
+  assert.equal(r.reason, 'noop');
+  assert.equal(r.tag.added, true);
+  assert.deepEqual(w.contacts.get('cAAAAAAAAAAAAAAAAAA1').tags, ['phone-team']);
+  const w2 = world({ owner: ROSS, tags: ['phone-team'] });
+  const r2 = await syncPartnerOwner(lead(), { prevRow: lead(), deps: w2.deps });
+  assert.equal(r2.reason, 'noop');
+  assert.equal(w2.tagCalls.length, 0);
+});
+
+test('2h. our return removes the phone-team tag we added; a dry run only reports it', async () => {
+  const moved = lead({ lp_branch_id: 'BOCA' });
+  const w = world({ leads: [moved], owner: ROSS, assignments: [ours()], tags: ['phone-team', 'other'] });
+  const dry = await syncPartnerOwner(moved, { prevRow: lead(), dryRun: true, deps: w.deps });
+  assert.equal(dry.reason, 'returned');
+  assert.equal(w.tagCalls.length, 0);
+  const r = await syncPartnerOwner(moved, { prevRow: lead(), deps: w.deps });
+  assert.equal(r.reason, 'returned');
+  assert.deepEqual(w.contacts.get('cAAAAAAAAAAAAAAAAAA1').tags, ['other']);
+  assert.deepEqual(r.tag, { tag: 'phone-team', removed: true });
+});
+
+test('2i. a failed tag add never undoes the owner; the next pass tries again', async () => {
+  const w = world();
+  const real = w.deps.ghlFetch;
+  let fail = true;
+  w.deps.ghlFetch = async (method, path, body) => {
+    if (fail && path.endsWith('/tags')) throw new Error('GHL 502');
+    return real(method, path, body);
+  };
+  const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r.reason, 'assigned');
+  assert.equal(w.contacts.get('cAAAAAAAAAAAAAAAAAA1').assignedTo, ROSS);
+  assert.equal(r.tag.present, false);
+  fail = false;
+  const again = await syncPartnerOwner(lead(), { prevRow: lead(), deps: w.deps });
+  assert.notEqual(again.reason, 'memo', 'an unconfirmed tag is not a memo');
+  assert.deepEqual(w.contacts.get('cAAAAAAAAAAAAAAAAAA1').tags, ['phone-team']);
 });
 
 test('3. an old lead whose branch changes INTO RFED after go-live → Ross, and stays Ross on later passes', async () => {

@@ -469,7 +469,7 @@ test('Phase 0: the six scenarios carry the spec\'s expectations; every scenario 
 test('Phase 0: the scorecard reports a pass rate per family, and a family that falls is worse', () => {
   const fam = (scenario, family, ok) => ({ ...result(scenario, [turn(1, 'hi', ok ? 'What got you looking?' : null)]), family });
   const card = scoreRun([fam('fam_a', 'new_lead', true), fam('fam_b', 'rehash', false), fam('fam_c', 'booking', true)]);
-  assert.equal(SCORING_VERSION, '2026-10-21.2');
+  assert.equal(SCORING_VERSION, '2026-10-21.3');
   assert.deepEqual(card.pass_rate_by_family.rehash, { conversations: 1, passed: 0, pass_rate: 0 });
   assert.equal(card.pass_rate_by_family.new_lead.pass_rate, 1);
   const text = formatScorecard(card);
@@ -490,4 +490,31 @@ test('Phase 0: the scorecard reports a pass rate per family, and a family that f
 test('Phase 0: a saved run keeps each result\'s family', () => {
   const card = scoreRun([{ ...result('rehash_defer', [turn(1, 'Call me in the spring', 'Will do.', pd('defer'))]), family: 'rehash' }]);
   assert.equal(evalRunPayload(card, null).scorecard.results[0].family, 'rehash');
+});
+
+// ── 2026-10-21 (SCORING_VERSION .3): three checks that failed on a healthy bot ──
+
+test('the cancel flow\'s identity ask is allowed by the turn\'s flow, whatever the scenario is called', () => {
+  const ask = 'Sorry to hear that. What is the full name and phone number the appointment is under?';
+  const fl = (flow) => scoreResult(result('reschedule_unclear', [turn(1, 'I need to change my appointment', ask, { flow })]));
+  assert.ok(!fl('ask_identity').failures.some(f => f.code === 'more_than_one_ask'), JSON.stringify(fl('ask_identity').failures));
+});
+
+test('the Siro hesitation check runs only when the run had SIRO_CONTEXT_MODE live', () => {
+  const r = (mode) => ({ ...result('rehash_siro_price_objection', [turn(1, 'We are still thinking it over', 'Totally fair. What would help you decide?', pd('post_demo'))]), channel: 'sms', ...(mode ? { siro_context_mode: mode } : {}) });
+  assert.ok(!scoreResult(r('shadow')).failures.some(f => f.code === 'visit_hesitation_ignored'));
+  assert.ok(scoreResult(r('live')).failures.some(f => f.code === 'visit_hesitation_ignored'));
+});
+
+test('phone_team_books_call: a phone-team lead offered a visit fails (with the calendar set)', () => {
+  const prev = process.env.PHONE_PRESENTATION_CALENDAR_ID;
+  process.env.PHONE_PRESENTATION_CALENDAR_ID = 'cal_pp';
+  try {
+    const bad = { ...result('phone_team_books_call', [turn(1, 'When can we talk?', 'I have Tue at 10 AM or Wed at 2 PM. Which works better?', { nepq: { step: 'offer_slots' } })]), channel: 'sms', would_do: [{ kind: 'would_book_appointment', payload: { calendar_name: 'Window Estimate' }, turn: 1 }] };
+    const codes = scoreResult(bad).failures.map(f => f.code);
+    assert.ok(codes.includes('no_phone_presentation'), codes.join(','));
+    assert.ok(codes.includes('one_leg_booked_visit'), codes.join(','));
+  } finally {
+    if (prev === undefined) delete process.env.PHONE_PRESENTATION_CALENDAR_ID; else process.env.PHONE_PRESENTATION_CALENDAR_ID = prev;
+  }
 });

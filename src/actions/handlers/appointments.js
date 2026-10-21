@@ -94,7 +94,7 @@ import { CALENDAR_MAP, GHL_LOCATION_ID } from '../constants.js';
 import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
 import { isInHomeCalendarId, isGhlOnlyCalendarId, isRehashCalendarId, rehashCalendarId, BOOKING_CALENDARS } from '../../knowledge/booking-calendar-router.js';
-import { isPhonePresentationCalendarId, ONE_LEG_STATE } from '../../agentic/one-leg-presentation.js';
+import { isPhonePresentationCalendarId, ONE_LEG_STATE, isPhoneTeamContact } from '../../agentic/one-leg-presentation.js';
 import { callAssigneeFor, rehashRepFor } from '../../config/rehash-assignee.js';
 import { isInRehash, rehashRoutingMode, rehashTeamUserIds, hasPostAppointmentStage } from '../../agentic/rehash-state.js';
 import { notifyRehashCall } from '../../notifications/rehash-call.js';
@@ -717,13 +717,24 @@ export async function executeBookAppointment(action, context) {
   // whose OPEN objection state is APPOINTMENT_DISRUPTION.one_leg, and nobody
   // else. A read that fails books nothing (fail closed: every other contact
   // must never get one).
+  // 2026-10-21 (the user): a phone-team contact (an outside partner's lead) books
+  // the call there too. Its tag is read live; a failed read is "not tagged".
   if (isPhonePresentationCalendarId(calendarId)) {
     const { data: openState, error: stateErr } = await supabase.from('contact_objection_states')
       .select('state_code').eq('contact_id', contactId).is('exited_at', null).maybeSingle();
+    let phoneTeam = false;
     if (stateErr || openState?.state_code !== ONE_LEG_STATE) {
-      const why = stateErr ? `objection state unreadable (${stateErr.message})` : `open state ${openState?.state_code || 'none'}`;
+      try {
+        const live = await ghlFetch('GET', `/contacts/${contactId}`);
+        phoneTeam = isPhoneTeamContact(live?.contact?.tags);
+      } catch (err) {
+        console.warn(`[ActionExecutor] ${contactId}: tag read for Phone Presentation failed (${err.message}) — treated as not phone-team`);
+      }
+    }
+    if (!phoneTeam && (stateErr || openState?.state_code !== ONE_LEG_STATE)) {
+      const why = stateErr ? `objection state unreadable (${stateErr.message})` : `open state ${openState?.state_code || 'none'}, no phone-team tag`;
       console.log(`[ActionExecutor] ⛔ skipped_not_one_leg: ${contactId} — ${why}; nothing booked on Phone Presentation`);
-      return { action: 'skipped_not_one_leg', contact_id: contactId, calendar_id: calendarId, start_time: startTime, reason: `Phone Presentation is for 1 Leg contacts only (handoff v3, 2026-10-20): ${why}` };
+      return { action: 'skipped_not_one_leg', contact_id: contactId, calendar_id: calendarId, start_time: startTime, reason: `Phone Presentation is for 1 Leg and phone-team contacts only (2026-10-20/21): ${why}` };
     }
   }
 

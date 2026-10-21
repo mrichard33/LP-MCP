@@ -106,7 +106,10 @@ export function withPersonaLp(context, persona) {
   // 2026-10-16 (Siro PR 1): a persona may carry the Siro recording of its
   // visit (persona.lp.siro: siro_recordings rows), as SIRO_CONTEXT_MODE=live
   // would read it from Supabase.
-  const siroRows = Array.isArray(lp.siro) && lp.siro.length ? lp.siro : null;
+  // 2026-10-21: only when the run's SIRO_CONTEXT_MODE is live (Railway's, or
+  // the gate's siro_context_mode). Production reads no visit in shadow, so a
+  // shadow run that saw one tested a feature that is off.
+  const siroRows = siroModes().context === 'live' && Array.isArray(lp.siro) && lp.siro.length ? lp.siro : null;
   next.lead_facts = buildLeadFacts({ lp: ctxLp, lpLead: { zip: lp.zip, city: lp.city, address: lp.address }, lead: context.lead, siro: siroRows, siroFollowupTextLive: siroModes().followupText === 'live' });
   if (siroRows) next.siro = { presentation: buildPresentationFacts(siroRows) };
   return next;
@@ -130,6 +133,12 @@ const ONE_LEG_LEAD = {
   firstName: 'Pat', lastName: 'Sim', phone: '+13525550188', email: null, postalCode: '33908',
   objectionState: { state_code: 'APPOINTMENT_DISRUPTION.one_leg', parent_state: 'APPOINTMENT_DISRUPTION', attempt_number: 1 },
   lp: { disposition: '1Leg', zip: '33908', city: 'Fort Myers', address: '1200 Palm Ave' },
+};
+
+// 2026-10-21: an RFED lead the partner owner sync assigned to Ross (tag phone-team).
+const PHONE_TEAM_LEAD = {
+  firstName: 'Lee', lastName: 'Sim', phone: '+15615550190', email: null, postalCode: '33401', tags: ['phone-team'],
+  lp: { disposition: 'Data', zip: '33401', city: 'West Palm Beach', address: '88 Clematis St' },
 };
 
 // 2026-10-16 (Siro PR 1): the same rehash lead, with the Siro recording of
@@ -301,6 +310,9 @@ export const SCENARIOS = Object.freeze({
   // NOT in that state who says the spouse is away keeps the normal offer. The
   // 1 Leg check applies only when PHONE_PRESENTATION_CALENDAR_ID is set.
   one_leg_phone_presentation: { title: '1 Leg: reschedule ask gets the phone presentation, both decision makers', family: 'booking', persona: ONE_LEG_LEAD, channels: ['sms'], turns: ['Can we reschedule? My husband had to work when the rep came.'] },
+  // 2026-10-21 (the user): a contact GHL tagged phone-team (an RFED lead our
+  // partner sync gave Ross) is offered the same phone presentation call.
+  phone_team_books_call: { title: 'phone-team (Ross) lead: a time ask gets the phone presentation, not a visit', family: 'booking', persona: PHONE_TEAM_LEAD, channels: ['sms'], turns: ['Hi, I got your text. When can we talk about the windows?'] },
   absent_spouse_normal_offer: { title: 'Not 1 Leg: "my wife isn\'t home" keeps the normal offer', family: 'booking', persona: DANA, channels: ['sms'], turns: ["My wife isn't home right now but we want new windows. Can we set up a time?"] },
   // ── 2026-10-16 (framework cleanup, Phase 0): the post-demo rehash track ──
   // SMS only: rehash is the SMS reply writer's (the live chat never plans it).
@@ -681,7 +693,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   return {
     channel: 'sms', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, turn_lock_mode: lockMode, contact_id: plan.contactId || null,
     // 2026-10-19: the modes this conversation ran under (Railway's, or the gate's override).
-    rehash_deal_hint_mode: rehashDealHintMode(), human_takeover_mode: humanTakeoverMode(),
+    rehash_deal_hint_mode: rehashDealHintMode(), human_takeover_mode: humanTakeoverMode(), siro_context_mode: siroModes().context,
     // 2026-10-21: the two rehash switches (src/agentic/rehash-flags.js).
     rehash_booking_fix: rehashBookingFix() ? 'on' : 'off', rehash_better_price: rehashBetterPrice() ? 'on' : 'off',
     transcript,

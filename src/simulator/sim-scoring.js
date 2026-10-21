@@ -39,7 +39,12 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // first gate run on this version is the Phase 0 baseline, never "worse". (.1
 // was already taken by the rehash closer PR the same day.)
 // 2026-10-20.1 (handoff v3): one_leg_phone_presentation and absent_spouse_normal_offer.
-export const SCORING_VERSION = '2026-10-21.2';
+// 2026-10-21.3: three checks that failed on a healthy bot. The cancel flow's
+// identity ask is allowed by the turn's flow, not the scenario's name;
+// two_texts_one_reply_sms counts a second rule's send only when it CLAIMED the
+// turn (shadow records the lock's would-skip); the Siro hesitation check runs
+// only when the run's SIRO_CONTEXT_MODE is live.
+export const SCORING_VERSION = '2026-10-21.3';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -243,12 +248,16 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     return out;
   },
   // Paul (d2hmgL9fAAWvtuu7NN5q, 2026-10-17 14:45): two texts 3 s apart got two
-  // replies from two rules. Exactly one reply goes out; a second rule's send is
-  // counted when the run is in shadow (it would still go out today).
+  // replies from two rules. Exactly one reply goes out. 2026-10-21: the second
+  // rule counts only when it CLAIMED the turn; in shadow the lock's decision is
+  // the measure (already_answered = live would skip it), as refire_after_answer.
   two_texts_one_reply_sms: (r) => {
     const t = r.transcript?.[0];
-    const n = replies(t).length + (Number(t?.shadow_extra_sends) || 0);
-    return n === 1 ? [] : [{ code: 'two_texts_not_one_reply', detail: `${n} replies to two quick texts`, turn: 1 }];
+    const second = t?.turn_lock?.second || null;
+    const n = replies(t).length + (second?.claimed === true ? 1 : 0);
+    const out = n === 1 ? [] : [{ code: 'two_texts_not_one_reply', detail: `${n} replies to two quick texts`, turn: 1 }];
+    if (second && second.claimed !== true && second.skip_reason !== 'already_answered') out.push({ code: 'second_rule_not_locked', detail: `${second.rule}: ${second.skip_reason || 'claimed'}`, turn: 1 });
+    return out;
   },
   // Rapid-fire messages get ONE reply (Mark, 2026-10-02).
   burst: (r) => {
@@ -319,7 +328,8 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     const out = rehashLaneFailures(r);
     const first = (r.transcript || [])[0];
     const text = first ? replies(first).join(' ') : '';
-    if (!/\b(?:price|cost|budget|spend|afford|invest|number)/i.test(text)) out.push({ code: 'visit_hesitation_ignored', detail: text, turn: first?.turn });
+    // The visit is in LEAD FACTS only with SIRO_CONTEXT_MODE=live (2026-10-21).
+    if (r.siro_context_mode === 'live' && !/\b(?:price|cost|budget|spend|afford|invest|number)/i.test(text)) out.push({ code: 'visit_hesitation_ignored', detail: text, turn: first?.turn });
     if (/\$\s?\d|\b\d[\d,]{2,}\b/.test(text)) out.push({ code: 'price_from_visit_stated', detail: text, turn: first?.turn });
     if ((text.match(/\?/g) || []).length !== 1) out.push({ code: 'not_one_question', detail: text, turn: first?.turn });
     if (/\b(?:said|mentioned)\b/i.test(text) && /\b(?:brian|rep)\b/i.test(text)) out.push({ code: 'rep_quoted', detail: text, turn: first?.turn });
@@ -398,6 +408,9 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     }
     return out;
   },
+  // 2026-10-21 (the user): a phone-team lead is offered the call, never a visit.
+  phone_team_books_call: (r) => SCENARIO_EXPECTATIONS.one_leg_phone_presentation(r)
+    .map(f => (f.code === 'no_phone_presentation' ? { ...f, detail: 'a phone-team contact was not offered the phone presentation' } : f)),
   absent_spouse_normal_offer: (r) => (planSteps(r).some(s => String(s).startsWith('pp_'))
     ? [{ code: 'phone_presentation_not_one_leg', detail: 'a contact not in one_leg got the phone presentation' }] : []),
   rehash_book_call: (r) => {
@@ -718,7 +731,8 @@ export function scoreResult(result) {
         callbackFiled,
         // The cancel identity ask ("name and phone the appointment is under")
         // is the one approved two-item ask (allow_multi_ask, Part 8).
-        allowMultiAsk: /cancel/.test(String(result.scenario || '')),
+        // 2026-10-21: read from the turn's flow (reschedule_unclear runs the same flow).
+        allowMultiAsk: /cancel/.test(String(result.scenario || '')) || t.flow === 'ask_identity',
         // A post-demo lead's one goal is the call (rehash, 2026-10-01/10-11):
         // offering it is the plan, not an unasked offer.
         // The third price ask's call offer is the plan too (the owner, 2026-10-13).

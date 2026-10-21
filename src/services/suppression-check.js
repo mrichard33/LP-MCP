@@ -124,6 +124,13 @@ export const SUPPRESS_TAGS = [
   // no tag, so leaving the tag on them protects nothing. The protection has to
   // sit on the send path, which is here.
   'active-entry:canvassing',
+
+  // 2026-10-21 (the user) — a lead assigned to an outside partner's phone team
+  // (Ross Erstling, RFED) gets the one SMS and one email GHL already sends, and
+  // nothing else unprompted: "we are not going to know when they got ahold of the
+  // lead". Like canvassing, NOT in REPLY_BLOCKING_TAGS: the bot still answers
+  // their texts and tries to book the call.
+  'phone-team',
 ];
 
 // Set for O(1) intersection check
