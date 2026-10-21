@@ -39,7 +39,8 @@ const plan = (trigger, conversation = [OFFER], callSlots = SLOTS()) => planNepqT
   channel: 'sms', trigger, conversation, slots: [], tzLabel: 'ET', firstName: 'Pat',
   discipline: { booking: { allowed: false, reason: 'x' } }, nowMs: NOW, postDemo: true, rehashRep: 'John', rehash: true, callSlots,
 });
-const off = (fn) => runWithSimOverrides({ rehashBookingFix: 'off' }, fn);
+// Both switches off: the bot before the 2026-10-21 handoff.
+const off = (fn) => runWithSimOverrides({ rehashBookingFix: 'off', rehashBetterPrice: 'off' }, fn);
 
 test('flag: unset is on; "false" is off; a gate run may force it', () => {
   assert.equal(rehashBookingFix({}), true);

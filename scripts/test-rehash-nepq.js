@@ -26,6 +26,11 @@ import { isInHomeCalendarId, isGhlOnlyCalendarId } from '../src/knowledge/bookin
 import { postDemoRehash } from '../src/prompts/response-generator/playbooks.js';
 import * as R from '../src/agentic/rehash.js';
 
+// 2026-10-21: these tests hold the rehash copy from BEFORE the better-price
+// framing (REHASH_BETTER_PRICE_FRAMING_ENABLED=false is the undo path, so it
+// must keep working). The framing itself: scripts/test-rehash-better-price.js.
+process.env.REHASH_BETTER_PRICE_FRAMING_ENABLED = 'false';
+
 const { notifyRehashCall } = await import('../src/notifications/rehash-call.js');
 
 const NOW = Date.parse('2026-10-09T16:00:00Z'); // Fri noon ET

@@ -418,6 +418,21 @@ booking claim with `{ rehash: true }` only (`REHASH_CALL_CLAIM_PATTERNS`, bookin
 `rehash_booking_fix` on|off, scenarios `rehash_bare_time_pick`, `rehash_named_time`, `rehash_ready_to_move`,
 `rehash_firm_no`. The pre-demo bot never reads the switch (`scripts/test-rehash-predemo-unchanged.js`).
 
+**The reason for a rehash call is a better price (the user, 2026-10-21; `REHASH_BETTER_PRICE_FRAMING_ENABLED`, unset =
+on, `false` = the copy before, byte for byte).** "I may be able to do something for you, it's just easier on a quick
+call" gave no reason, and "a couple more quotes" got "How do they compare, out of curiosity?" (Paul, Laura). Every call
+invitation now says we may be able to get them a better price, in "if I could, would you?" form. The one copy home is
+`rehash-nepq.js` (`betterPriceReason` before two real times, `betterPriceInvite` without; kinds generic / compare / price
+/ think / itemized; `hasBetterPrice` reads it back). The ladder: price, other quotes and thinking it over get the
+better-price line with the open pair at attempts 1-2 (no ask-back), a third is still `rehash_repeat_objection`; a spouse
+keeps its ask-back; an itemized estimate ask (`isItemizedAsk`) gets "{rep} can walk through each window and door line by
+line on a quick call, and look at getting you a better price". A call ask or yes gets the reason before the times unless
+one of our last three messages said it. The model's version must keep it (`reference_markers`). In this mode the
+better-price line SUPERSEDES "the best deal possible, once" (2026-10-11) and the ask-backs of 2026-10-15 for price /
+competitor / think. Still never an amount, %, discount or promise (`stripOfferTalk` is unchanged; its fallback line is
+the better-price question). Gate: `rehash_better_price` on|off, scenarios `rehash_other_quotes`, `rehash_call_reason`.
+Tests that hold the old copy pin the switch off (`test-rehash-nepq.js`, `-objection-ladder`, `-call-slots`, `-deal-hint`).
+
 **A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock
 discovery question after "Thank you I will.", two slot offers to "Follow up in November please.", a question after "Enjoy
 your week." and "Congratulations" to a lead who signed elsewhere: `planNepqTurn` never knew, and `enforceNepqPlan` step 7

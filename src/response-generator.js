@@ -18,6 +18,10 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.15.0 — 2026-10-21. REHASH BETTER-PRICE FRAMING (handoff Part 2, REHASH_BETTER_PRICE_FRAMING_ENABLED): the
+ *   reason for a rehash call is a better price, in "if I could, would you?" form (postDemoRehash, the rehash
+ *   NEPQ block, the objection ladder, an itemized estimate ask). Never an amount, %, discount or promise.
+ *   Rehash prompt copy only (fixture 40); no pre-demo prompt moved.
  * v2.14.0 — 2026-10-21. REHASH CALL BOOKING (rehash booking + better-price handoff, REHASH_BOOKING_FIX_ENABLED):
  *   a rehash lead's named call time ("9:30", "930am", "Thursday at 2pm") is booked on the rep's Rehash Call
  *   calendar or answered with the two closest real times; our open pair is offered again instead of a new
@@ -451,6 +455,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 import * as P from './prompts/response-generator/index.js';
 import { isRehashContact, normalizeRehashCall, stripOfferTalk, bestDealHintUsed, REHASH_NUMBER_DEFAULT, REHASH_REP_CUSTOM_VALUE } from './agentic/rehash.js';
 import { rehashDealHintMode } from './agentic/rehash-nepq.js';
+import { rehashBetterPrice } from './agentic/rehash-flags.js';
 import { getCustomValue } from './services/ghl-custom-values.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
@@ -492,11 +497,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.14.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.15.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.14.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.15.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -1648,7 +1653,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // carves out exactly one exception (a phone call with the rep) and keeps the
   // rest of the ban (no visit, no slot, no link). See src/agentic/rehash.js.
   if (opts.rehash?.active) {
-    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true }));
+    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true, betterPrice: rehashBetterPrice() }));
   }
 
   if (fastTrack && !postAppt.post && !ackOnly) {
@@ -4642,7 +4647,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (rehash) {
     // 2026-10-19 (Mark, ruling 4): with REHASH_DEAL_HINT_MODE=every the hint is
     // never "used up"; everything else in the offer test still strips.
-    const offer = stripOfferTalk(validated.message, { hintUsed: rehashDealHintMode() !== 'every' && bestDealHintUsed(context?.conversation_recent || []) });
+    const offer = stripOfferTalk(validated.message, { hintUsed: rehashDealHintMode() !== 'every' && bestDealHintUsed(context?.conversation_recent || []), betterPrice: rehashBetterPrice() });
     if (offer.stripped.length) {
       console.warn(`[ResponseGenerator] rehash offer talk stripped for ${contactId}: ${offer.stripped.join(' | ').slice(0, 200)}`);
       validated.message = offer.text;

@@ -13,6 +13,11 @@ import { planNepqTurn, enforceNepqPlan } from '../src/agentic/nepq-planner.js';
 import { recheckSlot } from '../src/agentic/slot-recheck.js';
 import { postDemoRehash } from '../src/prompts/response-generator/playbooks.js';
 
+// 2026-10-21: these tests hold the rehash copy from BEFORE the better-price
+// framing (REHASH_BETTER_PRICE_FRAMING_ENABLED=false is the undo path, so it
+// must keep working). The framing itself: scripts/test-rehash-better-price.js.
+process.env.REHASH_BETTER_PRICE_FRAMING_ENABLED = 'false';
+
 const NOW = Date.parse('2026-10-09T16:00:00Z'); // Fri noon ET
 const CAL = 'ncDzLgzbfKJRfhmtlWtB';
 const JOHN = 'TYcZ9DcNkuPCFYsFxRFV';

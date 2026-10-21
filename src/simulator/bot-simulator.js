@@ -340,6 +340,9 @@ export const SCENARIOS = Object.freeze({
   rehash_named_time: { title: 'Rehash: "I can do 930am" is the pick, not a new pair (Komal)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I have a question about the proposal. Can you call me?', nameOfferedCallTime('compact')] },
   rehash_ready_to_move: { title: 'Rehash: "Ready to move … final costs" gets the call, not the price ask-back (Charles)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Ready to move. Would like to see final description of project and final costs first.'] },
   rehash_firm_no: { title: 'Rehash: "Decided not needed" gets one line, no question (Charles)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', "Decided not needed at this time. We'll keep your contact info for future reference."] },
+  // ── 2026-10-21 (Part 2, REHASH_BETTER_PRICE_FRAMING_ENABLED): the reason for the call is a better price ──
+  rehash_other_quotes: { title: 'Rehash: "a couple more quotes" gets the better-price offer, not "how do they compare" (Paul, Laura)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Thanks for coming out. We are going to get a couple more quotes'] },
+  rehash_call_reason: { title: 'Rehash: every call invitation says why (a better price)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'We are still thinking it over', 'Can I get an itemized estimate? I want to see what each window is costing'] },
   // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
   rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', family: 'rehash', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──

@@ -25,7 +25,7 @@ import { decisionMakersFromThread, dmSettled } from '../agentic/qualifying.js';
 import { BRIDGE_RX } from '../agentic/nepq-planner.js';
 import { jobScopeFromThread } from '../agentic/job-scope.js';
 import { isCallPromise } from '../agentic/promised-callbacks.js';
-import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES } from '../agentic/rehash-nepq.js';
+import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from '../agentic/rehash-nepq.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
 // scored with new checks is a new baseline, never "worse" than an old one.
@@ -39,7 +39,7 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES } from '../agentic/reha
 // first gate run on this version is the Phase 0 baseline, never "worse". (.1
 // was already taken by the rehash closer PR the same day.)
 // 2026-10-20.1 (handoff v3): one_leg_phone_presentation and absent_spouse_normal_offer.
-export const SCORING_VERSION = '2026-10-21.1';
+export const SCORING_VERSION = '2026-10-21.2';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -86,6 +86,22 @@ function ownerNotDeclined(r, who) {
  * of failures ({ code, detail, turn? }); an empty list passes. Only behaviour
  * a CLAUDE.md ruling states, so a failure is a regression, not a taste call.
  */
+// 2026-10-21 (Part 2): a reply that invites the call (asks for it, or offers
+// times) gives the reason, a better price, in it or in our reply just before.
+function callInviteReasonFailures(r) {
+  const out = [];
+  let prev = '';
+  for (const t of r.transcript || []) {
+    const text = replies(t).join(' ');
+    if (!text) continue;
+    const invites = (/\b(?:quick|short|phone)\s+call\b|\bcall\b[^.!?]*\?/i.test(text) && text.includes('?')) || (/\bI\s+have\b/i.test(text) && clockCount(text) >= 2);
+    if (invites && !hasBetterPrice(text) && !hasBetterPrice(prev)) out.push({ code: 'call_invite_without_reason', detail: text, turn: t.turn });
+    if (/\bmay\s+be\s+able\s+to\s+do\s+something\b/i.test(text)) out.push({ code: 'vague_call_reason', detail: text, turn: t.turn });
+    prev = text;
+  }
+  return out;
+}
+
 // 2026-10-21: a rehash lead named one of our call times: that time is booked
 // on Rehash Call, the confirm asks nothing, and no new pair is offered.
 function rehashPickFailures(r) {
@@ -407,6 +423,21 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (!['rehash_offer', 'rehash_bridge'].includes(step)) out.push({ code: 'ready_not_offered_call', detail: `step ${step || 'none'}`, turn: first?.turn });
     if (replies(first).some(x => /\bcompared\s+to\s+what\b|\btoo\s+expensive\b/i.test(x))) out.push({ code: 'ready_read_as_objection', detail: replies(first).join(' '), turn: first?.turn });
     return out;
+  },
+  // 2026-10-21 (Part 2): checked only when the run had REHASH_BETTER_PRICE_FRAMING_ENABLED on.
+  rehash_other_quotes: (r) => {
+    const out = rehashLaneFailures(r);
+    if (r.rehash_better_price !== 'on') return out;
+    const first = (r.transcript || [])[0];
+    const text = replies(first).join(' ');
+    if (/\bhow\s+do\s+(?:they|the\s+quotes?)\s+compare\b/i.test(text)) out.push({ code: 'compare_asked_back', detail: text, turn: first?.turn });
+    if (!hasBetterPrice(text)) out.push({ code: 'no_better_price_offer', detail: text, turn: first?.turn });
+    return out;
+  },
+  rehash_call_reason: (r) => {
+    const out = rehashLaneFailures(r);
+    if (r.rehash_better_price !== 'on') return out;
+    return [...out, ...callInviteReasonFailures(r)];
   },
   rehash_firm_no: (r) => {
     const out = rehashLaneFailures(r);

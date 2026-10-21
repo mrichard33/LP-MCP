@@ -38,8 +38,8 @@ import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isLeadCloser, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { bestDealHintUsed } from './rehash.js';
-import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint, isRehashReady, rehashReadyLine } from './rehash-nepq.js';
-import { rehashBookingFix } from './rehash-flags.js';
+import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint, isRehashReady, rehashReadyLine, betterPriceReason, betterPriceInvite, betterPriceKindFor, hasBetterPrice, isItemizedAsk, REHASH_BETTER_PRICE_RX } from './rehash-nepq.js';
+import { rehashBookingFix, rehashBetterPrice } from './rehash-flags.js';
 import { readRehashTime, pickRehashTime, rehashTimeSlots, clockLabel } from './rehash-time.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
 import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js';
@@ -912,6 +912,12 @@ function planNepqTurnCore({
   // 2026-10-21 (rehash booking handoff): REHASH_BOOKING_FIX_ENABLED, read only
   // on the rehash line (the pre-demo bot never reads it).
   const bookingFix = !!(postDemo && (rehash ?? !!rehashRep) && rehashBookingFix());
+  // 2026-10-21 (Part 2): REHASH_BETTER_PRICE_FRAMING_ENABLED, rehash line only.
+  const betterPrice = !!(postDemo && (rehash ?? !!rehashRep) && rehashBetterPrice());
+  // Our better-price reason went out in one of our last three messages.
+  const betterPriceSaid = () => outbound.slice(-3).some(m => hasBetterPrice(m.text));
+  // The model's version of a line that gives the reason must keep it.
+  const BETTER_PRICE_MARKERS = [{ rx: REHASH_BETTER_PRICE_RX, say: 'keep the reason for the call: we may be able to get them a better price' }];
   // The Rehash Call times still on the table: the newest of our last four
   // messages that names real openings, however it was worded (the model's
   // "Thu, Oct 22 at 2:00 PM ET or …" with no "I have"), until a booking line,
@@ -1016,6 +1022,7 @@ function planNepqTurnCore({
     recent_outbound: outbound.slice(-8).map(m => m.text),
     variant_seed: outbound.length,
   };
+  if (betterPrice) plan.rehash_better_price = true;
   // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED): enforceNepqPlan keeps a rehash
   // reply's times to the rep's real Rehash Call openings (rehash line only).
   if (bookingFix) {
@@ -1269,7 +1276,10 @@ function planNepqTurnCore({
     const offerPlan = (two, line) => Object.assign(plan, base, {
       step: 'rehash_offer', required_move: 'offer_slots', fixed_line: line, slots_to_offer: two,
       allowed: { ...plan.allowed, slot_offer: true }, booking: { allowed: true, reason: 'nepq:rehash_offer' },
+      ...(betterPrice && hasBetterPrice(line) ? { reference_markers: BETTER_PRICE_MARKERS } : {}),
     });
+    // The rep the line names ("a quick call with Tom"), or null when the line speaks as that rep.
+    const callRep = callSlots.repName && !(rehashRep && callSlots.repName.toLowerCase() === String(rehashRep).toLowerCase()) ? callSlots.repName : null;
     const confirmPlan = (picked) => {
       const label = `${picked.rel || picked.day} at ${picked.time}${picked.tz ? ` ${picked.tz}` : ''}`;
       // 2026-10-11 (rehash NEPQ handoff): name who calls. The team member the
@@ -1312,8 +1322,12 @@ function planNepqTurnCore({
       // Ready to buy, or asking for the final price: the call, with its reason.
       const two = stableOffer();
       if (isRehashReady(now) && two.length === 2) {
-        const repName = callSlots.repName && !(rehashRep && callSlots.repName.toLowerCase() === String(rehashRep).toLowerCase()) ? callSlots.repName : null;
-        return offerPlan(two, `${rehashReadyLine(repName)} ${LINES.offer_slots(two, counters.slot_offers)}`);
+        return offerPlan(two, `${rehashReadyLine(callRep)} ${LINES.offer_slots(two, counters.slot_offers)}`);
+      }
+      // 2026-10-21 (Part 2, Komal): an itemized estimate asked for → the rep walks
+      // through it line by line on a call, and looks at a better price too.
+      if (betterPrice && isItemizedAsk(now) && two.length === 2) {
+        return offerPlan(two, `${betterPriceReason('itemized', callRep)} ${LINES.offer_slots(two, counters.slot_offers)}`);
       }
       // "You've given so many different times": the same two again.
       if (open.length === 2 && /\bconfus|\bso\s+many\b|\bdifferent\s+times\b|\bwhich\s+(?:times?|one)\s+(?:is\s+it|again)\b/i.test(now)) {
@@ -1369,7 +1383,9 @@ function planNepqTurnCore({
     if ((askedForCall || yesToCall || scheduleAsk) && offer.length === 2) {
       // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED): the pair still on the table, not a new one.
       const two = bookingFix ? stableOffer() : offer;
-      return offerPlan(two, LINES.offer_slots(two, counters.slot_offers));
+      // 2026-10-21 (Part 2): every call invitation says why, unless we just did.
+      const reason = betterPrice && !betterPriceSaid() ? `${betterPriceReason('generic', callRep)} ` : '';
+      return offerPlan(two, `${reason}${LINES.offer_slots(two, counters.slot_offers)}`);
     }
     return null;
   }
@@ -1505,12 +1521,41 @@ function planNepqTurnCore({
       Object.assign(plan, { rehash_stage: 'bridge', rehash_bridged: true });
       return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: line, rehash_ready: true });
     }
+    // 2026-10-21 (Part 2): an itemized estimate with no Rehash Call times read.
+    if (betterPrice && onTrack && isItemizedAsk(now)) {
+      const repName = (callSlots?.repName) || rehashRep || null;
+      const speaksAsRep = !!(repName && rehashRep && String(repName).toLowerCase() === String(rehashRep).toLowerCase());
+      Object.assign(plan, { rehash_stage: 'bridge', rehash_bridged: true });
+      return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: betterPriceInvite('itemized', speaksAsRep ? null : repName), reference_markers: BETTER_PRICE_MARKERS });
+    }
     const pdObj = onTrack && !askedForSpace(now) ? postDemoObjection(now, lastOut) : null;
     if (pdObj) {
       const objAttempt = turns.reduce((n, t, i) => n + (t.direction === 'inbound' && postDemoObjection(t.text, prevOutAt(i)) ? 1 : 0), 0);
       const repName = (Array.isArray(callSlots?.offer) && callSlots?.repName) || rehashRep || null;
       const speaksAsRep = !!(repName && rehashRep && String(repName).toLowerCase() === String(rehashRep).toLowerCase());
       plan.objection = { type: pdObj, attempt: objAttempt, line: null };
+      // 2026-10-21 (Part 2; Paul, Laura: "a couple more quotes" got "How do they
+      // compare, out of curiosity?"). Price, other quotes and thinking it over
+      // get the reason for the call at once, a better price, with the two times
+      // on the table (or "if I could, would you?" without them); asked again,
+      // the same. A third time is still a person. A spouse keeps its ask-back.
+      const bpKind = betterPrice ? betterPriceKindFor(pdObj) : null;
+      if (bpKind && objAttempt <= 2) {
+        const who = repName && !speaksAsRep ? repName : null;
+        const two = bookingFix ? stableOffer() : (Array.isArray(callSlots?.offer) ? callSlots.offer : []);
+        Object.assign(plan, { rehash_stage: 'bridge', rehash_bridged: true, rehash_ladder: 'better_price' });
+        if (two.length === 2) {
+          const line = `${betterPriceReason(bpKind, who)} ${LINES.offer_slots(two, counters.slot_offers)}`;
+          plan.objection.line = line;
+          return pd({
+            step: 'rehash_offer', required_move: 'offer_slots', fixed_line: line, slots_to_offer: two, rehash_call_slots: true,
+            allowed: { ...plan.allowed, slot_offer: true }, booking: { allowed: true, reason: 'nepq:rehash_offer' }, reference_markers: BETTER_PRICE_MARKERS,
+          });
+        }
+        const line = betterPriceInvite(bpKind, who);
+        plan.objection.line = line;
+        return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: line, reference_markers: BETTER_PRICE_MARKERS });
+      }
       if (objAttempt <= 1) {
         const line = POST_DEMO_ASK_BACK[pdObj](hi);
         plan.objection.line = line;
@@ -1526,7 +1571,10 @@ function planNepqTurnCore({
         plan.objection.line = null;
         if (offer.length === 2) {
           const withRep = repName && !speaksAsRep ? ` with ${repName}` : '';
-          const line = `${lead}, it's just easier on a quick call${withRep}. ${LINES.offer_slots(offer, counters.slot_offers)}`;
+          // 2026-10-21 (Part 2): the bridge gives its reason, a better price.
+          const line = betterPrice
+            ? `${betterPriceReason('generic', repName && !speaksAsRep ? repName : null)} ${LINES.offer_slots(offer, counters.slot_offers)}`
+            : `${lead}, it's just easier on a quick call${withRep}. ${LINES.offer_slots(offer, counters.slot_offers)}`;
           plan.objection.line = line;
           return pd({
             step: 'rehash_offer', required_move: 'offer_slots', fixed_line: line, slots_to_offer: offer, rehash_call_slots: true,
@@ -1534,7 +1582,7 @@ function planNepqTurnCore({
           });
         }
         // Every mode (ruling 3): "If I could …, would you …?"
-        const line = every ? `${hi ? `Understood${hi}. ` : ''}${rehashIfICouldBridge(repName && !speaksAsRep ? repName : null)}` : `${lead}, it's just easier on a quick call. Would that help?`;
+        const line = every || betterPrice ? `${hi ? `Understood${hi}. ` : ''}${rehashIfICouldBridge(repName && !speaksAsRep ? repName : null)}` : `${lead}, it's just easier on a quick call. Would that help?`;
         plan.objection.line = line;
         return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: line });
       }
@@ -2908,7 +2956,8 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // The bridge turn asks for the call (the same simulation: "Worth seeing if
   // we can close that difference." and no question).
   if (plan.post_demo && plan.rehash_stage === 'bridge' && plan.step === 'post_demo' && !plan.no_question && !statesCallTime && body && !body.includes('?')) {
-    body = `${body} Would a quick call help?`;
+    // 2026-10-21 (Part 2): the ask carries its reason, a better price.
+    body = `${body} ${plan.rehash_better_price ? betterPriceInvite('generic', null) : 'Would a quick call help?'}`;
     changes.push('rehash_bridge_ask_added');
   }
   // 2026-10-19 (Mark, ruling 4): REHASH_DEAL_HINT_MODE=every. An eligible
