@@ -137,3 +137,18 @@ test('SMS and live chat are unchanged by the window', () => {
     assert.equal(decideEmailSendDelay({ channel, inboundAtMs: T, nowMs: T, minDelayMs: MIN, maxDelayMs: MAX, seed: 1 }).defer, false);
   }
 });
+
+// 2026-10-21 (Bobbi Glenn, agent_actions 617906): the hold was anchored on the
+// analysis event (50s after her email), so the reply landed 18.5 min after it.
+test('the delay is anchored on the inbound, not the analysis that queued the reply', () => {
+  const { emailDelayAnchorIso } = _internal;
+  const analysis = { event_type: 'ai.analysis_completed', created_at: '2026-10-21T01:04:48.859Z',
+    payload: { inbound_event_created_at: '2026-10-21T01:03:58.537Z', last_inbound_event_created_at: '2026-10-21T01:03:58.537Z' } };
+  assert.equal(emailDelayAnchorIso(analysis), '2026-10-21T01:03:58.537Z');
+  // A burst: the newest inbound is the one the reply answers.
+  assert.equal(emailDelayAnchorIso({ created_at: 'x', payload: { inbound_event_created_at: '2026-10-21T01:00:00Z', last_inbound_event_created_at: '2026-10-21T01:02:00Z' } }), '2026-10-21T01:02:00Z');
+  // The inbound event itself, or nothing readable: unchanged fallbacks.
+  assert.equal(emailDelayAnchorIso({ event_type: 'ghl.reply_received', created_at: '2026-10-21T01:03:58Z', payload: {} }), '2026-10-21T01:03:58Z');
+  assert.equal(emailDelayAnchorIso(null, '2026-10-21T01:00:00Z'), '2026-10-21T01:00:00Z');
+  assert.equal(emailDelayAnchorIso(null, null), null);
+});
