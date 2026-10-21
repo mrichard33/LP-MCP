@@ -35,6 +35,7 @@ import { buildPresentationFacts } from '../siro/presentation-facts.js';
 import { siroModes } from '../siro/config.js';
 import { humanTakeoverMode, takeoverDecision } from '../agentic/human-takeover.js';
 import { rehashDealHintMode } from '../agentic/rehash-nepq.js';
+import { rehashBookingFix, rehashBetterPrice } from '../agentic/rehash-flags.js';
 import { scoreRun, compareScorecards, combineRuns } from './sim-scoring.js';
 import { memoryTurnLockStore, claimTurn, releaseTurn } from '../agentic/turn-lock-io.js';
 import { turnLockMode } from '../agentic/turn-lock.js';
@@ -221,6 +222,22 @@ export function pickOfferedTime(form) {
 }
 
 /**
+ * A rehash lead naming the first call time we offered the way people text it
+ * (2026-10-21, the 2026-10-20 threads): 'bare' → "9:30", 'compact' → "I can do
+ * 930am". With no clock time in our reply, a plain call request.
+ */
+export function nameOfferedCallTime(form) {
+  const fn = (reply) => {
+    const t = String(reply || '').match(/\b(\d{1,2}):(\d{2})\s*(AM|PM)\b/i);
+    if (!t) return 'Can you just give me a call?';
+    if (form === 'compact') return `I can do ${Number(t[1])}${t[2]}${t[3].toLowerCase()}`;
+    return `${Number(t[1])}:${t[2]}`;
+  };
+  fn.form = form;
+  return fn;
+}
+
+/**
  * The scenario families the scorecard reports a pass rate for (Phase 0,
  * 2026-10-18): one total hid a family going red behind another going green.
  */
@@ -317,6 +334,12 @@ export const SCENARIOS = Object.freeze({
   rehash_hint_every_turn: { title: 'Rehash: a varied deal hint on every eligible reply (ruling 4)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'We are still going over it', 'Mostly wondering about the sliding door in the back'] },
   rehash_hint_not_after_no: { title: 'Rehash: no deal hint after a no (ruling 4)', family: 'rehash', expect: { 2: { question_allowed: false }, 3: { question_allowed: false } }, persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'Not interested at this time', 'No thanks, we are good'] },
   human_takeover_skip_one: { title: "A person texts by hand: the pending reply drops, the next one goes (ruling 5)", family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I have a question about the proposal', { manual: 'Hi Monica, John here. Happy to walk you through it. Want me to give you a call?' }, 'Sure, a call works. Thanks John'] },
+  // ── 2026-10-21 (rehash booking handoff, REHASH_BOOKING_FIX_ENABLED; threads of 2026-10-20) ──
+  // Checked only when the run had the switch on (r.rehash_booking_fix).
+  rehash_bare_time_pick: { title: 'Rehash: "9:30" to our call times books 9:30, the confirm asks nothing (kS2A…)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Can you call me tomorrow? We can go over it then', nameOfferedCallTime('bare')] },
+  rehash_named_time: { title: 'Rehash: "I can do 930am" is the pick, not a new pair (Komal)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I have a question about the proposal. Can you call me?', nameOfferedCallTime('compact')] },
+  rehash_ready_to_move: { title: 'Rehash: "Ready to move … final costs" gets the call, not the price ask-back (Charles)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Ready to move. Would like to see final description of project and final costs first.'] },
+  rehash_firm_no: { title: 'Rehash: "Decided not needed" gets one line, no question (Charles)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', "Decided not needed at this time. We'll keep your contact info for future reference."] },
   // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
   rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', family: 'rehash', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
@@ -656,6 +679,8 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     channel: 'sms', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, turn_lock_mode: lockMode, contact_id: plan.contactId || null,
     // 2026-10-19: the modes this conversation ran under (Railway's, or the gate's override).
     rehash_deal_hint_mode: rehashDealHintMode(), human_takeover_mode: humanTakeoverMode(),
+    // 2026-10-21: the two rehash switches (src/agentic/rehash-flags.js).
+    rehash_booking_fix: rehashBookingFix() ? 'on' : 'off', rehash_better_price: rehashBetterPrice() ? 'on' : 'off',
     transcript,
   };
 }

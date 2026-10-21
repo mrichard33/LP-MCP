@@ -1,5 +1,5 @@
 {
-  "count": 298,
-  "updated": "2026-10-20",
-  "reason": "PP_DM_ASK_RX, PP_BOTH_YES_RX, PP_ONLY_ONE_RX (one-leg-presentation.js, handoff v3): our 'will both of you be on the call?' ask and the lead's answer to it, read by meaning, so a 1 Leg phone presentation books only once both decision makers are confirmed (one_leg_phone_presentation). Was 299 with room for TIME_CHOICE_RX (rehash_neither_times)."
+  "count": 304,
+  "updated": "2026-10-21",
+  "reason": "REHASH_FIRM_NO_RX, REHASH_READY_RX (rehash-nepq.js) and DAY_WORD_RX, MERIDIEM_CLOCK_RX, SEPARATED_CLOCK_RX, COMPACT_CLOCK_RX (rehash-time.js), rehash booking handoff 2026-10-21: a firm decline is a first no (rehash_firm_no), a buying signal gets the call (rehash_ready_to_move), and the call time a lead texts ('9:30', '930am', 'Thursday at 2pm') is read and booked (rehash_bare_time_pick, rehash_named_time). Was 298."
 }

@@ -39,7 +39,7 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES } from '../agentic/reha
 // first gate run on this version is the Phase 0 baseline, never "worse". (.1
 // was already taken by the rehash closer PR the same day.)
 // 2026-10-20.1 (handoff v3): one_leg_phone_presentation and absent_spouse_normal_offer.
-export const SCORING_VERSION = '2026-10-20.1';
+export const SCORING_VERSION = '2026-10-21.1';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -86,6 +86,20 @@ function ownerNotDeclined(r, who) {
  * of failures ({ code, detail, turn? }); an empty list passes. Only behaviour
  * a CLAUDE.md ruling states, so a failure is a regression, not a taste call.
  */
+// 2026-10-21: a rehash lead named one of our call times: that time is booked
+// on Rehash Call, the confirm asks nothing, and no new pair is offered.
+function rehashPickFailures(r) {
+  const out = rehashLaneFailures(r);
+  if (r.rehash_booking_fix !== 'on') return out;
+  const t = r.transcript || [];
+  if (!t[0] || t[0].nepq?.step !== 'rehash_offer') return [...out, { code: 'no_rehash_call_times', detail: `step ${t[0]?.nepq?.step || 'none'}`, turn: t[0]?.turn }];
+  const pick = t[1];
+  if (pick && pick.nepq?.step !== 'rehash_confirm') out.push({ code: 'named_time_not_booked', detail: `step ${pick.nepq?.step || 'none'}`, turn: pick.turn });
+  if (!wouldDo(r).some(w => w.kind === 'would_book_appointment' && w.payload?.rehash_call === true)) out.push({ code: 'rehash_call_not_booked', detail: 'no Rehash Call booking' });
+  if (pick && replies(pick).some(x => x.includes('?'))) out.push({ code: 'question_after_booking', detail: replies(pick).join(' '), turn: pick.turn });
+  return out;
+}
+
 export const SCENARIO_EXPECTATIONS = Object.freeze({
   // "A 'no' gets a close with no pitch" (Mark, 2026-10-02); two no's go to a person.
   not_interested: (r) => {
@@ -377,7 +391,29 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (!books.some(w => w.payload?.rehash_call === true)) out.push({ code: 'rehash_call_not_booked', detail: 'no Rehash Call booking' });
     const confirm = (r.transcript || []).find(t => t.nepq?.step === 'rehash_confirm');
     // The caller named is the one the calendar read gave, or "Someone from our team": never a guess.
-    if (confirm && !replies(confirm).some(x => /\bgive\s+you\s+a\s+call\b/i.test(x))) out.push({ code: 'rehash_confirm_no_caller', detail: replies(confirm).join(' '), turn: confirm.turn });
+    // 2026-10-21: "… will call you at this number then." (REHASH_BOOKING_FIX_ENABLED) names the caller too.
+    if (confirm && !replies(confirm).some(x => /\bgive\s+you\s+a\s+call\b|\bcall\s+you\s+at\s+this\s+number\b/i.test(x))) out.push({ code: 'rehash_confirm_no_caller', detail: replies(confirm).join(' '), turn: confirm.turn });
+    return out;
+  },
+  // ── 2026-10-21 (rehash booking handoff): the threads of 2026-10-20. Checked
+  // only when the run had REHASH_BOOKING_FIX_ENABLED on (r.rehash_booking_fix). ──
+  rehash_bare_time_pick: (r) => rehashPickFailures(r),
+  rehash_named_time: (r) => rehashPickFailures(r),
+  rehash_ready_to_move: (r) => {
+    const out = rehashLaneFailures(r);
+    if (r.rehash_booking_fix !== 'on') return out;
+    const first = (r.transcript || [])[0];
+    const step = String(first?.nepq?.step || '');
+    if (!['rehash_offer', 'rehash_bridge'].includes(step)) out.push({ code: 'ready_not_offered_call', detail: `step ${step || 'none'}`, turn: first?.turn });
+    if (replies(first).some(x => /\bcompared\s+to\s+what\b|\btoo\s+expensive\b/i.test(x))) out.push({ code: 'ready_read_as_objection', detail: replies(first).join(' '), turn: first?.turn });
+    return out;
+  },
+  rehash_firm_no: (r) => {
+    const out = rehashLaneFailures(r);
+    if (r.rehash_booking_fix !== 'on') return out;
+    const last = (r.transcript || []).at(-1);
+    if (replies(last).some(x => x.includes('?'))) out.push({ code: 'question_after_firm_no', detail: replies(last).join(' '), turn: last?.turn });
+    if (clockCount(replies(last).join(' '))) out.push({ code: 'times_after_firm_no', detail: replies(last).join(' '), turn: last?.turn });
     return out;
   },
   // ── 2026-10-19 (Sam, IMWge24jxc0xO0ppy7OR) ──
@@ -659,7 +695,7 @@ export function scoreResult(result) {
         // 2026-10-16: a post-demo turn gets the post-demo hard checks
         // (post_demo_rebuttal, post_demo_unbacked_follow_up,
         // question_after_post_demo_stop). Any other turn skips them, as before.
-        ...(t.nepq?.post_demo === true ? { postDemoStep: String(t.nepq.step || '') || null, postDemoLead: true, postDemoNoQuestion: t.nepq.no_question === true } : {}),
+        ...(t.nepq?.post_demo === true ? { postDemoStep: String(t.nepq.step || '') || null, postDemoLead: true, postDemoNoQuestion: t.nepq.no_question === true, postDemoPlanStep: t.nepq.plan_step || null } : {}),
       });
       for (const v of check.violations) failures.push({ code: v.code, detail: v.detail, turn: t.turn });
       conversation.push({ direction: 'outbound', text });

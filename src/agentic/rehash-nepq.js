@@ -26,6 +26,7 @@ import { isNotInterested } from './not-interested.js';
 import { detectDeferral, isLeadCloser } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { simModeOverrides } from '../simulator/sim-overrides.js';
+import { rehashBookingFix } from './rehash-flags.js';
 
 // ── A better deal, hinted on every reply (Mark, 2026-10-19, ruling 4) ──────
 // REHASH_DEAL_HINT_MODE=every: every rehash reply hints that we may be able to
@@ -170,10 +171,38 @@ const OBJECTIONS = [
 const BARE_NO_RX = /^\s*(?:no|nope|nah|no\s+thanks?|no\s+thank\s+you|not\s+really|not\s+now|not\s+right\s+now|not\s+interested|pass|i(?:'|’)?m\s+good|we(?:'|’)?re\s+good)\b[\s.!]*$/i;
 const YES_RX = /^\s*(?:y(?:es|eah|ep|up)|sure|ok(?:ay)?|sounds\s+good|that\s+works|please|absolutely|definitely|why\s+not|let(?:'|’)?s\s+do\s+it|i(?:'|’)?d\s+like\s+that|that\s+would\s+help|it\s+would)\b/i;
 
+// 2026-10-21 (Charles, ybKSdqmy1sVVdd0v0QY4; REHASH_BOOKING_FIX_ENABLED): "We are
+// not doing windows at this time" got "What changed?" and "Decided not needed at
+// this time." got "Where are you at with it?". Neither read as a no, so the track
+// asked its next question. A firm decline is a first no (door_open: one line,
+// nothing asked), and a second one is the stop.
+export const REHASH_FIRM_NO_RX = /^\s*not\s+needed(?:,?\s+(?:thanks?|thank\s+you))?\s*[.!]*\s*$|\b(?:decided\s+)?not\s+needed\s+(?:at\s+(?:this|the\s+moment)|right\s+now|any\s*more|now)\b|\bno\s+longer\s+need(?:ed)?\b|\b(?:have\s+|we(?:'|’)?ve\s+|i(?:'|’)?ve\s+)?decided\s+(?:against\s+(?:it|this|the\s+(?:windows?|project))|not\s+(?:needed|necessary|to\s+(?:do|move|proceed|replace|go\s+(?:ahead|forward)))|to\s+(?:pass|hold\s+off))\b|\bnot\s+doing\s+(?:the\s+|any\s+)?(?:windows?|doors?|project)\b|\bnot\s+moving\s+forward\b|\bwon(?:'|’)?t\s+be\s+(?:moving|going)\s+(?:forward|ahead)\b/i;
+
 /** A no for the two-no's rule on the rehash line; a closer ("Not ready", "Will do") counts (2026-10-17). Pure. */
 export function isRehashNo(text) {
   const t = String(text || '');
-  return isNotInterested(t) || BARE_NO_RX.test(t) || isLeadCloser(t);
+  return isNotInterested(t) || BARE_NO_RX.test(t) || isLeadCloser(t) || (REHASH_FIRM_NO_RX.test(t) && rehashBookingFix());
+}
+
+// 2026-10-21 (Charles: "Ready to move. Would like to see final description of
+// project and final costs first." got "Too expensive compared to what you were
+// quoted elsewhere?" and he backed out). A lead ready to buy, or asking for the
+// final price, is offered the call with the rep at once: never the objection
+// ladder. REHASH_BOOKING_FIX_ENABLED.
+export const REHASH_READY_RX = /\bready\s+to\s+(?:move(?:\s+forward)?|go(?:\s+ahead)?|sign|get\s+started|start|buy|do\s+(?:it|this))\b|\blet(?:'|’)?s\s+(?:move\s+forward|get\s+started|go\s+ahead|get\s+(?:it|this)\s+(?:going|done))\b|\b(?:see|get|have|know)\s+(?:the\s+|your\s+)?final\s+(?:cost|costs|price|pricing|numbers?|quote|total|description)\b|\b(?:decided|going|want)\s+to\s+go\s+(?:with|ahead\s+with)\s+(?:you|your|reece|the\s+(?:quote|proposal))\b/i;
+
+/** A buying signal on the rehash line ("ready to move", "want the final costs"). Pure. */
+export function isRehashReady(text) {
+  const t = String(text || '');
+  return REHASH_READY_RX.test(t) && !/\bnot\s+(?:quite\s+|yet\s+)?ready\b/i.test(t) && !isNotInterested(t);
+}
+
+/** The reason for the call on a buying signal (the rep goes over the final project and price). Pure. */
+export function rehashReadyLine(repName = null, { ask = false } = {}) {
+  const who = repName ? `${repName} can` : 'I can';
+  // With no times to offer, the call is asked for (REHASH_BRIDGE_RX reads "quick call …?" back).
+  return ask ? `${who} go over the final project and price with you. Would a quick call work for that?`
+    : `${who} go over the final project and price with you on a quick call.`;
 }
 
 // The lead already answered the PROBLEM stage when they named an objection.

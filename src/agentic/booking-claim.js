@@ -34,6 +34,15 @@ const CLAIM_PATTERNS = [
   /\byour\s+(?:appointment|visit|measurement|consultation|assessment|review)\s+is\s+(?:all\s+)?(?:set|booked|confirmed|scheduled|locked\s+in)\b/i,
 ];
 
+// 2026-10-21 (kS2AJk85fv7Lfyl3iZcm, REHASH_BOOKING_FIX_ENABLED): "Got it, I'll
+// call you at 9:30 AM ET tomorrow" went out to a rehash lead and nothing was
+// booked. On the rehash line a call promised at a clock time IS the booking
+// claim (the call is the appointment). Read only with { rehash: true }: on the
+// pre-demo bot a promised callback at a time is a Five9 callback, not a claim.
+const REHASH_CALL_CLAIM_PATTERNS = [
+  /\b\w+(?:'ll|’ll|\s+will)\s+(?:give\s+you\s+a\s+(?:call|ring)|call\s+you)\b[^.?!]*\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)/i,
+];
+
 // 2026-10-02 (Mark, Oct 2 6:12 PM chat): "Usually on Wednesdays" got "We have
 // Wednesdays blocked for you." Nothing was held. A hold is a claim too: it
 // stands only when this turn's code held a real slot (opts.held).
@@ -75,9 +84,10 @@ function sentences(text) {
 }
 
 /** True when the sentence says (or implies) a time is booked or held. A question never is. */
-export function isClaimSentence(s, { held = false } = {}) {
+export function isClaimSentence(s, { held = false, rehash = false } = {}) {
   const t = String(s || '').trim();
   if (!t || t.endsWith('?')) return false;
+  if (rehash && REHASH_CALL_CLAIM_PATTERNS.some(rx => rx.test(t))) return true;
   // A slot code held this turn may be echoed ("Tuesday at 2 works, I'm holding it").
   return CLAIM_PATTERNS.some(rx => rx.test(t)) || (!held && (dayTimeClaim(t) || HOLD_PATTERNS.some(rx => rx.test(t))));
 }
@@ -90,11 +100,11 @@ export function isClaimSentence(s, { held = false } = {}) {
  *   hasAppointment  an appointment is already on file; a claim that names a
  *                   day or time is then about that one and stands
  */
-export function findUnbackedBookingClaim(message, { booked = false, hasAppointment = false, held = false } = {}) {
+export function findUnbackedBookingClaim(message, { booked = false, hasAppointment = false, held = false, rehash = false } = {}) {
   if (booked) return null;
   for (const s of sentences(message)) {
     if (s.endsWith('?')) continue;
-    if (!isClaimSentence(s, { held })) continue;
+    if (!isClaimSentence(s, { held, rehash })) continue;
     if (hasAppointment && DAY_OR_TIME_RX.test(s)) continue;
     return s;
   }
@@ -287,8 +297,8 @@ export function claimMatchesAppointment(sentence, appt, { nowMs = Date.now(), ti
  *             "I'm holding … for you" line); a hold claim then stands
  * @returns {{allowed: boolean, reason: string, sentence: string|null}}
  */
-export function checkBookingTruth(text, { result = null, existing = null, held = false, nowMs = Date.now(), timeZone = 'America/New_York' } = {}) {
-  const claims = sentences(text).filter(s => isClaimSentence(s, { held }));
+export function checkBookingTruth(text, { result = null, existing = null, held = false, rehash = false, nowMs = Date.now(), timeZone = 'America/New_York' } = {}) {
+  const claims = sentences(text).filter(s => isClaimSentence(s, { held, rehash }));
   if (!claims.length) return { allowed: true, reason: 'no_claim', sentence: null };
   if (result?.booked && result.appointment_id) return { allowed: true, reason: 'booked', sentence: claims[0] };
   if (existing?.appointment_id) {
@@ -326,6 +336,8 @@ export function applyBookingTruth(message, generated, { result = null, teamOpen 
     result,
     existing,
     held: !!generated?.booking_hold_backed,
+    // 2026-10-21: the rehash line's call-time claims (REHASH_BOOKING_FIX_ENABLED).
+    rehash: !!generated?.rehash_call_claims,
     nowMs,
     timeZone,
   });

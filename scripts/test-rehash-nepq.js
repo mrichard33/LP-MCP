@@ -158,7 +158,7 @@ test('(d) a hard pick → book on Rehash Call with that rep; the confirm names t
   const p = plan('2 PM works', conv, { ...callSlots, repName: 'Tom' });
   assert.equal(p.step, 'rehash_confirm');
   assert.equal(p.rehash_pick.iso, ALL[0].iso);
-  assert.equal(p.reference_line, "You're all set for today at 2:00 PM ET. Tom will give you a call then.");
+  assert.equal(p.reference_line, "You're all set for today at 2:00 PM ET. Tom will call you at this number then.");
   const booking = rehashCallBooking({ slot: p.rehash_pick, calendarId: CAL, rep: JOHN, env: {} });
   assert.equal(booking.action_type, 'book_appointment');
   assert.equal(booking.action_payload.calendar_id, CAL);
@@ -172,7 +172,7 @@ test('(d) a hard pick → book on Rehash Call with that rep; the confirm names t
   assert.equal(isGhlOnlyCalendarId(CAL) || R.isRehashContact({ tags: ['rehash'] }), true);
   void env;
   // A confirm with no visit disclosure survives the enforcer as written.
-  const e = enforceNepqPlan("You're all set for today at 2:00 PM ET. Tom will give you a call then.", p);
+  const e = enforceNepqPlan("You're all set for today at 2:00 PM ET. Tom will call you at this number then.", p);
   assert.doesNotMatch(e.text, /\?|visit|confirm the details/i);
 });
 

@@ -28,6 +28,10 @@ export const SIM_MODE_OVERRIDES = Object.freeze({
   f0FormulaMode: ['v1', 'four_step'],
   rehashDealHintMode: ['once', 'every'],
   humanTakeoverMode: ['off', 'shadow', 'live'],
+  // 2026-10-21 (rehash booking + better-price handoff): the two rehash-only
+  // switches (src/agentic/rehash-flags.js), so the gate can compare on and off.
+  rehashBookingFix: ['on', 'off'],
+  rehashBetterPrice: ['on', 'off'],
 });
 
 /** Run fn with these overrides in force. Unknown or empty values are ignored. */

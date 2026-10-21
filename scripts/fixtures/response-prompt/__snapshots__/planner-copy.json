@@ -1,5 +1,5 @@
 {
- "version": "v2.13.0",
+ "version": "v2.14.0",
  "copy": {
   "src/agentic/nepq-planner.js": [
    "${hi ? `Understood${hi}. ` : ''}${rehashIfICouldBridge(repName && !speaksAsRep ? repName : null)}",
@@ -178,6 +178,9 @@
    "\"THE BEST DEAL POSSIBLE\": ALREADY SAID in this conversation. Do not say it again, in any wording.",
    "\"THE BEST DEAL POSSIBLE\": may be said at most ONCE per conversation, and only at the bridge.",
    "${i + 1}. ${s.label} — ${s.aim}. e.g. \"${s.example}\"",
+   "${repName} can",
+   "${who} go over the final project and price with you on a quick call.",
+   "${who} go over the final project and price with you. Would a quick call work for that?",
    "- \"Got another quote\" → \"How do they compare, out of curiosity?\" → then bridge with \"the best deal possible.\"",
    "- \"Need to think about it\" → \"What part do you want to think through?\"",
    "- \"Not interested\" → acknowledge, leave the door open, no pitch, NO question. Two no\\'s in a row = stop asking.",
@@ -201,6 +204,7 @@
    "Example (adapt, do not recite): \"${t.example}\"",
    "FOLLOW-UP DATE",
    "How do they compare, out of curiosity?",
+   "I can",
    "I may be able to do a little more for you on this.",
    "I may be able to do something for you, it\\'s just easier on a quick call. Would that help?",
    "I want to make sure you're getting the best deal possible.",

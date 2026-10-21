@@ -38,7 +38,9 @@ import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isLeadCloser, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { bestDealHintUsed } from './rehash.js';
-import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint } from './rehash-nepq.js';
+import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint, isRehashReady, rehashReadyLine } from './rehash-nepq.js';
+import { rehashBookingFix } from './rehash-flags.js';
+import { readRehashTime, pickRehashTime, rehashTimeSlots, clockLabel } from './rehash-time.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
 import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
@@ -659,6 +661,9 @@ export function postDemoObjection(text, lastOutbound = '') {
   // 2026-10-14), never an ask-back, and never counts toward the ladder.
   if (askedForSpace(t)) return null;
   if (PRICE_INFO_Q_RX.test(t)) return null;
+  // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED): "Ready to move … final costs" is a
+  // buying signal, never a price objection (the call is offered at once).
+  if (isRehashReady(t) && rehashBookingFix()) return null;
   const r = rehashObjection(t)?.type || null;
   if (r === 'price' || POST_DEMO_PRICE_RX.test(t)) return 'price';
   if (r === 'other_quote' || SHOPPING_RX.test(t) || COMPETITOR_RX.test(t)) return 'competitor';
@@ -904,6 +909,29 @@ function planNepqTurnCore({
     }
     return '';
   })();
+  // 2026-10-21 (rehash booking handoff): REHASH_BOOKING_FIX_ENABLED, read only
+  // on the rehash line (the pre-demo bot never reads it).
+  const bookingFix = !!(postDemo && (rehash ?? !!rehashRep) && rehashBookingFix());
+  // The Rehash Call times still on the table: the newest of our last four
+  // messages that names real openings, however it was worded (the model's
+  // "Thu, Oct 22 at 2:00 PM ET or …" with no "I have"), until a booking line,
+  // a hand-off or a goodbye closes it. Only times the calendar still shows.
+  const rehashOpenOffer = () => {
+    const pool = Array.isArray(callSlots?.all) ? callSlots.all : [];
+    if (!pool.length) return [];
+    for (const m of outbound.slice(-4).reverse()) {
+      if (/\bI'm\s+holding\b|\byou'?re\s+all\s+set\s+for\b/i.test(m.text) || OFFER_CLOSED_RX.test(m.text)) return [];
+      const named = offeredIn(m.text, pool);
+      if (named.length) return named.slice(0, 2);
+      if (CLOSING_LINE_RX.test(splitSentences(m.text).slice(-1)[0] || '')) return [];
+    }
+    return [];
+  };
+  // The pair to offer again: the open one while both are free, else the soonest pair.
+  const stableOffer = () => {
+    const open = bookingFix ? rehashOpenOffer() : [];
+    return open.length === 2 ? open : (Array.isArray(callSlots?.offer) ? callSlots.offer : []);
+  };
   const now = String(trigger || inbound[inbound.length - 1]?.text || '');
   const offerSlots = (Array.isArray(slots) ? slots : []).slice(0, 2).map(s => ({ ...s, tz: s.tz || tzLabel || '' }));
   // 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): "Sun, Oct 18 at 2:00 PM ET?"
@@ -988,6 +1016,15 @@ function planNepqTurnCore({
     recent_outbound: outbound.slice(-8).map(m => m.text),
     variant_seed: outbound.length,
   };
+  // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED): enforceNepqPlan keeps a rehash
+  // reply's times to the rep's real Rehash Call openings (rehash line only).
+  if (bookingFix) {
+    plan.rehash_fix = true;
+    plan.rehash_time_pool = (Array.isArray(callSlots?.all) ? callSlots.all : []).map(x => ({ iso: x.iso, day: x.day, time: x.time, rel: x.rel, dayOfWeek: x.dayOfWeek }));
+    // The pair a false "I'll call you at …" becomes (response-generator.js).
+    plan.rehash_reoffer = stableOffer().slice(0, 2);
+    plan.rehash_has_appointment = !!hasAppointment;
+  }
   plan.echo.phrase = problemPhrase(echoWord);
   const vary = (primary, alts = []) => pickFresh([primary, ...alts], plan.recent_outbound, 0);
   const fixed = (move, line, extra = {}) => Object.assign(plan, { required_move: move, fixed_line: line }, extra);
@@ -1240,15 +1277,49 @@ function planNepqTurnCore({
       // line speaks as; never a guessed name. "all set" keeps every read-back
       // working (BOOKED_LINE_RX, and it is not a new promised callback).
       const caller = callSlots.repName || null;
-      const who = caller && rehashRep && caller.toLowerCase() === String(rehashRep).toLowerCase()
-        ? "I'll give you a call then."
-        : `${caller || 'Someone from our team'} will give you a call then.`;
+      // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED): confirm and stop, with the number
+      // they will be called on ("we'll call you at this number").
+      const selfCall = caller && rehashRep && caller.toLowerCase() === String(rehashRep).toLowerCase();
+      const who = bookingFix
+        ? (selfCall ? "I'll call you at this number then." : `${caller || 'Someone from our team'} will call you at this number then.`)
+        : selfCall ? "I'll give you a call then." : `${caller || 'Someone from our team'} will give you a call then.`;
       return Object.assign(plan, base, {
         step: 'rehash_confirm', required_move: 'confirm', rehash_pick: picked, rehash_caller: caller,
         reference_line: `You're all set for ${label}. ${who}`,
         reference_slots: [picked], booking: { allowed: true, reason: 'nepq:rehash_confirm' },
       });
     };
+    // 2026-10-21 (rehash booking handoff, REHASH_BOOKING_FIX_ENABLED). Two live
+    // threads of 2026-10-20: "9:30" to our "9:30 AM or 10:30 AM" read as nothing
+    // (no booking, the model said "I'll call you at 9:30" anyway), and "I can do
+    // 930am", "Thursday at 6pm", "Thursday at 2pm" each got a NEW pair until the
+    // lead was "so confused" and opted out. Now: a time they name is taken when
+    // the rep's calendar has it; otherwise the two closest that day, said plainly;
+    // and our open pair is offered again instead of a fresh one.
+    if (bookingFix) {
+      const open = rehashOpenOffer();
+      // A named time is read exactly (pickSlot's hour test let "2pm" match 2:30 PM);
+      // "the first one" / "Thursday" still go through pickSlot.
+      const picked = !open.length ? null : readRehashTime(now) ? pickRehashTime(now, open) : pickSlot(now, open);
+      if (picked) return confirmPlan(picked);
+      // A time named in passing ("the visit at 2") is not a request: only with a
+      // call on the table, a call or time asked for, or a short reply.
+      const timeTalk = open.length || askedForCall || scheduleAsk || bridgedRecently(outbound.map(m => m.text))
+        || REHASH_TIME_ASK_RX.test(lastOut) || now.trim().split(/\s+/).length <= 8 || /\b(?:can\s+do|works?|available|free|call\s+me)\b/i.test(now);
+      const named = timeTalk && all.length ? rehashTimeSlots(now, all, { offered: open, nowMs }) : null;
+      if (named?.exact) return confirmPlan(named.exact);
+      if (named?.near?.length === 2) return offerPlan(named.near, LINES.not_open(clockLabel(named.time.minutes), named.near));
+      // Ready to buy, or asking for the final price: the call, with its reason.
+      const two = stableOffer();
+      if (isRehashReady(now) && two.length === 2) {
+        const repName = callSlots.repName && !(rehashRep && callSlots.repName.toLowerCase() === String(rehashRep).toLowerCase()) ? callSlots.repName : null;
+        return offerPlan(two, `${rehashReadyLine(repName)} ${LINES.offer_slots(two, counters.slot_offers)}`);
+      }
+      // "You've given so many different times": the same two again.
+      if (open.length === 2 && /\bconfus|\bso\s+many\b|\bdifferent\s+times\b|\bwhich\s+(?:times?|one)\s+(?:is\s+it|again)\b/i.test(now)) {
+        return offerPlan(open, `Sorry for the mix-up${hi}. ${LINES.offer_slots(open, counters.slot_offers)}`);
+      }
+    }
     // A pick from the times we offered (the last four of our messages).
     if (lastOfferOut) {
       const offered = offeredIn(lastOfferOut, all);
@@ -1296,7 +1367,9 @@ function planNepqTurnCore({
     const bridged = CALL_OFFER_SENTENCE_RX.test(lastOut) || bridgedRecently(outbound.map(m => m.text));
     const yesToCall = bridged && (YES_RX.test(now) || MAYBE_RX.test(now)) && !isNo(now, lastOut);
     if ((askedForCall || yesToCall || scheduleAsk) && offer.length === 2) {
-      return offerPlan(offer, LINES.offer_slots(offer, counters.slot_offers));
+      // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED): the pair still on the table, not a new one.
+      const two = bookingFix ? stableOffer() : offer;
+      return offerPlan(two, LINES.offer_slots(two, counters.slot_offers));
     }
     return null;
   }
@@ -1423,6 +1496,15 @@ function planNepqTurnCore({
     // A request for room is never an objection (2026-10-15): Jose's "tough few days I would need more time to
     // think about this" reads as "think" to postDemoObjection, and the ladder (merged beside 3b, #1324/#1325)
     // asked it back. Room comes first; a bare "need to think about it" still reaches the ladder.
+    // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED): ready to buy, with no Rehash Call
+    // times read (planRehashCall offers them when it has them): ask for the call.
+    if (bookingFix && onTrack && isRehashReady(now)) {
+      const repName = (callSlots?.repName) || rehashRep || null;
+      const speaksAsRep = !!(repName && rehashRep && String(repName).toLowerCase() === String(rehashRep).toLowerCase());
+      const line = rehashReadyLine(speaksAsRep ? null : repName, { ask: true });
+      Object.assign(plan, { rehash_stage: 'bridge', rehash_bridged: true });
+      return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: line, rehash_ready: true });
+    }
     const pdObj = onTrack && !askedForSpace(now) ? postDemoObjection(now, lastOut) : null;
     if (pdObj) {
       const objAttempt = turns.reduce((n, t, i) => n + (t.direction === 'inbound' && postDemoObjection(t.text, prevOutAt(i)) ? 1 : 0), 0);
@@ -1439,7 +1521,7 @@ function planNepqTurnCore({
         const every = hintMode === 'every';
         const hintUsed = !every && bestDealHintUsed(conversation);
         const lead = hintUsed ? 'I may be able to do something for you' : "I want to make sure you're getting the best deal possible. I may be able to do something for you";
-        const offer = Array.isArray(callSlots?.offer) ? callSlots.offer : [];
+        const offer = bookingFix ? stableOffer() : Array.isArray(callSlots?.offer) ? callSlots.offer : [];
         Object.assign(plan, { rehash_stage: 'bridge', rehash_bridged: true, rehash_ladder: 'bridge' });
         plan.objection.line = null;
         if (offer.length === 2) {
@@ -2796,7 +2878,28 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   if (!body && plan.post_demo && !referenceMove) { body = 'Understood.'; changes.push('post_demo_fallback'); }
   // 2026-10-11 live simulation: "Thanks for checking in" got "Anytime. Talk
   // soon." The planned proposal question goes on; a sign-off in its way goes.
-  const trackQuestion = plan.step === 'post_demo_ack' ? plan.post_demo_question : plan.step === 'post_demo' ? plan.rehash_question : null;
+  // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED; kS2AJk85fv7Lfyl3iZcm, Komal): on a
+  // rehash turn that is not our offer or our confirm, a clock time the draft
+  // names that is not a real Rehash Call opening goes (the model offered times
+  // from another calendar, the lead picked them, and the rep's calendar did
+  // not have them). A reply that still states a call time asks nothing after it.
+  let statesCallTime = false;
+  // A booked call already on the calendar is no longer an opening: its time stays.
+  if (plan.rehash_fix && plan.post_demo && !plan.rehash_has_appointment && !['rehash_offer', 'rehash_confirm'].includes(plan.step) && body) {
+    const pool = Array.isArray(plan.rehash_time_pool) ? plan.rehash_time_pool : [];
+    const parts = splitSentences(body);
+    const kept = parts.filter(x => typedClock(x) == null || offeredIn(x, pool).length > 0);
+    if (kept.length < parts.length) {
+      body = kept.join(' ').trim() || plan.ack_line || 'Understood.';
+      changes.push('rehash_foreign_time_dropped');
+    }
+    statesCallTime = typedClock(body) != null;
+    if (statesCallTime && body.includes('?')) {
+      body = splitSentences(body).filter(x => !x.includes('?')).join(' ').trim();
+      changes.push('rehash_no_question_after_time');
+    }
+  }
+  const trackQuestion = statesCallTime ? null : plan.step === 'post_demo_ack' ? plan.post_demo_question : plan.step === 'post_demo' ? plan.rehash_question : null;
   if (trackQuestion && plan.rehash_stage && !plan.no_question && !body.includes('?')) {
     const kept = splitSentences(body).filter(s => !isSignOffLine(s) && !/^talk\s+soon\b/i.test(s));
     body = [...kept, trackQuestion].join(' ').trim();
@@ -2804,7 +2907,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   }
   // The bridge turn asks for the call (the same simulation: "Worth seeing if
   // we can close that difference." and no question).
-  if (plan.post_demo && plan.rehash_stage === 'bridge' && plan.step === 'post_demo' && !plan.no_question && body && !body.includes('?')) {
+  if (plan.post_demo && plan.rehash_stage === 'bridge' && plan.step === 'post_demo' && !plan.no_question && !statesCallTime && body && !body.includes('?')) {
     body = `${body} Would a quick call help?`;
     changes.push('rehash_bridge_ask_added');
   }

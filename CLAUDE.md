@@ -400,6 +400,24 @@ carry `lp_had_demo: false` (`sql/seeds/2026-10-19_dq_above_2nd_floor_not_post_de
 a bare no to our times asks once "When is a good day and time for a call?" (`rehash_ask_time`; `isPostDemoNo` does not
 count it, a no to that ask does), and a day or part of day gets two Rehash Call openings, never the pair just refused.
 
+**A rehash lead's named call time is booked, and the pair on the table stays the pair (the user, 2026-10-21;
+`REHASH_BOOKING_FIX_ENABLED`, unset = on, `false` = off).** kS2AJk85fv7Lfyl3iZcm answered our "9:30 AM or 10:30 AM" with
+"9:30": nothing read it, nothing was booked, the model said "I'll call you at 9:30 … Would a quick call help?". Komal
+(YgAD0NmDXBbyHDF82Ban) got a NEW pair after "930am", "Thursday at 6pm" and "Thursday at 2pm" (the prompt also showed the
+knowledge pack's visit calendar, whose times the rep's calendar did not have) and opted out. Now, in `planRehashCall`:
+`readRehashTime` (`src/agentic/rehash-time.js`: "9:30", "930am", "9.30", "at 2", "Thursday at 2pm"; the LAST time named
+wins) picks from our open offer (`rehashOpenOffer`: any of our last four messages naming real openings) or books the exact
+opening on the named day (`rehashTimeSlots`), else offers the two closest that day (`LINES.not_open`); a call ask, a yes or
+"so many different times" re-offers the open pair (`stableOffer`); the confirm is "You're all set for {day} at {time}.
+{Rep} will call you at this number then." (no question); a buying signal ("ready to move", "final costs",
+`isRehashReady`) gets the call before any objection; a firm decline ("not needed at this time", "not doing windows",
+`REHASH_FIRM_NO_RX`) is a first no (door_open). `enforceNepqPlan` drops a clock time that is not a Rehash Call opening and
+asks nothing after a stated call time; the prompt gets no `availability` on a rehash turn; "I'll call you at <time>" is a
+booking claim with `{ rehash: true }` only (`REHASH_CALL_CLAIM_PATTERNS`, booking-claim.js). checkReply
+`question_after_post_demo_firm_no`. `bot_outcomes.booked_at` needed no change: it reads the HL appointment mirror. Gate:
+`rehash_booking_fix` on|off, scenarios `rehash_bare_time_pick`, `rehash_named_time`, `rehash_ready_to_move`,
+`rehash_firm_no`. The pre-demo bot never reads the switch (`scripts/test-rehash-predemo-unchanged.js`).
+
 **A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock
 discovery question after "Thank you I will.", two slot offers to "Follow up in November please.", a question after "Enjoy
 your week." and "Congratulations" to a lead who signed elsewhere: `planNepqTurn` never knew, and `enforceNepqPlan` step 7
