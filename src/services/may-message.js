@@ -103,6 +103,7 @@ export const OPERATIONAL_HOLD = Object.freeze([
   'cooling-active',                    // loss intelligence cooling window
   'cannot-afford:pursuing-assistance', // CANNOT_AFFORD hold (executeIssueHold)
   'active-entry:canvassing',           // a canvasser is working the door (2026-08-08)
+  'phone-team',                        // an outside partner's phone team owns the lead (2026-10-21)
 ]);
 
 /** Never a reason to withhold a message here (see header). */

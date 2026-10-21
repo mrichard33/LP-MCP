@@ -1208,6 +1208,17 @@ assignment. Every write is read back (a kept owner is `failed`), noted on the co
 `PARTNER_SYNC_ENABLED=false` or `PARTNER_GO_LIVE_AT` unset. `POST /n8n/admin/partner-owner/run {lp_lead_id, dry_run}`
 (strict operator token, no soft launch) and `GET /n8n/admin/partner-owner/status`. Side effect: GHL credits a bot message
 with no `userId` to the contact owner, so bot texts to a partner lead show as the partner in GHL.
+**The partner's GHL tag is what tells the partner (the user, 2026-10-21).** "When a lead has the tag applied phone-team
+this is what triggers the lead being assigned to Ross and a notification sent to Ross." `partner_owner_map.ghl_tag`
+(Ross / RFED: `phone-team`, migration `20261021120000_partner_owner_tag.sql`) is added, read back, right after the sync
+makes the partner the owner, and on a `noop` whose contact lacks it; GHL "U.RFED Lead Assigned to Phone Team" fires on
+it. A failed tag keeps the owner and is retried next pass (the memo needs `detail.tag.present`). The return removes it
+only for a contact WE assigned. The customer gets ONE SMS and ONE email, both GHL's (S5.2 / U.RFED): `phone-team` is
+in the send gate's OPERATIONAL_HOLD and the legacy SUPPRESS_TAGS (outreach only; the bot still answers every reply),
+and `executeAddToWorkflow` refuses any code enrollment but S5.2 for it (`skipped_phone_team`;
+`PHONE_TEAM_HOLD_ENABLED=false` is the rollback). The bot tries to book the call: `phonePresentationActive` counts
+`phone-team` like 1 Leg (same calendar, same hold, same both-decision-makers question), and the booking guard reads the
+tag live. Gate scenario `phone_team_books_call`.
 
 **A 1 Leg contact is offered a phone presentation, both decision makers on the call (Mark, handoff v3, 2026-10-20).**
 Only a contact whose OPEN objection state is `APPOINTMENT_DISRUPTION.one_leg` (rule `LP_DISP_1LEG_TO_ONELEG`) gets it:

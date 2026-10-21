@@ -401,6 +401,9 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     }
     return out;
   },
+  // 2026-10-21 (the user): a phone-team lead is offered the call, never a visit.
+  phone_team_books_call: (r) => SCENARIO_EXPECTATIONS.one_leg_phone_presentation(r)
+    .map(f => (f.code === 'no_phone_presentation' ? { ...f, detail: 'a phone-team contact was not offered the phone presentation' } : f)),
   absent_spouse_normal_offer: (r) => (planSteps(r).some(s => String(s).startsWith('pp_'))
     ? [{ code: 'phone_presentation_not_one_leg', detail: 'a contact not in one_leg got the phone presentation' }] : []),
   rehash_book_call: (r) => {

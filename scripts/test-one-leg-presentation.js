@@ -57,6 +57,19 @@ test('only an open one_leg state, a configured calendar and SMS turn the branch 
   assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, channel: 'livechat', env: ENV }), false);
 });
 
+test('a phone-team contact (an outside partner\'s lead, 2026-10-21) gets the branch too; the tag alone, any case', async () => {
+  const { mayMessage } = await import('../src/services/may-message.js');
+  assert.equal(pp.phonePresentationActive({ objectionState: null, tags: ['phone-team'], env: ENV }), true);
+  assert.equal(pp.phonePresentationActive({ objectionState: null, tags: ['Phone-Team'], env: ENV }), true);
+  assert.equal(pp.phonePresentationActive({ objectionState: null, tags: ['phone-team'], env: {} }), false, 'no calendar → inert');
+  assert.equal(pp.phonePresentationActive({ objectionState: null, tags: ['phone-team'], rehash: true, env: ENV }), false);
+  assert.equal(pp.phonePresentationActive({ objectionState: null, tags: ['phone-team'], channel: 'livechat', env: ENV }), false);
+  assert.equal(pp.phonePresentationActive({ objectionState: null, tags: ['active-s5.2'], env: ENV }), false);
+  // The send gate: no unprompted message to a phone-team contact, and the bot still answers their texts.
+  assert.equal(mayMessage({ tags: ['phone-team'], channel: 'sms', purpose: 'outreach' }).allowed, false);
+  assert.equal(mayMessage({ tags: ['phone-team'], channel: 'sms', purpose: 'reply' }).allowed, true);
+});
+
 test('the Phone Presentation calendar is GHL-only (never an LP appointment)', () => {
   const prev = process.env.PHONE_PRESENTATION_CALENDAR_ID;
   process.env.PHONE_PRESENTATION_CALENDAR_ID = CAL;

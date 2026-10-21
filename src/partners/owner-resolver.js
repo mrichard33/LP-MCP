@@ -37,7 +37,8 @@ export async function loadPartnerMap(deps = {}) {
   const db = deps.supabase || await defaultSupabase();
   if (!db) throw new Error('partner_owner_map: LP Supabase not configured');
   const { data, error } = await db.from('partner_owner_map')
-    .select('id, partner_name, lp_branch_id, lp_rep_name, ghl_user_id, active');
+    // '*' so ghl_tag (2026-10-21) is read once its migration lands and its absence before then is no error.
+    .select('*');
   if (error) {
     if (cache) {
       console.warn(`[PartnerOwner] partner_owner_map read failed, keeping the last map: ${error.message}`);

@@ -132,6 +132,12 @@ const ONE_LEG_LEAD = {
   lp: { disposition: '1Leg', zip: '33908', city: 'Fort Myers', address: '1200 Palm Ave' },
 };
 
+// 2026-10-21: an RFED lead the partner owner sync assigned to Ross (tag phone-team).
+const PHONE_TEAM_LEAD = {
+  firstName: 'Lee', lastName: 'Sim', phone: '+15615550190', email: null, postalCode: '33401', tags: ['phone-team'],
+  lp: { disposition: 'Data', zip: '33401', city: 'West Palm Beach', address: '88 Clematis St' },
+};
+
 // 2026-10-16 (Siro PR 1): the same rehash lead, with the Siro recording of
 // her visit: the price was her hesitation and the lanai slider her priority.
 const REHASH_SIRO_LEAD = {
@@ -301,6 +307,9 @@ export const SCENARIOS = Object.freeze({
   // NOT in that state who says the spouse is away keeps the normal offer. The
   // 1 Leg check applies only when PHONE_PRESENTATION_CALENDAR_ID is set.
   one_leg_phone_presentation: { title: '1 Leg: reschedule ask gets the phone presentation, both decision makers', family: 'booking', persona: ONE_LEG_LEAD, channels: ['sms'], turns: ['Can we reschedule? My husband had to work when the rep came.'] },
+  // 2026-10-21 (the user): a contact GHL tagged phone-team (an RFED lead our
+  // partner sync gave Ross) is offered the same phone presentation call.
+  phone_team_books_call: { title: 'phone-team (Ross) lead: a time ask gets the phone presentation, not a visit', family: 'booking', persona: PHONE_TEAM_LEAD, channels: ['sms'], turns: ['Hi, I got your text. When can we talk about the windows?'] },
   absent_spouse_normal_offer: { title: 'Not 1 Leg: "my wife isn\'t home" keeps the normal offer', family: 'booking', persona: DANA, channels: ['sms'], turns: ["My wife isn't home right now but we want new windows. Can we set up a time?"] },
   // ── 2026-10-16 (framework cleanup, Phase 0): the post-demo rehash track ──
   // SMS only: rehash is the SMS reply writer's (the live chat never plans it).

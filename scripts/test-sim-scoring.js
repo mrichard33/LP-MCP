@@ -491,3 +491,24 @@ test('Phase 0: a saved run keeps each result\'s family', () => {
   const card = scoreRun([{ ...result('rehash_defer', [turn(1, 'Call me in the spring', 'Will do.', pd('defer'))]), family: 'rehash' }]);
   assert.equal(evalRunPayload(card, null).scorecard.results[0].family, 'rehash');
 });
+
+// ── 2026-10-21: the identity ask by flow (also fixed on main, #1416) and phone_team_books_call ──
+
+test('the cancel flow\'s identity ask is allowed by the turn\'s flow, whatever the scenario is called', () => {
+  const ask = 'Sorry to hear that. What is the full name and phone number the appointment is under?';
+  const fl = (flow) => scoreResult(result('reschedule_unclear', [turn(1, 'I need to change my appointment', ask, { flow })]));
+  assert.ok(!fl('ask_identity').failures.some(f => f.code === 'more_than_one_ask'), JSON.stringify(fl('ask_identity').failures));
+});
+
+test('phone_team_books_call: a phone-team lead offered a visit fails (with the calendar set)', () => {
+  const prev = process.env.PHONE_PRESENTATION_CALENDAR_ID;
+  process.env.PHONE_PRESENTATION_CALENDAR_ID = 'cal_pp';
+  try {
+    const bad = { ...result('phone_team_books_call', [turn(1, 'When can we talk?', 'I have Tue at 10 AM or Wed at 2 PM. Which works better?', { nepq: { step: 'offer_slots' } })]), channel: 'sms', would_do: [{ kind: 'would_book_appointment', payload: { calendar_name: 'Window Estimate' }, turn: 1 }] };
+    const codes = scoreResult(bad).failures.map(f => f.code);
+    assert.ok(codes.includes('no_phone_presentation'), codes.join(','));
+    assert.ok(codes.includes('one_leg_booked_visit'), codes.join(','));
+  } finally {
+    if (prev === undefined) delete process.env.PHONE_PRESENTATION_CALENDAR_ID; else process.env.PHONE_PRESENTATION_CALENDAR_ID = prev;
+  }
+});

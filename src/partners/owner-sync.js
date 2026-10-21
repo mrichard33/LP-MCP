@@ -4,8 +4,9 @@
 // outside sales partner's branch (Ross Erstling → RFED) is owned in GHL by the
 // partner — the contact AND every open opportunity — and goes back to the Reece team
 // user (PARTNER_DEFAULT_OWNER_ID) when it leaves the partner. LP is the source of
-// truth; one way only; nothing here writes to LP or touches messaging, tags or
-// workflows. Partners are OWNERS, never followers: GHL's "Only Assigned Data"
+// truth; one way only; nothing here writes to LP or touches messaging or
+// workflows. The one tag it writes is the partner row's ghl_tag (2026-10-21,
+// phone-team: GHL's U.RFED fires on it), added on assign, removed on our return. Partners are OWNERS, never followers: GHL's "Only Assigned Data"
 // permission keys on the owner.
 //
 // The rules, in the order they are applied:
@@ -271,6 +272,39 @@ async function openOpportunities(d, contactId) {
 // see. The card keeps its owner, is listed as skipped, and is not a failure.
 export const PIPELINE_ACCESS_RX = /does not have permission to access this pipeline/i;
 
+// 2026-10-21 (the user): "When a lead has the tag applied phone-team this is what
+// triggers the lead being assigned to Ross and a notification sent to Ross."
+// GHL "U.RFED Lead Assigned to Phone Team" fires on the tag being ADDED (assign
+// the partner, then an internal SMS to the owner). So once our sync makes the
+// partner the owner, it adds the partner row's ghl_tag (partner_owner_map; Ross →
+// phone-team). Read back; a failed tag never undoes the owner, it is logged
+// (detail.tag) and tried again on the next pass. On a return the tag comes off,
+// only for a contact we assigned, so a later lead in the branch fires GHL again.
+const hasTag = (contact, tag) => (contact?.tags || []).some((t) => norm(t) === norm(tag));
+
+async function ensurePartnerTag(d, contactId, tag, contact) {
+  if (!tag) return null;
+  if (hasTag(contact, tag)) return { tag, present: true, added: false };
+  try {
+    await d.ghlFetch('POST', `/contacts/${contactId}/tags`, { tags: [tag] });
+    const back = await readContact(d, contactId);
+    const ok = hasTag(back, tag);
+    return ok ? { tag, present: true, added: true } : { tag, present: false, added: false, error: 'tag missing on read-back' };
+  } catch (err) {
+    return { tag, present: false, added: false, error: err.message };
+  }
+}
+
+async function removePartnerTag(d, contactId, tag, contact) {
+  if (!tag || !hasTag(contact, tag)) return null;
+  try {
+    await d.ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: [tag] });
+    return { tag, removed: true };
+  } catch (err) {
+    return { tag, removed: false, error: err.message };
+  }
+}
+
 /** PUT the owner on the contact and every open opportunity, reading each back. */
 async function applyOwner(d, contactId, target) {
   await d.ghlFetch('PUT', `/contacts/${contactId}`, { assignedTo: target });
@@ -410,6 +444,7 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
     const lastD = decidingHistory[0];
     if (!dryRun && lastD && !branchChanged && !repChanged
         && (WRITE_REASONS.has(lastD.reason) || lastD.reason === 'noop')
+        && (!match.ghl_tag || lastD.detail?.tag?.present === true)
         && String(lastD.to_owner || '') === target
         && d.now() - Date.parse(lastD.created_at) < MEMO_MS) {
       return { ok: true, reason: 'memo', target };
@@ -456,7 +491,16 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
     && decidingHistory[0]?.reason === 'failed');
   if (from === target && !finishOurs) {
     const out = { ok: true, reason: 'noop', from, target, eligibility };
-    if (!dryRun && !quiet('noop')) await writeLog(d, { ...base, reason: 'noop', from_owner: from, to_owner: target, partner_name: partnerName });
+    if (match?.ghl_tag && !hasTag(contact, match.ghl_tag)) {
+      if (dryRun) return { ...out, would_tag: match.ghl_tag };
+      out.tag = await ensurePartnerTag(d, lead.ghl_contact_id, match.ghl_tag, contact);
+      await writeLog(d, { ...base, reason: 'noop', from_owner: from, to_owner: target, partner_name: partnerName, detail: { tag: out.tag, eligibility } });
+      return out;
+    }
+    if (!dryRun && !quiet('noop')) {
+      await writeLog(d, { ...base, reason: 'noop', from_owner: from, to_owner: target, partner_name: partnerName,
+        ...(match?.ghl_tag ? { detail: { tag: { tag: match.ghl_tag, present: true, added: false } } } : {}) });
+    }
     return out;
   }
 
@@ -466,7 +510,8 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
   const toLabel = ownerLabel(target, match?.partner_name || null, cfg.defaultOwner);
   const fromLabel = ownerLabel(from, await partnerNameForUser(from, d), cfg.defaultOwner);
   if (dryRun) {
-    return { ok: true, reason, dry_run: true, from, target, partner_name: partnerName, eligibility, deciding_lead: String(deciding.lp_lead_id) };
+    return { ok: true, reason, dry_run: true, from, target, partner_name: partnerName, eligibility, deciding_lead: String(deciding.lp_lead_id),
+      ...(match?.ghl_tag ? { would_tag: match.ghl_tag } : {}) };
   }
 
   let applied;
@@ -486,7 +531,15 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
     return { ok: false, reason: 'failed', from, target, error: err.message };
   }
 
-  if (!match) await releaseAssignment(d, lead.ghl_contact_id);
+  let tag = null;
+  if (match) {
+    tag = await ensurePartnerTag(d, lead.ghl_contact_id, match.ghl_tag, applied.contact);
+  } else {
+    const ourRow = assignment && rows.find((r) => String(r.ghl_user_id) === String(assignment.ghl_user_id) && r.ghl_tag);
+    if (ourRow) tag = await removePartnerTag(d, lead.ghl_contact_id, ourRow.ghl_tag, applied.contact || contact);
+    await releaseAssignment(d, lead.ghl_contact_id);
+  }
+  if (tag?.error) console.warn(`[PartnerOwner] tag ${tag.tag} on ${lead.ghl_contact_id}: ${tag.error} (owner already set; retried next pass)`);
   const stamp = formatEt(new Date(d.now()));
   const note = `Owner → ${toLabel} · LP branch ${deciding.lp_branch_id || '—'} · rep ${deciding.rep_name || '—'} · ${stamp}`;
   try {
@@ -499,9 +552,10 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
     detail: {
       opportunities: applied.opportunities, eligibility, deciding_lead: String(deciding.lp_lead_id),
       ...(applied.opportunities_skipped.length ? { opportunities_skipped_no_pipeline_access: applied.opportunities_skipped } : {}),
+      ...(tag ? { tag } : {}),
     },
   });
   const card = await postCard(d, { reason, lead: deciding, target, contact: applied.contact || contact, partnerName, toLabel, fromLabel });
   d.log(`[PartnerOwner] ${reason}: contact ${lead.ghl_contact_id} ${from || 'none'} → ${target} (${applied.opportunities.length} open opportunit${applied.opportunities.length === 1 ? 'y' : 'ies'})`);
-  return { ok: true, reason, from, target, opportunities: applied.opportunities, card };
+  return { ok: true, reason, from, target, opportunities: applied.opportunities, card, ...(tag ? { tag } : {}) };
 }
