@@ -106,10 +106,7 @@ export function withPersonaLp(context, persona) {
   // 2026-10-16 (Siro PR 1): a persona may carry the Siro recording of its
   // visit (persona.lp.siro: siro_recordings rows), as SIRO_CONTEXT_MODE=live
   // would read it from Supabase.
-  // 2026-10-21: only when the run's SIRO_CONTEXT_MODE is live (Railway's, or
-  // the gate's siro_context_mode). Production reads no visit in shadow, so a
-  // shadow run that saw one tested a feature that is off.
-  const siroRows = siroModes().context === 'live' && Array.isArray(lp.siro) && lp.siro.length ? lp.siro : null;
+  const siroRows = Array.isArray(lp.siro) && lp.siro.length ? lp.siro : null;
   next.lead_facts = buildLeadFacts({ lp: ctxLp, lpLead: { zip: lp.zip, city: lp.city, address: lp.address }, lead: context.lead, siro: siroRows, siroFollowupTextLive: siroModes().followupText === 'live' });
   if (siroRows) next.siro = { presentation: buildPresentationFacts(siroRows) };
   return next;
@@ -693,7 +690,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   return {
     channel: 'sms', scenario: plan.key, title: plan.title, family: plan.family || 'new_lead', expect: plan.expect || null, nepq_mode: nepqMode, lead_stage_mode: stageDeps.env.LEAD_STAGE_MODE, turn_lock_mode: lockMode, contact_id: plan.contactId || null,
     // 2026-10-19: the modes this conversation ran under (Railway's, or the gate's override).
-    rehash_deal_hint_mode: rehashDealHintMode(), human_takeover_mode: humanTakeoverMode(), siro_context_mode: siroModes().context,
+    rehash_deal_hint_mode: rehashDealHintMode(), human_takeover_mode: humanTakeoverMode(),
     // 2026-10-21: the two rehash switches (src/agentic/rehash-flags.js).
     rehash_booking_fix: rehashBookingFix() ? 'on' : 'off', rehash_better_price: rehashBetterPrice() ? 'on' : 'off',
     transcript,

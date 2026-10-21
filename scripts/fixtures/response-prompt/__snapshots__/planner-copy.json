@@ -1,5 +1,5 @@
 {
- "version": "v2.15.0",
+ "version": "v2.16.0",
  "copy": {
   "src/agentic/nepq-planner.js": [
    "${betterPriceReason('generic', repName && !speaksAsRep ? repName : null)} ${LINES.offer_slots(offer, counters.slot_offers)}",
@@ -105,6 +105,7 @@
    "dnk_ask_address",
    "handoff",
    "itemized",
+   "name the ${visitHesitation === 'price' ? 'budget' : visitHesitation === 'competitor' ? 'other quotes' : 'decision'} they raised at the visit",
    "nepq:${step}",
    "nepq:ask_day",
    "nepq:booked",

@@ -166,3 +166,57 @@ export function clockLabel(minutes) {
   const m = minutes % 60;
   return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`.replace(':00 ', ' ');
 }
+
+/**
+ * The day (and part of day) a message names with NO clock time, or null:
+ * { day: 'tomorrow' | 'today' | 'thursday' …, part: 'morning' | 'afternoon' | 'evening' | null }.
+ * 2026-10-21 (first live-build sim): "Can you call me tomorrow?" got today's two
+ * times and a model-made "I don't have anything open tomorrow". Pure.
+ */
+export function readRehashDay(text) {
+  const t = String(text || '');
+  if (!t.trim() || readRehashTime(t)) return null;
+  const days = [...t.matchAll(DAY_WORD_RX)];
+  if (!days.length) return null;
+  const low = t.toLowerCase();
+  const part = /\bmornings?\b/.test(low) ? 'morning' : /\bafternoons?\b/.test(low) ? 'afternoon' : /\b(?:evenings?|tonight|after\s+work)\b/.test(low) ? 'evening' : null;
+  return { day: dayKey(days[days.length - 1]), part };
+}
+
+const inPart = (s, part) => {
+  const m = slotMinutes(s);
+  if (!part || m == null) return true;
+  if (part === 'morning') return m < 12 * 60;
+  if (part === 'afternoon') return m >= 12 * 60 && m < 17 * 60;
+  return m >= 17 * 60;
+};
+
+/**
+ * Two real openings on the day a message names: { want, matched, slots }.
+ * matched: the day has two (or one, with its nearest neighbour that day or the
+ * next); otherwise the two soonest openings after it, said honestly by the
+ * caller. Null when the message names no day without a time. Pure.
+ */
+export function rehashDaySlots(text, all = [], { nowMs = Date.now() } = {}) {
+  const want = readRehashDay(text);
+  if (!want) return null;
+  const pool = (Array.isArray(all) ? all : []).filter(s => slotMinutes(s) != null && (!s.iso || Date.parse(s.iso) >= nowMs)).sort((a, b) => when(a) - when(b));
+  const onDay = pool.filter(s => slotDayKeys(s).has(want.day));
+  const hits = onDay.filter(s => inPart(s, want.part));
+  if (hits.length >= 2) {
+    // The first opening, and the one furthest from it that day (a real choice, not 2:00 and 2:30).
+    const first = hits[0];
+    const second = hits.slice(1).reduce((a, b) => (Math.abs(slotMinutes(b) - slotMinutes(first)) > Math.abs(slotMinutes(a) - slotMinutes(first)) ? b : a));
+    return { want, matched: true, slots: [first, second].sort((a, b) => when(a) - when(b)) };
+  }
+  if (hits.length === 1) {
+    // Its neighbour that day, else the opening nearest it in time.
+    const at = when(hits[0]);
+    const rest = onDay.filter(s => s !== hits[0]);
+    const near = (rest.length ? rest : pool.filter(s => s !== hits[0])).sort((a, b) => Math.abs(when(a) - at) - Math.abs(when(b) - at))[0];
+    if (near) return { want, matched: true, slots: [hits[0], near].sort((a, b) => when(a) - when(b)) };
+  }
+  // Nothing that day: the two soonest openings after it (or overall).
+  const after = onDay.length ? pool.filter(s => when(s) > when(onDay[onDay.length - 1])) : pool;
+  return { want, matched: false, slots: (after.length >= 2 ? after : pool).slice(0, 2) };
+}

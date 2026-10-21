@@ -492,18 +492,12 @@ test('Phase 0: a saved run keeps each result\'s family', () => {
   assert.equal(evalRunPayload(card, null).scorecard.results[0].family, 'rehash');
 });
 
-// ── 2026-10-21 (SCORING_VERSION .3): three checks that failed on a healthy bot ──
+// ── 2026-10-21: the identity ask by flow (also fixed on main, #1416) and phone_team_books_call ──
 
 test('the cancel flow\'s identity ask is allowed by the turn\'s flow, whatever the scenario is called', () => {
   const ask = 'Sorry to hear that. What is the full name and phone number the appointment is under?';
   const fl = (flow) => scoreResult(result('reschedule_unclear', [turn(1, 'I need to change my appointment', ask, { flow })]));
   assert.ok(!fl('ask_identity').failures.some(f => f.code === 'more_than_one_ask'), JSON.stringify(fl('ask_identity').failures));
-});
-
-test('the Siro hesitation check runs only when the run had SIRO_CONTEXT_MODE live', () => {
-  const r = (mode) => ({ ...result('rehash_siro_price_objection', [turn(1, 'We are still thinking it over', 'Totally fair. What would help you decide?', pd('post_demo'))]), channel: 'sms', ...(mode ? { siro_context_mode: mode } : {}) });
-  assert.ok(!scoreResult(r('shadow')).failures.some(f => f.code === 'visit_hesitation_ignored'));
-  assert.ok(scoreResult(r('live')).failures.some(f => f.code === 'visit_hesitation_ignored'));
 });
 
 test('phone_team_books_call: a phone-team lead offered a visit fails (with the calendar set)', () => {

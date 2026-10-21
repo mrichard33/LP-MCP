@@ -25,6 +25,9 @@ const DEFER_RXS = [
   /\bnot\s+(?:right\s+)?now\b|\bnot\s+(?:today|at\s+(?:this|the)\s+(?:time|moment)|this\s+(?:week|time))\b/i,
   /\bmaybe\s+(?:later|another\s+time|some\s+other\s+time|down\s+the\s+road)\b/i,
   /\bi(?:'|’)?m\s+(?:busy|at\s+work|driving|in\s+a\s+meeting)\s+(?:right\s+now|now|at\s+the\s+moment)\b/i,
+  // Other quotes still to come (bot gate 2026-10-20, two_texts_one_reply_sms: "Still got a
+  // couple more quotes to come in / Sounds good" got a hand-off and a Five9 callback).
+  /\b(?:quotes?|estimates?|bids?)\s+(?:still\s+)?(?:to\s+come\s+in|coming(?:\s+in)?|on\s+the\s+way)\b|\bwaiting\s+(?:on|for)\s+(?:a\s+(?:couple|few)\s+(?:more\s+|other\s+)?|more\s+|other\s+|the\s+other\s+)?(?:quotes?|estimates?|bids?)\b/i,
 ];
 
 // A closing line: counts when it is the message's LAST sentence.

@@ -28,7 +28,8 @@
 --   POST /n8n/kb/reembed {"faqs":true}, then read would_match on each:
 --   GET /n8n/kb/faq-probe?q=Do you work on rental properties?   (LIB-P16)
 --   GET /n8n/kb/faq-probe?q=I'm renting, can I get a quote?      (LIB-P16)
---   and reload the intent handlers (they load at boot; a redeploy reloads them).
+--   The intent handlers re-read the table within a minute (HANDLERS_CACHE_TTL_MS, 60s in
+--   src/knowledge/intent-classifier.js); no redeploy is needed.
 
 UPDATE kb_faqs
    SET question_pattern = $$Do you work on rental properties? | Can you do windows on my rental? | I rent it out, can you replace the windows? | Do you work with landlords? | Do you do investment properties? | It's a flip, can you do the windows? | It's an Airbnb, can you help? | I'm renting, can I get a quote? | Can renters get a quote?$$,

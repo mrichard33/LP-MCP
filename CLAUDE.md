@@ -416,7 +416,10 @@ asks nothing after a stated call time; the prompt gets no `availability` on a re
 booking claim with `{ rehash: true }` only (`REHASH_CALL_CLAIM_PATTERNS`, booking-claim.js). checkReply
 `question_after_post_demo_firm_no`. `bot_outcomes.booked_at` needed no change: it reads the HL appointment mirror. Gate:
 `rehash_booking_fix` on|off, scenarios `rehash_bare_time_pick`, `rehash_named_time`, `rehash_ready_to_move`,
-`rehash_firm_no`. The pre-demo bot never reads the switch (`scripts/test-rehash-predemo-unchanged.js`).
+`rehash_firm_no`. The pre-demo bot never reads the switch (`scripts/test-rehash-predemo-unchanged.js`). A day named
+with no clock time ("call me tomorrow", "Thursday afternoon") on a call ask, a yes or an open offer gets two openings
+that day (`rehashDaySlots`; the open pair when it is already that day; none → "I don't have anything open …" and the
+next two); after our "When is a good day and time?" the older preference branch answers (it leaves out refused times).
 
 **The reason for a rehash call is a better price (the user, 2026-10-21; `REHASH_BETTER_PRICE_FRAMING_ENABLED`, unset =
 on, `false` = the copy before, byte for byte).** "I may be able to do something for you, it's just easier on a quick
@@ -432,6 +435,26 @@ better-price line SUPERSEDES "the best deal possible, once" (2026-10-11) and the
 competitor / think. Still never an amount, %, discount or promise (`stripOfferTalk` is unchanged; its fallback line is
 the better-price question). Gate: `rehash_better_price` on|off, scenarios `rehash_other_quotes`, `rehash_call_reason`.
 Tests that hold the old copy pin the switch off (`test-rehash-nepq.js`, `-objection-ladder`, `-call-slots`, `-deal-hint`).
+
+**The bot gate's last failures (2026-10-20).** Three real bugs, one scorer gap:
+- **A burst is one inbound.** The reply buffer joins a burst with newlines as the trigger, and `normalizeThread` /
+  rehash `normalize()` appended it after the texts already in the thread, so "Still got a couple more quotes to come in
+  / Sounds good" counted the shopping objection twice and planned `repeat_objection` (a Five9 callback) on the first
+  reply. `appendTrigger` (`src/agentic/burst-trigger.js`) replaces the trailing run with the one trigger (a real newline
+  or I.L3-IN's two-character `\n`). Quotes or estimates still to come in are a sign-off (`DEFER_RXS`).
+- **The visit's hesitation is asked back by name.** With Siro's PRESENTATION showing price, "We are still thinking it
+  over" got the generic "What's holding you back?". `visitHesitationOf` (`presentation-facts.js`) passes
+  `visitHesitation` to the planner, and a post-demo "still deciding" (the situation stage's own read-back) plans ONE
+  `POST_DEMO_VISIT_ASK` ("Are you still weighing the budget?", no figure); it is the ladder's ask-back, so the next
+  objection gets the bridge. With `REHASH_BETTER_PRICE_FRAMING_ENABLED` on (the default, newer), a price or
+  other-quotes hesitation from the visit takes the better-price line instead, exactly as a named one does (`ladderObj`);
+  a spouse keeps the ask-back.
+- **The live chat's reschedule path runs in every mode** (`stageLive: true` for `planCancelTurn`): an unclear answer to
+  "a different day instead of cancelling?" gets one move-or-cancel question, never a cancel card, and "neither of those"
+  to the re-offered times goes to a person rather than the same two times again.
+- **Scorer:** the cancel identity ask is allowed by the turn's own flow step (`ask_identity`), not the scenario's name
+  (`SCORING_VERSION` 2026-10-21.3). `two_texts_one_reply_sms` still counts the shadow turn lock's would-be second send
+  until `TURN_LOCK_MODE` is live (a person's flip after the 48-hour check).
 
 **A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock
 discovery question after "Thank you I will.", two slot offers to "Follow up in November please.", a question after "Enjoy

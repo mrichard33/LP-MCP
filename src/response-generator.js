@@ -18,6 +18,10 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.16.0 — 2026-10-21. THE GATE'S LAST FAILURES. A post-demo lead who is "still thinking it
+ *   over" is asked back about the hesitation the visit recorded (POST_DEMO_VISIT_ASK: "Are you
+ *   still weighing the budget?"; with the better-price framing on, its better-price line); a burst of texts is one inbound to the planner; "more quotes
+ *   to come in" is a sign-off.
  * v2.15.0 — 2026-10-21. REHASH BETTER-PRICE FRAMING (handoff Part 2, REHASH_BETTER_PRICE_FRAMING_ENABLED): the
  *   reason for a rehash call is a better price, in "if I could, would you?" form (postDemoRehash, the rehash
  *   NEPQ block, the objection ladder, an itemized estimate ask). Never an amount, %, discount or promise.
@@ -487,6 +491,7 @@ import { rehashCallSlotsMode, readRehashCallSlots, rehashCallBooking } from './a
 import { phonePresentationActive, readPhonePresentationSlots, phonePresentationBooking } from './agentic/one-leg-presentation.js';
 import { isInRehash, rehashLeadFromContext, rehashRoutingMode } from './agentic/rehash-state.js';
 import { enforcePresentationGuard, copiesSiroDraft } from './siro/presentation-guard.js';
+import { visitHesitationOf } from './siro/presentation-facts.js';
 import { planNepqTurn, enforceNepqPlan, referenceRetryNote, nepqBackboneMode, prefersCall as nepqPrefersCall, objectionType as nepqObjectionType, TIME_REQUEST_RX as NEPQ_TIME_REQUEST_RX, SCHEDULE_ASK_RX as NEPQ_SCHEDULE_ASK_RX,REPEAT_COMPLAINT_RX as NEPQ_REPEAT_COMPLAINT_RX, bookingOpenInThread as nepqBookingOpenInThread, dropUnaskedCallOffer, leadWantsCall as nepqLeadWantsCall, isServiceCallback as nepqIsServiceCallback, planStepOf as nepqPlanStepOf } from './agentic/nepq-planner.js';
 // A layer3 script that forbids a time offer this turn (follow_up_scheduled,
 // OBJ_PRICE_STRIKE3's "no slot grid").
@@ -497,11 +502,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.15.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.16.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.15.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.16.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -4315,6 +4320,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         // planner is told.
         directiveNoTimes: NO_TIMES_DIRECTIVE_RX.test(String(opts.promptHint || '')),
         lastPlanStep,
+        // 2026-10-20 (rehash_siro_price_objection): the hesitation the visit recorded.
+        visitHesitation: visitHesitationOf(context.siro?.presentation || null),
       };
       nepqPlan = planNepqTurn({ ...planArgs, postDemo: pdMode === 'live' && postDemoLead, rehashRep, rehash: !!rehash, callSlots: slotsMode === 'live' ? rehashCallSlots : null, phonePresentation: phonePresentationSlots });
       if (slotsMode === 'shadow' && rehash && postDemoLead) {
