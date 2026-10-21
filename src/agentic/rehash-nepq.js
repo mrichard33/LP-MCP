@@ -22,6 +22,7 @@
 //
 // PURE. No I/O.
 
+import { appendTrigger } from './burst-trigger.js';
 import { isNotInterested } from './not-interested.js';
 import { detectDeferral, isLeadCloser } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
@@ -291,8 +292,9 @@ function normalize(conversation, trigger) {
     .filter(m => m.text);
   const now = String(trigger || '').trim();
   const lastIn = [...turns].reverse().find(t => t.direction === 'inbound');
-  if (now && lastIn?.text !== now) turns.push({ direction: 'inbound', text: now });
-  return turns;
+  if (!now || lastIn?.text === now) return turns;
+  // A burst's joined trigger replaces its own texts (2026-10-20, burst-trigger.js).
+  return appendTrigger(turns, now);
 }
 
 /**

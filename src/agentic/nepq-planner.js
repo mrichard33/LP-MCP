@@ -47,6 +47,7 @@ import { decisionMakersFromThread, dmSettled } from './qualifying.js';
 import { extractZip } from './service-area-turn.js';
 import { isLeadSignOff, leadWillReachOut } from './sign-off.js';
 import { PP_LINES, PP_MARKERS, PP_DM_ASK_RX, PP_ONLY_ONE_RX, bothConfirmedInThread } from './one-leg-presentation.js';
+import { appendTrigger } from './burst-trigger.js';
 
 export { isKnockComplaint };
 
@@ -534,9 +535,8 @@ function normalizeThread(conversation, trigger) {
   const turns = currentSession(conversation)
     .map(m => ({ direction: String(m?.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound', text: String(m?.text ?? m?.body ?? '') }))
     .filter(m => m.text.trim());
-  const last = turns[turns.length - 1];
-  if (trigger && !(last && last.direction === 'inbound' && last.text === trigger)) turns.push({ direction: 'inbound', text: String(trigger) });
-  return turns;
+  // A burst's joined trigger replaces its own texts (2026-10-20, burst-trigger.js).
+  return appendTrigger(turns, trigger);
 }
 
 /** Is this inbound a price or figure ask? Plain "do you offer financing?" is not. Pure. */
@@ -679,6 +679,18 @@ export const POST_DEMO_ASK_BACK = Object.freeze({
   think: () => 'What part do you want to think through?',
   spouse: () => "What do you think they'll want to know?",
 });
+
+// The visit's own hesitation, asked back by name when the lead only says they are
+// still deciding (bot gate 2026-10-20, rehash_siro_price_objection: Siro recorded
+// price, and "We are still thinking it over" got the generic "What's holding you
+// back?"). "still weighing" is the problem stage's own read-back (rehash-nepq.js),
+// so the track never asks it again. No figure, ever (enforcePresentationGuard).
+export const POST_DEMO_VISIT_ASK = Object.freeze({
+  price: (hi = '') => `Are you still weighing the budget${hi}?`,
+  competitor: (hi = '') => `Are you still weighing it against the other quotes${hi}?`,
+  spouse: (hi = '') => `Are you still weighing it with everyone who's part of the decision${hi}?`,
+});
+const VISIT_ASK_TOPIC = Object.freeze({ price: /(?:budget|price|cost)/i, competitor: /(?:quotes?|estimates?|bids?)/i, spouse: /(?:everyone|decision|together)/i });
 
 // Our post-demo stop line, read back (the stop is sticky for the session).
 export const POST_DEMO_STOP_RX = /\bi(?:'|’)?m\s+here\s+if\s+anything\s+changes\b/i;
@@ -856,6 +868,9 @@ function planNepqTurnCore({
   // 2026-10-09 (Mark): the lead already had the in-home demo (rehash, or past
   // the appointment). rehashRep is the rep the reply is written as, if named.
   postDemo = false, rehashRep = null,
+  // The hesitation Siro recorded at the visit ('price' | 'competitor' | 'spouse'),
+  // from the PRESENTATION facts (visitHesitationOf). 2026-10-20.
+  visitHesitation = null,
   // 2026-10-11: a rehash lead (not just past the appointment): the post-demo
   // NEPQ track (rehash-nepq.js) applies. Defaults to "a rep is named".
   rehash = null,
@@ -1548,17 +1563,34 @@ function planNepqTurnCore({
       return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: betterPriceInvite('itemized', speaksAsRep ? null : repName), reference_markers: BETTER_PRICE_MARKERS });
     }
     const pdObj = onTrack && !askedForSpace(now) ? postDemoObjection(now, lastOut) : null;
-    if (pdObj) {
-      const objAttempt = turns.reduce((n, t, i) => n + (t.direction === 'inbound' && postDemoObjection(t.text, prevOutAt(i)) ? 1 : 0), 0);
+    // 3b'. The visit already named the hesitation and the lead only says they are
+    //      still deciding: ask it back by name, once. It is the ladder's ask-back
+    //      (counted below), so the next objection gets the bridge.
+    const visitAsked = turns.some(t => t.direction === 'outbound' && /\bstill\s+weighing\b/i.test(t.text || ''));
+    const situationRx = REHASH_STAGES.find(s => s.key === 'situation')?.answeredRx;
+    const visitStill = !!(onTrack && !pdObj && !visitAsked && POST_DEMO_VISIT_ASK[visitHesitation] && !String(now).includes('?') && situationRx?.test(now));
+    // 2026-10-21: with REHASH_BETTER_PRICE_FRAMING_ENABLED (Part 2, newer than this ask-back) a price or other-quotes
+    // hesitation from the visit takes the better-price line exactly as a named one does; a spouse keeps the ask-back.
+    const ladderObj = pdObj || (visitStill && betterPrice && betterPriceKindFor(visitHesitation) ? visitHesitation : null);
+    if (visitStill && !ladderObj) {
+      const line = POST_DEMO_VISIT_ASK[visitHesitation](hi);
+      plan.objection = { type: visitHesitation, attempt: 1, line, source: 'visit' };
+      return pd({
+        step: 'rehash_objection', required_move: 'objection_play', fixed_line: line, call_offer_ok: false, rehash_ladder: 'ask_back',
+        reference_markers: [{ rx: VISIT_ASK_TOPIC[visitHesitation], say: `name the ${visitHesitation === 'price' ? 'budget' : visitHesitation === 'competitor' ? 'other quotes' : 'decision'} they raised at the visit` }],
+      });
+    }
+    if (ladderObj) {
+      const objAttempt = turns.reduce((n, t, i) => n + (t.direction === 'inbound' && postDemoObjection(t.text, prevOutAt(i)) ? 1 : 0), 0) + (visitAsked ? 1 : 0);
       const repName = (Array.isArray(callSlots?.offer) && callSlots?.repName) || rehashRep || null;
       const speaksAsRep = !!(repName && rehashRep && String(repName).toLowerCase() === String(rehashRep).toLowerCase());
-      plan.objection = { type: pdObj, attempt: objAttempt, line: null };
+      plan.objection = { type: ladderObj, attempt: objAttempt, line: null, ...(pdObj ? {} : { source: 'visit' }) };
       // 2026-10-21 (Part 2; Paul, Laura: "a couple more quotes" got "How do they
       // compare, out of curiosity?"). Price, other quotes and thinking it over
       // get the reason for the call at once, a better price, with the two times
       // on the table (or "if I could, would you?" without them); asked again,
       // the same. A third time is still a person. A spouse keeps its ask-back.
-      const bpKind = betterPrice ? betterPriceKindFor(pdObj) : null;
+      const bpKind = betterPrice ? betterPriceKindFor(ladderObj) : null;
       if (bpKind && objAttempt <= 2) {
         const who = repName && !speaksAsRep ? repName : null;
         const two = bookingFix ? stableOffer() : (Array.isArray(callSlots?.offer) ? callSlots.offer : []);
@@ -1576,7 +1608,7 @@ function planNepqTurnCore({
         return pd({ step: 'rehash_bridge', required_move: 'objection_play', fixed_line: line, reference_markers: BETTER_PRICE_MARKERS });
       }
       if (objAttempt <= 1) {
-        const line = POST_DEMO_ASK_BACK[pdObj](hi);
+        const line = POST_DEMO_ASK_BACK[ladderObj](hi);
         plan.objection.line = line;
         return pd({ step: 'rehash_objection', required_move: 'objection_play', fixed_line: line, call_offer_ok: false, rehash_ladder: 'ask_back' });
       }

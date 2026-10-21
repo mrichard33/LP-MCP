@@ -1176,8 +1176,13 @@ export function createLiveChatFastLane(deps) {
       body,
       thread: context.conversation_recent,
       known: { phone: context.lead?.phone || contact?.phone || null, hasName: hasNameOnRecord },
-      // 2026-10-12 (handoff PR 5): the reschedule path, LEAD_STAGE_MODE=live only.
-      stageLive: d.leadStageMode() === 'live',
+      // 2026-10-12 (handoff PR 5): the reschedule path. 2026-10-20 (bot gate,
+      // reschedule_unclear): in EVERY mode, not only LEAD_STAGE_MODE=live. In shadow
+      // "what color are the frames?" after our "a different day instead of
+      // cancelling?" was read as a cancel and posted a cancel card; the live path
+      // asks once (move or cancel?), reads "a different day" as a move, and reads
+      // a model-worded time offer as the flow's own.
+      stageLive: true,
     });
     if (cancelPlan && !reference) {
       // A newer message already arrived: let that turn run the flow, so an
@@ -1780,7 +1785,9 @@ export function createLiveChatFastLane(deps) {
       record.slots_offered = offered.map(x => x.iso);
       // Live (2026-10-12, handoff PR 5): an unclear pick gets the same two
       // times once more, never discovery and never a cancel.
-      if (!chosen && plan.stageLive && offered.length === 2 && (plan.offersInFlow || 0) < 2) {
+      // "Neither of those" is a clear no to both, not an unclear pick: a person sets the time.
+      const turnedDown = /\b(?:neither|none\s+of\s+(?:those|them|these)|no(?:pe)?)\b|\b(?:don'?t|doesn'?t|won'?t|can'?t)\s+work\b/i.test(body);
+      if (!chosen && plan.stageLive && !turnedDown && offered.length === 2 && (plan.offersInFlow || 0) < 2) {
         return { reply: slotsOfferLine(offered, free.tzLabel), slots: offered.map(x => ({ ...x, tz: x.tz || free.tzLabel })), record: { ...record, outcome: 'offered_slots', reask: true } };
       }
       if (!chosen) return personReschedules(offered.length ? 'slot_pick_unclear' : 'offered_slots_gone');

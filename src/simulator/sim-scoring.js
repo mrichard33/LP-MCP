@@ -39,7 +39,10 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // first gate run on this version is the Phase 0 baseline, never "worse". (.1
 // was already taken by the rehash closer PR the same day.)
 // 2026-10-20.1 (handoff v3): one_leg_phone_presentation and absent_spouse_normal_offer.
-export const SCORING_VERSION = '2026-10-21.2';
+// 2026-10-21.2: the rehash booking fix and better-price scenarios (rehash_bare_time_pick ... rehash_call_reason).
+// 2026-10-21.3: the approved identity ask is read from the turn's flow step, not the
+// scenario name (reschedule_unclear).
+export const SCORING_VERSION = '2026-10-21.3';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -717,8 +720,11 @@ export function scoreResult(result) {
         held,
         callbackFiled,
         // The cancel identity ask ("name and phone the appointment is under")
-        // is the one approved two-item ask (allow_multi_ask, Part 8).
-        allowMultiAsk: /cancel/.test(String(result.scenario || '')),
+        // is the one approved two-item ask (allow_multi_ask, Part 8). Read from
+        // the turn's own flow step, as production reads the plan (fast-lane.js
+        // allow_multi_ask), never the scenario's name: reschedule_unclear opens
+        // with the same ask and failed more_than_one_ask (bot gate 2026-10-20).
+        allowMultiAsk: t.flow === 'ask_identity' || t.nepq?.step === 'ask_identity' || t.nepq?.allow_multi_ask === true,
         // A post-demo lead's one goal is the call (rehash, 2026-10-01/10-11):
         // offering it is the plan, not an unasked offer.
         // The third price ask's call offer is the plan too (the owner, 2026-10-13).
