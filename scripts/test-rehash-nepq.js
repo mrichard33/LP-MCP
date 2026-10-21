@@ -26,6 +26,11 @@ import { isInHomeCalendarId, isGhlOnlyCalendarId } from '../src/knowledge/bookin
 import { postDemoRehash } from '../src/prompts/response-generator/playbooks.js';
 import * as R from '../src/agentic/rehash.js';
 
+// 2026-10-21: these tests hold the rehash copy from BEFORE the better-price
+// framing (REHASH_BETTER_PRICE_FRAMING_ENABLED=false is the undo path, so it
+// must keep working). The framing itself: scripts/test-rehash-better-price.js.
+process.env.REHASH_BETTER_PRICE_FRAMING_ENABLED = 'false';
+
 const { notifyRehashCall } = await import('../src/notifications/rehash-call.js');
 
 const NOW = Date.parse('2026-10-09T16:00:00Z'); // Fri noon ET
@@ -158,7 +163,7 @@ test('(d) a hard pick → book on Rehash Call with that rep; the confirm names t
   const p = plan('2 PM works', conv, { ...callSlots, repName: 'Tom' });
   assert.equal(p.step, 'rehash_confirm');
   assert.equal(p.rehash_pick.iso, ALL[0].iso);
-  assert.equal(p.reference_line, "You're all set for today at 2:00 PM ET. Tom will give you a call then.");
+  assert.equal(p.reference_line, "You're all set for today at 2:00 PM ET. Tom will call you at this number then.");
   const booking = rehashCallBooking({ slot: p.rehash_pick, calendarId: CAL, rep: JOHN, env: {} });
   assert.equal(booking.action_type, 'book_appointment');
   assert.equal(booking.action_payload.calendar_id, CAL);
@@ -172,7 +177,7 @@ test('(d) a hard pick → book on Rehash Call with that rep; the confirm names t
   assert.equal(isGhlOnlyCalendarId(CAL) || R.isRehashContact({ tags: ['rehash'] }), true);
   void env;
   // A confirm with no visit disclosure survives the enforcer as written.
-  const e = enforceNepqPlan("You're all set for today at 2:00 PM ET. Tom will give you a call then.", p);
+  const e = enforceNepqPlan("You're all set for today at 2:00 PM ET. Tom will call you at this number then.", p);
   assert.doesNotMatch(e.text, /\?|visit|confirm the details/i);
 });
 

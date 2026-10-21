@@ -18,11 +18,20 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
- * v2.14.0 — 2026-10-21. THE GATE'S LAST FAILURES. A post-demo lead who is "still thinking it
+ * v2.16.0 — 2026-10-21. THE GATE'S LAST FAILURES. A post-demo lead who is "still thinking it
  *   over" is asked back about the hesitation the visit recorded (POST_DEMO_VISIT_ASK: "Are you
- *   still weighing the budget?"); a burst of texts is one inbound to the planner; "more quotes
+ *   still weighing the budget?"; with the better-price framing on, its better-price line); a burst of texts is one inbound to the planner; "more quotes
  *   to come in" is a sign-off.
- *
+ * v2.15.0 — 2026-10-21. REHASH BETTER-PRICE FRAMING (handoff Part 2, REHASH_BETTER_PRICE_FRAMING_ENABLED): the
+ *   reason for a rehash call is a better price, in "if I could, would you?" form (postDemoRehash, the rehash
+ *   NEPQ block, the objection ladder, an itemized estimate ask). Never an amount, %, discount or promise.
+ *   Rehash prompt copy only (fixture 40); no pre-demo prompt moved.
+ * v2.14.0 — 2026-10-21. REHASH CALL BOOKING (rehash booking + better-price handoff, REHASH_BOOKING_FIX_ENABLED):
+ *   a rehash lead's named call time ("9:30", "930am", "Thursday at 2pm") is booked on the rep's Rehash Call
+ *   calendar or answered with the two closest real times; our open pair is offered again instead of a new
+ *   one; the confirm says "… will call you at this number then." and asks nothing; a buying signal gets the
+ *   call; a firm decline is a first no; the prompt shows no other calendar's times. Planner copy only; no
+ *   prompt text moved.
  * v2.13.0 — 2026-10-20. 1 LEG PHONE PRESENTATION (handoff v3, Mark): a contact whose open objection state
  *   is APPOINTMENT_DISRUPTION.one_leg is offered a phone presentation with both decision makers on the
  *   Phone Presentation calendar (PHONE_PRESENTATION_CALENDAR_ID, GHL-only) instead of a visit, booked only
@@ -450,6 +459,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 import * as P from './prompts/response-generator/index.js';
 import { isRehashContact, normalizeRehashCall, stripOfferTalk, bestDealHintUsed, REHASH_NUMBER_DEFAULT, REHASH_REP_CUSTOM_VALUE } from './agentic/rehash.js';
 import { rehashDealHintMode } from './agentic/rehash-nepq.js';
+import { rehashBetterPrice } from './agentic/rehash-flags.js';
 import { getCustomValue } from './services/ghl-custom-values.js';
 import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 import { normalizeRepNote } from './agentic/rep-note.js';
@@ -492,11 +502,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.14.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.16.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.14.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.16.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -1648,7 +1658,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // carves out exactly one exception (a phone call with the rep) and keeps the
   // rest of the ban (no visit, no slot, no link). See src/agentic/rehash.js.
   if (opts.rehash?.active) {
-    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true }));
+    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true, betterPrice: rehashBetterPrice() }));
   }
 
   if (fastTrack && !postAppt.post && !ackOnly) {
@@ -4429,7 +4439,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   const userPrompt = buildResponsePrompt(
     context, channel, triggerMessage, kbPack, classification,
-    fastTrack, trafficTemp, (slotsForPlannerOnly && !nepqPlan?.booking?.allowed) ? null : availability,
+    // 2026-10-21 (Komal, YgAD0NmDXBbyHDF82Ban; REHASH_BOOKING_FIX_ENABLED): a
+    // rehash lead's only times are the rep's Rehash Call openings, which the
+    // plan block carries. The knowledge pack's calendar was shown here too; the
+    // model offered its 2:00 / 6:00, the lead picked them, and the rep's
+    // calendar did not have them.
+    fastTrack, trafficTemp, ((slotsForPlannerOnly && !nepqPlan?.booking?.allowed) || nepqPlan?.rehash_fix) ? null : availability,
     {
       editInstruction: opts.editInstruction || null,
       previousMessage: opts.previousMessage || null,
@@ -4639,7 +4654,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (rehash) {
     // 2026-10-19 (Mark, ruling 4): with REHASH_DEAL_HINT_MODE=every the hint is
     // never "used up"; everything else in the offer test still strips.
-    const offer = stripOfferTalk(validated.message, { hintUsed: rehashDealHintMode() !== 'every' && bestDealHintUsed(context?.conversation_recent || []) });
+    const offer = stripOfferTalk(validated.message, { hintUsed: rehashDealHintMode() !== 'every' && bestDealHintUsed(context?.conversation_recent || []), betterPrice: rehashBetterPrice() });
     if (offer.stripped.length) {
       console.warn(`[ResponseGenerator] rehash offer talk stripped for ${contactId}: ${offer.stripped.join(' | ').slice(0, 200)}`);
       validated.message = offer.text;
@@ -4835,13 +4850,18 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     const onFile = !!appointmentOnFile({ upcomingAppointments, lp: context.lp });
     // A hold stands only when code held the slot this turn (booking facts).
     const held = !!bookingFacts && (bookingFacts.kind === 'hold' || bookingFacts.kind === 'collect');
-    const claimOpts = { booked: validated.companion_action?.action_type === 'book_appointment', hasAppointment: onFile, held };
+    // 2026-10-21 (REHASH_BOOKING_FIX_ENABLED): on the rehash line "I'll call you
+    // at 9:30" is a booking claim too, and its replacement is the rep's open
+    // Rehash Call pair, never the visit calendar's times.
+    const rehashFix = !!nepqPlan?.rehash_fix;
+    const claimOpts = { booked: validated.companion_action?.action_type === 'book_appointment', hasAppointment: onFile, held, ...(rehashFix ? { rehash: true } : {}) };
     const claim = findUnbackedBookingClaim(validated.message, claimOpts);
     if (claim) {
       // Part 6 (Mark, Oct 2 6:12 PM chat: "We have Wednesdays blocked for
       // you"): rewritten on the first draft. With times in hand the claim
       // becomes the two real times, otherwise the day question.
-      const two = (nepqPlan?.slots_to_offer || []).length === 2 ? nepqPlan.slots_to_offer : (offerSelection?.slots || []).slice(0, 2);
+      const two = (nepqPlan?.slots_to_offer || []).length === 2 ? nepqPlan.slots_to_offer
+        : rehashFix ? (nepqPlan.rehash_reoffer || []) : (offerSelection?.slots || []).slice(0, 2);
       const replacement = nepqPlan
         ? (two.length === 2 ? NEPQ_LINES.offer_slots(two.map(x => ({ ...x, tz: x.tz || tzLabel(promptTimezoneFor(context)) })), nepqPlan.counters?.slot_offers || 0) : NEPQ_LINES.ask_day)
         : undefined;
@@ -5127,6 +5147,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       ...(nepqPlan.call_offer_ok ? { call_offer_ok: true } : {}),
       // 2026-10-19 (ruling 4): REHASH_DEAL_HINT_MODE=every, this turn's hint.
       ...(nepqPlan.hint_line ? { hint_line: nepqPlan.hint_line } : {}),
+      // 2026-10-21: REHASH_BOOKING_FIX_ENABLED was on for this rehash turn.
+      ...(nepqPlan.rehash_fix ? { rehash_fix: true } : {}),
     };
     const idf = identityState?.identity || {};
     const knownFirst = idf.first_name || context.lead?.first_name || null;
@@ -5760,6 +5782,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // the zone a named day/time is read in.
     appointment_on_file: appointmentOnFile({ upcomingAppointments, lp: context.lp }),
     booking_hold_backed: (!!bookingFacts && (bookingFacts.kind === 'hold' || bookingFacts.kind === 'collect')) || !!validated.nepq_plan?.held,
+    // 2026-10-21: a rehash call promised at a clock time is a booking claim (REHASH_BOOKING_FIX_ENABLED).
+    rehash_call_claims: !!validated.nepq_plan?.rehash_fix,
     slot_timezone_for_truth: promptTimezoneFor(context),
     lead_first_name: context.lead?.first_name || null,
     // 2026-10-12 (Lead Conversation Stage): what the send handler hands to the

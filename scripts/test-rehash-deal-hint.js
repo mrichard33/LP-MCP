@@ -13,6 +13,11 @@ import {
 import { findOfferTalk, stripOfferTalk } from '../src/agentic/rehash.js';
 import { runWithSimOverrides } from '../src/simulator/sim-overrides.js';
 
+// 2026-10-21: these tests hold the rehash copy from BEFORE the better-price
+// framing (REHASH_BETTER_PRICE_FRAMING_ENABLED=false is the undo path, so it
+// must keep working). The framing itself: scripts/test-rehash-better-price.js.
+process.env.REHASH_BETTER_PRICE_FRAMING_ENABLED = 'false';
+
 const NOW = Date.parse('2026-10-15T18:20:00Z');
 const out = (text) => ({ direction: 'outbound', text });
 const inn = (text) => ({ direction: 'inbound', text });

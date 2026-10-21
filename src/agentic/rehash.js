@@ -100,12 +100,16 @@ export const OFFER_HINT_LINE_AFTER = "I may be able to do something for you, and
  * @param {string} text
  * @param {{hintUsed?: boolean}} [o]  "best deal" was already said in this conversation
  */
-export function stripOfferTalk(text, { hintUsed = false } = {}) {
+// 2026-10-21 (Part 2, REHASH_BETTER_PRICE_FRAMING_ENABLED; the caller passes
+// betterPrice): the line put back after a strip gives the reason for the call.
+export const OFFER_BETTER_PRICE_LINE = 'If I could get you a better price, would you be open to a quick call?';
+
+export function stripOfferTalk(text, { hintUsed = false, betterPrice = false } = {}) {
   const hits = findOfferTalk(text, { hintUsed });
   if (!hits.length) return { text: String(text || ''), stripped: [] };
   const kept = splitSentences(text).filter((s) => !hits.includes(s));
   const hasQuestion = kept.some((s) => s.includes('?'));
-  const out = hasQuestion ? kept : [...kept, hintUsed ? OFFER_HINT_LINE_AFTER : OFFER_HINT_LINE];
+  const out = hasQuestion ? kept : [...kept, betterPrice ? OFFER_BETTER_PRICE_LINE : hintUsed ? OFFER_HINT_LINE_AFTER : OFFER_HINT_LINE];
   return { text: out.join(' ').trim(), stripped: hits };
 }
 

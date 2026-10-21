@@ -27,6 +27,7 @@ import { isNotInterested } from './not-interested.js';
 import { detectDeferral, isLeadCloser } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { simModeOverrides } from '../simulator/sim-overrides.js';
+import { rehashBookingFix, rehashBetterPrice } from './rehash-flags.js';
 
 // ── A better deal, hinted on every reply (Mark, 2026-10-19, ruling 4) ──────
 // REHASH_DEAL_HINT_MODE=every: every rehash reply hints that we may be able to
@@ -85,7 +86,69 @@ export function rehashHintFor({ step = null, stage = null, noQuestion = false, r
 
 /** The "If I could …, would you …?" bridge to the call (ruling 3). Pure. */
 export function rehashIfICouldBridge(repName = null) {
+  // 2026-10-21 (REHASH_BETTER_PRICE_FRAMING_ENABLED): the bridge names the reason, a better price.
+  if (rehashBetterPrice()) return betterPriceInvite('generic', repName);
   return `If I could make this work better for you, would you be open to a quick call${repName ? ` with ${repName}` : ''}?`;
+}
+
+// ── The reason for the call: a better price (the user, 2026-10-21, Part 2;
+// REHASH_BETTER_PRICE_FRAMING_ENABLED) ───────────────────────────────────────
+// "I may be able to do something for you, it's just easier on a quick call"
+// gave no reason to talk again, and "We are going to get a couple more quotes"
+// got "How do they compare, out of curiosity?" (Paul, Laura, 2026-10-20). Every
+// call invitation now says why: we may be able to get them a better price, in
+// "if I could, would you?" form. A better price is hinted, never stated or
+// promised: no amount, no percentage, no discount (stripOfferTalk still strips
+// those; "better price" and "beat what you're being quoted" pass it). This is
+// the one home for that copy.
+export const REHASH_BETTER_PRICE_RX = /\bbetter\s+price\b|\bbeat\s+what\s+you(?:'|’)?re\s+(?:being\s+)?quoted\b|\bget\s+(?:that|the)\s+(?:number|price)\s+down\b/i;
+export const BETTER_PRICE_KINDS = Object.freeze(['generic', 'compare', 'price', 'think', 'itemized']);
+
+/** The reply already gives the better-price reason for the call. Pure. */
+export function hasBetterPrice(text) {
+  return REHASH_BETTER_PRICE_RX.test(String(text || ''));
+}
+
+/**
+ * The better-price reason as a statement, said before two real call times.
+ * `repName` null = the line speaks as the rep ("a quick call", "I can"). Pure.
+ */
+export function betterPriceReason(kind = 'generic', repName = null) {
+  const withRep = repName ? ` with ${repName}` : '';
+  const who = repName ? `${repName} can` : 'I can';
+  switch (kind) {
+    case 'compare': return `Smart to compare. I may be able to beat what you're being quoted, and a quick call${withRep} before you decide is the easiest way to look at it.`;
+    case 'price': return `I hear you on the price. I may be able to get that number down for you, and a quick call${withRep} is the easiest way to look at it.`;
+    case 'think': return `Take the time you need. Before you decide, I may be able to get you a better price, and a quick call${withRep} is the easiest way to look at it.`;
+    case 'itemized': return `${who} walk through each window and door line by line on a quick call, and look at getting you a better price at the same time.`;
+    default: return `I may be able to get you a better price, and a quick call${withRep} is the easiest way to look at it.`;
+  }
+}
+
+/** The better-price invitation, "if I could, would you?", when no call times are in hand. Pure. */
+export function betterPriceInvite(kind = 'generic', repName = null) {
+  const withRep = repName ? ` with ${repName}` : '';
+  const who = repName ? `${repName} can` : 'I can';
+  switch (kind) {
+    case 'compare': return `Smart to compare. If I could beat what you're being quoted, would you be open to a quick call${withRep} before you decide?`;
+    case 'price': return `I hear you on the price. If I could get that number down for you, would a quick call${withRep} be worth 10 minutes?`;
+    case 'think': return `Take the time you need. Before you decide, if I could get you a better price, would you be open to a quick call${withRep}?`;
+    case 'itemized': return `${who} look at getting you a better price at the same time. Would a quick call to walk through each window and door line by line help?`;
+    default: return `If I could get you a better price, would you be open to a quick call${withRep}?`;
+  }
+}
+
+/** The better-price kind for a post-demo objection type, or null (spouse keeps its ask-back). Pure. */
+export function betterPriceKindFor(objectionType) {
+  return ({ price: 'price', competitor: 'compare', other_quote: 'compare', think: 'think' })[objectionType] || null;
+}
+
+// An itemized estimate asked for ("an itemized estimate", "line by line", "what
+// each window is costing"; Komal, 2026-10-20): the rep walks through it on a call.
+export const REHASH_ITEMIZED_RX = /\bitemi[sz]ed\b|\bline\s+by\s+line\b|\bbreak\s*-?\s*down\b|\beach\s+(?:window|door|slider|item|opening)\b[^.?!]*\b(?:cost|costing|price|priced)\b/i;
+/** A rehash lead asks for an itemized estimate. Pure. */
+export function isItemizedAsk(text) {
+  return REHASH_ITEMIZED_RX.test(String(text || ''));
 }
 
 /** The hint (Mark's framing). Said at most once per conversation, at the bridge. */
@@ -171,10 +234,38 @@ const OBJECTIONS = [
 const BARE_NO_RX = /^\s*(?:no|nope|nah|no\s+thanks?|no\s+thank\s+you|not\s+really|not\s+now|not\s+right\s+now|not\s+interested|pass|i(?:'|’)?m\s+good|we(?:'|’)?re\s+good)\b[\s.!]*$/i;
 const YES_RX = /^\s*(?:y(?:es|eah|ep|up)|sure|ok(?:ay)?|sounds\s+good|that\s+works|please|absolutely|definitely|why\s+not|let(?:'|’)?s\s+do\s+it|i(?:'|’)?d\s+like\s+that|that\s+would\s+help|it\s+would)\b/i;
 
+// 2026-10-21 (Charles, ybKSdqmy1sVVdd0v0QY4; REHASH_BOOKING_FIX_ENABLED): "We are
+// not doing windows at this time" got "What changed?" and "Decided not needed at
+// this time." got "Where are you at with it?". Neither read as a no, so the track
+// asked its next question. A firm decline is a first no (door_open: one line,
+// nothing asked), and a second one is the stop.
+export const REHASH_FIRM_NO_RX = /^\s*not\s+needed(?:,?\s+(?:thanks?|thank\s+you))?\s*[.!]*\s*$|\b(?:decided\s+)?not\s+needed\s+(?:at\s+(?:this|the\s+moment)|right\s+now|any\s*more|now)\b|\bno\s+longer\s+need(?:ed)?\b|\b(?:have\s+|we(?:'|’)?ve\s+|i(?:'|’)?ve\s+)?decided\s+(?:against\s+(?:it|this|the\s+(?:windows?|project))|not\s+(?:needed|necessary|to\s+(?:do|move|proceed|replace|go\s+(?:ahead|forward)))|to\s+(?:pass|hold\s+off))\b|\bnot\s+doing\s+(?:the\s+|any\s+)?(?:windows?|doors?|project)\b|\bnot\s+moving\s+forward\b|\bwon(?:'|’)?t\s+be\s+(?:moving|going)\s+(?:forward|ahead)\b/i;
+
 /** A no for the two-no's rule on the rehash line; a closer ("Not ready", "Will do") counts (2026-10-17). Pure. */
 export function isRehashNo(text) {
   const t = String(text || '');
-  return isNotInterested(t) || BARE_NO_RX.test(t) || isLeadCloser(t);
+  return isNotInterested(t) || BARE_NO_RX.test(t) || isLeadCloser(t) || (REHASH_FIRM_NO_RX.test(t) && rehashBookingFix());
+}
+
+// 2026-10-21 (Charles: "Ready to move. Would like to see final description of
+// project and final costs first." got "Too expensive compared to what you were
+// quoted elsewhere?" and he backed out). A lead ready to buy, or asking for the
+// final price, is offered the call with the rep at once: never the objection
+// ladder. REHASH_BOOKING_FIX_ENABLED.
+export const REHASH_READY_RX = /\bready\s+to\s+(?:move(?:\s+forward)?|go(?:\s+ahead)?|sign|get\s+started|start|buy|do\s+(?:it|this))\b|\blet(?:'|’)?s\s+(?:move\s+forward|get\s+started|go\s+ahead|get\s+(?:it|this)\s+(?:going|done))\b|\b(?:see|get|have|know)\s+(?:the\s+|your\s+)?final\s+(?:cost|costs|price|pricing|numbers?|quote|total|description)\b|\b(?:decided|going|want)\s+to\s+go\s+(?:with|ahead\s+with)\s+(?:you|your|reece|the\s+(?:quote|proposal))\b/i;
+
+/** A buying signal on the rehash line ("ready to move", "want the final costs"). Pure. */
+export function isRehashReady(text) {
+  const t = String(text || '');
+  return REHASH_READY_RX.test(t) && !/\bnot\s+(?:quite\s+|yet\s+)?ready\b/i.test(t) && !isNotInterested(t);
+}
+
+/** The reason for the call on a buying signal (the rep goes over the final project and price). Pure. */
+export function rehashReadyLine(repName = null, { ask = false } = {}) {
+  const who = repName ? `${repName} can` : 'I can';
+  // With no times to offer, the call is asked for (REHASH_BRIDGE_RX reads "quick call …?" back).
+  return ask ? `${who} go over the final project and price with you. Would a quick call work for that?`
+    : `${who} go over the final project and price with you on a quick call.`;
 }
 
 // The lead already answered the PROBLEM stage when they named an objection.
@@ -213,10 +304,25 @@ function normalize(conversation, trigger) {
  *   objection: object|null, nos: number, hintUsed: boolean, asked: string[] }}
  */
 export function rehashNepqTurn({ conversation = [], trigger = '', nowMs = Date.now(), hintMode = 'once', repName = null } = {}) {
-  const turn = rehashNepqTurnCore({ conversation, trigger, nowMs, hintMode, repName });
+  let turn = rehashNepqTurnCore({ conversation, trigger, nowMs, hintMode, repName });
+  if (rehashBetterPrice()) turn = betterPriceTurn(turn, repName);
   if (hintMode !== 'every') return turn;
   const recent = normalize(conversation, trigger).filter(t => t.direction === 'outbound').slice(-8).map(t => t.text);
   return { ...turn, hintMode, hint: rehashHintFor({ stage: turn.stage, recentOutbound: recent, seed: recent.length, mode: hintMode }) };
+}
+
+// 2026-10-21 (REHASH_BETTER_PRICE_FRAMING_ENABLED): an objection (price, other
+// quotes, thinking it over) and the bridge give the reason for the call, a
+// better price, instead of an ask-back or "I may be able to do something".
+function betterPriceTurn(turn, repName) {
+  const kind = turn.stage === 'objection' ? betterPriceKindFor(turn.objection?.type) : null;
+  if (kind) {
+    return { ...turn, move: 'Give the reason for the call, a better price, in "if I could, would you?" form, and ask for the call. Never rebut, never ask them to compare or explain.', example: betterPriceInvite(kind, repName) };
+  }
+  if (turn.stage === 'bridge' || turn.stage === 'after_bridge') {
+    return { ...turn, move: 'Ask for the call with its reason: "If I could get you a better price, would you be open to a quick call?" (adapt the words, keep the meaning).', example: betterPriceInvite('generic', repName) };
+  }
+  return turn;
 }
 
 function rehashNepqTurnCore({ conversation = [], trigger = '', nowMs = Date.now(), hintMode = 'once', repName = null } = {}) {
@@ -303,6 +409,8 @@ function rehashNepqTurnCore({ conversation = [], trigger = '', nowMs = Date.now(
 export function buildRehashNepqBlock(turn, { repName = null } = {}) {
   const t = turn || rehashNepqTurn({});
   const rep = repName || 'our team';
+  // 2026-10-21: REHASH_BETTER_PRICE_FRAMING_ENABLED (off = the copy before, byte for byte).
+  const betterPrice = rehashBetterPrice();
   const lines = [
     '',
     `STAGE (POST-DEMO REHASH): ${t.label}`,
@@ -310,20 +418,32 @@ export function buildRehashNepqBlock(turn, { repName = null } = {}) {
     'This lead already had the in-home demo and holds a proposal. This is NOT a new lead.',
     'Never ask what got them looking at windows, how long, which room, or anything about',
     'the windows themselves. Every question is about the proposal and their decision.',
-    `The one goal is a scheduled phone call with ${rep}, framed as making sure they are`,
-    'getting the best deal possible.',
+    ...(betterPrice
+      ? [`The one goal is a scheduled phone call with ${rep}. The reason for the call: we may be`, 'able to get them a better price.']
+      : [`The one goal is a scheduled phone call with ${rep}, framed as making sure they are`, 'getting the best deal possible.']),
     '',
     `THIS TURN: ${t.move}`,
     t.example ? `Example (adapt, do not recite): "${t.example}"` : null,
     '',
     'THE TRACK (move ONE stage per turn, never skip to the pitch):',
-    ...REHASH_STAGES.map((s, i) => `${i + 1}. ${s.label} — ${s.aim}. e.g. "${s.example}"`),
+    ...REHASH_STAGES.map((s, i) => `${i + 1}. ${s.label} — ${betterPrice && s.key === 'bridge' ? 'ask for the call with its reason, a better price' : s.aim}. e.g. "${betterPrice && s.key === 'bridge' ? betterPriceInvite('generic', repName) : s.example}"`),
     '6. SCHEDULE — once they say yes to the call (see SCHEDULING in the rehash block).',
     '',
-    'OBJECTIONS (ask back, never rebut):',
-    '- "Too expensive" → "Too expensive compared to what?" → then bridge.',
-    '- "Got another quote" → "How do they compare, out of curiosity?" → then bridge with "the best deal possible."',
-    '- "Need to think about it" → "What part do you want to think through?"',
+    ...(betterPrice
+      ? [
+        'OBJECTIONS (never rebut; the reason for the call is a better price):',
+        `- "Too expensive" / budget → "${betterPriceInvite('price', repName)}"`,
+        `- Other quotes, comparing, shopping around → "${betterPriceInvite('compare', repName)}"`,
+        `- "Need to think about it" → "${betterPriceInvite('think', repName)}"`,
+        `- An itemized estimate → "${betterPriceInvite('itemized', repName)}"`,
+        '- "Ready to move", the final cost or price → the rep goes over the final project and price on a quick call.',
+      ]
+      : [
+        'OBJECTIONS (ask back, never rebut):',
+        '- "Too expensive" → "Too expensive compared to what?" → then bridge.',
+        '- "Got another quote" → "How do they compare, out of curiosity?" → then bridge with "the best deal possible."',
+        '- "Need to think about it" → "What part do you want to think through?"',
+      ]),
     '- "Talking to my spouse" → "What do you think they\'ll want to know?" → offer the call with both on.',
     '- "Not interested" → acknowledge, leave the door open, no pitch, NO question. Two no\'s in a row = stop asking.',
     '- A sign-off ("will do", "I\'ll get back to you", "not ready", "ok thanks") → one matching line, no question.',
@@ -338,6 +458,10 @@ export function buildRehashNepqBlock(turn, { repName = null } = {}) {
       : [t.hintUsed
         ? '"THE BEST DEAL POSSIBLE": ALREADY SAID in this conversation. Do not say it again, in any wording.'
         : '"THE BEST DEAL POSSIBLE": may be said at most ONCE per conversation, and only at the bridge.']),
+    ...(betterPrice
+      ? ['THE REASON FOR THE CALL: every call invitation says we may be able to get them a better',
+        'price, in "if I could, would you?" form. Hint it; never state or promise it.']
+      : []),
     'Never name what the deal is: no amount, no percentage, no discount, no promotion, no',
     'special price or financing, never "a deal", "a great deal" or "a special deal".',
     '',

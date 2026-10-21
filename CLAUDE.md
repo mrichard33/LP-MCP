@@ -400,6 +400,39 @@ carry `lp_had_demo: false` (`sql/seeds/2026-10-19_dq_above_2nd_floor_not_post_de
 a bare no to our times asks once "When is a good day and time for a call?" (`rehash_ask_time`; `isPostDemoNo` does not
 count it, a no to that ask does), and a day or part of day gets two Rehash Call openings, never the pair just refused.
 
+**A rehash lead's named call time is booked, and the pair on the table stays the pair (the user, 2026-10-21;
+`REHASH_BOOKING_FIX_ENABLED`, unset = on, `false` = off).** kS2AJk85fv7Lfyl3iZcm answered our "9:30 AM or 10:30 AM" with
+"9:30": nothing read it, nothing was booked, the model said "I'll call you at 9:30 … Would a quick call help?". Komal
+(YgAD0NmDXBbyHDF82Ban) got a NEW pair after "930am", "Thursday at 6pm" and "Thursday at 2pm" (the prompt also showed the
+knowledge pack's visit calendar, whose times the rep's calendar did not have) and opted out. Now, in `planRehashCall`:
+`readRehashTime` (`src/agentic/rehash-time.js`: "9:30", "930am", "9.30", "at 2", "Thursday at 2pm"; the LAST time named
+wins) picks from our open offer (`rehashOpenOffer`: any of our last four messages naming real openings) or books the exact
+opening on the named day (`rehashTimeSlots`), else offers the two closest that day (`LINES.not_open`); a call ask, a yes or
+"so many different times" re-offers the open pair (`stableOffer`); the confirm is "You're all set for {day} at {time}.
+{Rep} will call you at this number then." (no question); a buying signal ("ready to move", "final costs",
+`isRehashReady`) gets the call before any objection; a firm decline ("not needed at this time", "not doing windows",
+`REHASH_FIRM_NO_RX`) is a first no (door_open). `enforceNepqPlan` drops a clock time that is not a Rehash Call opening and
+asks nothing after a stated call time; the prompt gets no `availability` on a rehash turn; "I'll call you at <time>" is a
+booking claim with `{ rehash: true }` only (`REHASH_CALL_CLAIM_PATTERNS`, booking-claim.js). checkReply
+`question_after_post_demo_firm_no`. `bot_outcomes.booked_at` needed no change: it reads the HL appointment mirror. Gate:
+`rehash_booking_fix` on|off, scenarios `rehash_bare_time_pick`, `rehash_named_time`, `rehash_ready_to_move`,
+`rehash_firm_no`. The pre-demo bot never reads the switch (`scripts/test-rehash-predemo-unchanged.js`).
+
+**The reason for a rehash call is a better price (the user, 2026-10-21; `REHASH_BETTER_PRICE_FRAMING_ENABLED`, unset =
+on, `false` = the copy before, byte for byte).** "I may be able to do something for you, it's just easier on a quick
+call" gave no reason, and "a couple more quotes" got "How do they compare, out of curiosity?" (Paul, Laura). Every call
+invitation now says we may be able to get them a better price, in "if I could, would you?" form. The one copy home is
+`rehash-nepq.js` (`betterPriceReason` before two real times, `betterPriceInvite` without; kinds generic / compare / price
+/ think / itemized; `hasBetterPrice` reads it back). The ladder: price, other quotes and thinking it over get the
+better-price line with the open pair at attempts 1-2 (no ask-back), a third is still `rehash_repeat_objection`; a spouse
+keeps its ask-back; an itemized estimate ask (`isItemizedAsk`) gets "{rep} can walk through each window and door line by
+line on a quick call, and look at getting you a better price". A call ask or yes gets the reason before the times unless
+one of our last three messages said it. The model's version must keep it (`reference_markers`). In this mode the
+better-price line SUPERSEDES "the best deal possible, once" (2026-10-11) and the ask-backs of 2026-10-15 for price /
+competitor / think. Still never an amount, %, discount or promise (`stripOfferTalk` is unchanged; its fallback line is
+the better-price question). Gate: `rehash_better_price` on|off, scenarios `rehash_other_quotes`, `rehash_call_reason`.
+Tests that hold the old copy pin the switch off (`test-rehash-nepq.js`, `-objection-ladder`, `-call-slots`, `-deal-hint`).
+
 **The bot gate's last failures (2026-10-20).** Three real bugs, one scorer gap:
 - **A burst is one inbound.** The reply buffer joins a burst with newlines as the trigger, and `normalizeThread` /
   rehash `normalize()` appended it after the texts already in the thread, so "Still got a couple more quotes to come in
@@ -410,12 +443,14 @@ count it, a no to that ask does), and a day or part of day gets two Rehash Call 
   over" got the generic "What's holding you back?". `visitHesitationOf` (`presentation-facts.js`) passes
   `visitHesitation` to the planner, and a post-demo "still deciding" (the situation stage's own read-back) plans ONE
   `POST_DEMO_VISIT_ASK` ("Are you still weighing the budget?", no figure); it is the ladder's ask-back, so the next
-  objection gets the bridge.
+  objection gets the bridge. With `REHASH_BETTER_PRICE_FRAMING_ENABLED` on (the default, newer), a price or
+  other-quotes hesitation from the visit takes the better-price line instead, exactly as a named one does (`ladderObj`);
+  a spouse keeps the ask-back.
 - **The live chat's reschedule path runs in every mode** (`stageLive: true` for `planCancelTurn`): an unclear answer to
   "a different day instead of cancelling?" gets one move-or-cancel question, never a cancel card, and "neither of those"
   to the re-offered times goes to a person rather than the same two times again.
 - **Scorer:** the cancel identity ask is allowed by the turn's own flow step (`ask_identity`), not the scenario's name
-  (`SCORING_VERSION` 2026-10-21.1). `two_texts_one_reply_sms` still counts the shadow turn lock's would-be second send
+  (`SCORING_VERSION` 2026-10-21.3). `two_texts_one_reply_sms` still counts the shadow turn lock's would-be second send
   until `TURN_LOCK_MODE` is live (a person's flip after the 48-hour check).
 
 **A post-demo lead is planned as post-demo, never as a new lead (Mark, 2026-10-09).** Five rehash threads got a stock

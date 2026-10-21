@@ -21,6 +21,11 @@ import { handoffSlackChannels, formatNepqHandoff } from '../src/agentic/nepq-han
 import { NO_DIAL_REASONS, callbackDecision } from '../src/agentic/bot-callback.js';
 import { checkReply } from '../src/eval/reply-invariants.js';
 
+// 2026-10-21: these tests hold the rehash copy from BEFORE the better-price
+// framing (REHASH_BETTER_PRICE_FRAMING_ENABLED=false is the undo path, so it
+// must keep working). The framing itself: scripts/test-rehash-better-price.js.
+process.env.REHASH_BETTER_PRICE_FRAMING_ENABLED = 'false';
+
 const NOW = Date.parse('2026-10-15T18:20:00Z'); // Thu 2:20 PM ET
 const out = (text) => ({ direction: 'outbound', text });
 const inn = (text) => ({ direction: 'inbound', text });
