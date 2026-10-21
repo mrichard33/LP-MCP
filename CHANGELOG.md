@@ -5,6 +5,22 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-10-21
+
+- **F.0 v2 gets a personal email the evening of the demo.** Position 0 of F.0 v2
+  is now one email written from the Siro recording of the visit, as the rehash
+  rep: it thanks them for having us out, names what they wanted and their main
+  hesitation in their words, and ends on one question, "If I could …, would you
+  be open to a quick call with John?". It replaces the old fixed F.0 email. No
+  price, deal, discount, sensitive detail, footer or exclamation mark. With no
+  recording by 08:30 the next morning, nothing is written and the workflow sends
+  its fixed fallback (tag `f0-no-recording`). Behind `F0_EMAIL_MODE`, default
+  shadow (drafts + an approval card in #contact-rehash), and its prompt row is
+  seeded inactive, so nothing a customer sees changes until Mark switches it on.
+- **A nurture workflow writes drafts only for contacts it actually holds.**
+  With `NURTURE_WORKFLOW_IDS` set, a generate call from a workflow the contact
+  is no longer in is refused and nothing is written.
+
 ## 2026-10-11
 
 - **After an unsold demo, the bot never says the sales rep will follow up.**

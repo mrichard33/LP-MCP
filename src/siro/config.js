@@ -49,6 +49,10 @@ export function siroModes(env = process.env) {
     demoNote: pick(env.SIRO_DEMO_NOTE_MODE, OSL, 'shadow'),
     scorecardSync: pick(env.SIRO_SCORECARD_SYNC_MODE, OL, 'off'),
     f0: pick(env.F0_V2_MODE, OSL, 'shadow'),
+    // F.0 v2 position-0 email (Mark, 2026-10-21): off suppresses it quietly,
+    // shadow drafts it for approval, live sends it. It decides the email alone
+    // (src/siro/f0-email.js); F0_V2_MODE=off still stops every F.0 touch.
+    f0Email: pick(env.F0_EMAIL_MODE, OSL, 'shadow'),
   };
 }
 
@@ -71,6 +75,9 @@ export function siroConfig(env = process.env) {
     demoNoteMaxAgeH: num(env.SIRO_DEMO_NOTE_MAX_AGE_H, 48, { min: 1, max: 720 }),
     nurtureShadowWorkflows: String(env.NURTURE_SHADOW_WORKFLOWS ?? 'F.0')
       .split(',').map(s => s.trim()).filter(Boolean),
+    // The position-0 email waits for the recording until this Eastern time the
+    // day after the demo (src/siro/f0-email.js), then gives up: no_recording.
+    f0EmailHoldCapEt: env.F0_EMAIL_HOLD_CAP_ET || '08:30',
     f0ApprovalChannel: env.F0_APPROVAL_CHANNEL || env.SLACK_CHANNEL_REHASH || 'C0C5YMHNYJH',
   };
 }

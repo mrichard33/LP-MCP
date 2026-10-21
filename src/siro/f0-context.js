@@ -27,6 +27,10 @@ import { isCustomerP2 } from '../agentic/lead-state/signals/context-reader.js';
 import { POST_DEMO_STOP_RX } from '../agentic/nepq-planner.js';
 import { getCustomValue } from '../services/ghl-custom-values.js';
 import { REHASH_REP_CUSTOM_VALUE } from '../agentic/rehash.js';
+import { rehashRepFor } from '../config/rehash-assignee.js';
+import { rehashTeamUserIds } from '../agentic/rehash-state.js';
+import { rehashRepFirstName, ghlUserFirstName } from '../agentic/rehash-slots.js';
+import { isF0EmailRequest, emailHoldWindow } from './f0-email.js';
 
 const HOUR_MS = 3_600_000;
 const SENT_STATUSES = ['ghl_sent_confirmed', 'generated_ready'];
@@ -66,6 +70,29 @@ async function safe(label, fn, fallback) {
   try { return await fn(); } catch (err) { console.log(`[F0v2] ${label} read failed: ${err.message}`); return fallback; }
 }
 
+const REP_READ_CAP_MS = 2500;
+const capped = (p) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), REP_READ_CAP_MS))]);
+
+/**
+ * The rehash rep's first name, the SAME rule for every F.0 touch, text or
+ * email (Mark, 2026-10-21: the email is "written as John, the rehash rep … same
+ * voice as the SMS touches"). 2026-10-15 (the user): the rep is the FOLLOWER
+ * the GHL rehash workflow put on THIS lead (rehashRepFor), named from
+ * REHASH_TEAM_USER_NAMES or the GHL user record; else the GHL custom value
+ * rehash_rep_name, as before; else "Reece Team". Never guessed. Never throws.
+ */
+export async function resolveRehashRepFirst(contactId, { env = process.env, deps = {} } = {}) {
+  const getContact = deps.getContact || (async (id) => (await import('../actions/contact-cache.js')).getContactCached(id, null, { maxWaitMs: 2000 }));
+  const contact = contactId ? await capped(getContact(contactId)).catch(() => null) : null;
+  const repId = rehashRepFor(contact, rehashTeamUserIds(env));
+  const fromFollower = repId
+    ? (rehashRepFirstName(repId, env) || await capped((deps.getUserName || ghlUserFirstName)(repId)).catch(() => null))
+    : null;
+  if (fromFollower) return fromFollower;
+  const repRaw = await (deps.getCustomValue || getCustomValue)(REHASH_REP_CUSTOM_VALUE);
+  return repFirstName(repRaw) || 'Reece Team';
+}
+
 /**
  * @param {object} context  buildLeadContext() output
  * @param {{contact_id: string, sequence_position: number}} request
@@ -79,11 +106,18 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   const tags = (lead.current_tags || []).map(t => String(t).toLowerCase());
   const read = deps.readSiroRows || readSiroRows;
   const readArgs = { supabase, contactId: request.contact_id, leadIds: [lp.lead_id], prospectId: lp.prospect_id };
+  // 2026-10-21 (Mark): the position-0 email waits for the recording until the
+  // cap (08:30 ET the day after the demo), not the texts' 24h.
+  const email = isF0EmailRequest(request);
+  const demoAtMs = (f) => Date.parse(f?.recorded_at || lp.demo_date || lp.last_appointment_date || lp.appointment_date || '');
+  const waitFor = (f) => (email
+    ? emailHoldWindow({ demoAtMs: demoAtMs(f), nowMs, capEt: cfg.f0EmailHoldCapEt, stepH: cfg.waitHoldH })
+    : { waitMaxH: cfg.waitMaxH, waitHoldH: cfg.waitHoldH });
 
   let rows = await safe('siro_recordings', () => read(readArgs), []);
   let facts = buildPresentationFacts(rows, { now: nowMs });
   const ageBefore = demoAgeHours({ facts, lp, nowMs });
-  if (!facts && allowEnsure && Number.isFinite(ageBefore) && ageBefore < cfg.waitMaxH && lp.lead_id) {
+  if (!facts && allowEnsure && Number.isFinite(ageBefore) && ageBefore < waitFor(facts).waitMaxH && lp.lead_id) {
     const ensured = await (deps.ensureRecordingForLead || ensureRecordingForLead)(
       { lp_lead_id: lp.lead_id, phone: lead.phone, demo_date: lp.demo_date, appointment_date: lp.last_appointment_date || lp.appointment_date },
       { env, deps, nowMs },
@@ -132,10 +166,9 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   const sold = lpSold(lp) || isCustomerP2(context) || tags.includes('deal-won');
   const postAppointment = isPostDemoLead({ lp, tags, stageTag: lead.current_stage_tag || null });
 
-  // The rehash rep's first name, as the reply path reads it (the GHL custom
-  // value rehash_rep_name); never guessed: "Reece Team" when none.
-  const repRaw = await (deps.getCustomValue || getCustomValue)(REHASH_REP_CUSTOM_VALUE);
-  const rehashRepFirst = repFirstName(repRaw) || 'Reece Team';
+  // The rehash rep's first name: the follower on the lead, else the GHL
+  // custom value rehash_rep_name; never guessed: "Reece Team" when none.
+  const rehashRepFirst = await resolveRehashRepFirst(request.contact_id, { env, deps });
 
   const age = demoAgeHours({ facts, lp, nowMs });
   const modes = siroModes(env);
@@ -152,7 +185,10 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   // and are picked by Siro's MAIN objection: v1 picked by the first moment
   // type, so 8 of 10 preview leads got the price variant, Mr. Jackson's
   // "decision maker not present" included.
-  if (modes.f0Formula === 'four_step') {
+  // The position-0 email reads the same <visit_facts> whatever the text
+  // formula (one prompt row serves v1 and four_step), plus the person who
+  // visited, whom it may name once (Mark, 2026-10-21).
+  if (modes.f0Formula === 'four_step' || email) {
     // 2026-10-20: the formula opens on the first name. A couple's field
     // ("George/Paula") is no name to the reply writer, so it is read here and
     // its first person used; with none at all the text opens without a name.
@@ -166,11 +202,15 @@ export async function loadF0Context(context, request, { env = process.env, deps 
     }
     vars.first_name = firstName || '';
     const objectionType = fourStepObjectionType(facts);
-    vars.formula = 'four_step';
+    if (modes.f0Formula === 'four_step') vars.formula = 'four_step';
     vars.objection_type = objectionType;
     vars.story_angle = STORY_ANGLES[objectionType] || STORY_ANGLES.none;
-    vars.visit_facts = buildVisitFacts(facts, { firstName: vars.first_name, repFirstName: rehashRepFirst, followupTextLive });
+    vars.visit_facts = buildVisitFacts(facts, {
+      firstName: vars.first_name, repFirstName: rehashRepFirst, followupTextLive,
+      ...(email ? { visitedBy: facts?.rep_first_name || '' } : {}),
+    });
   }
+  const wait = waitFor(facts);
   return {
     facts,
     rows,
@@ -188,8 +228,8 @@ export async function loadF0Context(context, request, { env = process.env, deps 
       tags,
       siroFacts: facts,
       demoAgeH: age,
-      waitMaxH: cfg.waitMaxH,
-      waitHoldH: cfg.waitHoldH,
+      waitMaxH: wait.waitMaxH,
+      waitHoldH: wait.waitHoldH,
     },
   };
 }

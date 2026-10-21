@@ -61,11 +61,14 @@ const DEFAULT_TIMEOUT_MS = 8_000;
  * JSON, null, undefined, or empty string) to a positive integer 1..MAX.
  * Returns null when the input doesn't represent a valid cycle position.
  */
-function coerceSeqPos(raw) {
+// 2026-10-21 (Mark): F.0 v2's email is position 0. Only the route may allow
+// it (F.0 by email, src/siro/f0-email.js); everywhere else 0 is no position.
+export function coerceSeqPos(raw, { allowZero = false } = {}) {
   if (raw === null || raw === undefined || raw === '') return null;
   const n = Number(raw);
   if (!Number.isFinite(n)) return null;
   const i = Math.floor(n);
+  if (allowZero && i === 0) return 0;
   if (i < 1 || i > MAX_SEQ_POS) return null;
   return i;
 }
@@ -114,11 +117,12 @@ async function fetchSeqPosFromGHL(contactId) {
  *
  * @param {string} contactId      — GHL contact ID (required)
  * @param {*} payloadSeqPos       — value from the inbound payload (any type)
+ * @param {{allowZero?: boolean}} [o] — the F.0 email (position 0); the caller decides
  * @returns {Promise<{position:number, source:'payload'|'contact_field'|'default'}>}
  */
-export async function resolveSequencePosition(contactId, payloadSeqPos) {
+export async function resolveSequencePosition(contactId, payloadSeqPos, { allowZero = false } = {}) {
   // 1. Payload — preferred when present and valid.
-  const fromPayload = coerceSeqPos(payloadSeqPos);
+  const fromPayload = coerceSeqPos(payloadSeqPos, { allowZero });
   if (fromPayload !== null) {
     return { position: fromPayload, source: 'payload' };
   }

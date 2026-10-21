@@ -91,7 +91,8 @@ const SENSITIVE_RX = new RegExp([
   // death and loss
   String.raw`\b(?:died|dies|dying|death|dead|deceased|passed\s+away|passing\s+of|funeral|grie(?:f|ving|ves)|bereave\w*|widow(?:ed|er)?|late\s+(?:wife|husband|spouse|mother|father|son|daughter))\b`,
   String.raw`\b(?:sorry\s+(?:about\s+(?:your|his|her|their)|to\s+hear|for\s+(?:your|his|her|their)\s+loss)|condolence\w*|(?:my|our)\s+sympath\w*|thoughts\s+and\s+prayers)\b`,
-  String.raw`\blost\s+(?:his|her|their|my|a)\s+(?:wife|husband|spouse|partner|son|daughter|child|mother|father|mom|dad|parent|brother|sister|family\s+member|loved\s+one)\b`,
+  // 2026-10-21 (the email checks): "losing" and "your" read the same.
+  String.raw`\b(?:lost|losing)\s+(?:his|her|their|my|your|a)\s+(?:wife|husband|spouse|partner|son|daughter|child|mother|father|mom|dad|parent|brother|sister|family\s+member|loved\s+one)\b`,
   String.raw`\bloss\s+(?:of|in)\s+(?:the\s+|his\s+|her\s+|their\s+)?(?:family|wife|husband|spouse|child|parent|loved)`,
   // illness and health
   String.raw`\b(?:ill|illness|sick(?:ness)?|cancer|chemo\w*|diagnos\w*|hospital\w*|surger(?:y|ies)|surgical|stroke|dementia|alzheimer\w*|parkinson\w*|disab(?:led|ility|ilities)|medical|medication|health|healthy?\s+issues|ailing|caregiv\w*|terminal|hospice|ambulance|paramedics?|firefighters?|emergency\s+room|heart\s+(?:attack|problems?|condition|issues?|trouble))\b`,
