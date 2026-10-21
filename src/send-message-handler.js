@@ -578,6 +578,22 @@ export function decideEmailSendDelay({
 }
 
 /**
+ * When did the lead's message ARRIVE? Pure. A reply queued from an analysis
+ * (ai.analysis_completed, the usual case) has its own created_at ~30-60s after
+ * the inbound, so the analysis payload's inbound stamps win (2026-10-21, Bobbi
+ * Glenn H20S2hp7XnsDHvRkr0az: the hold was anchored on the analysis and the
+ * email went out 18.5 min after her message, past the 15 min window). The
+ * newest inbound of a burst is the one the reply answers.
+ */
+export function emailDelayAnchorIso(sourceEventMeta, newestInboundAt = null) {
+  const p = sourceEventMeta?.payload || {};
+  for (const v of [p.last_inbound_event_created_at, p.inbound_event_created_at, p.inbound_webhook_received_at]) {
+    if (v && Number.isFinite(Date.parse(v))) return v;
+  }
+  return sourceEventMeta?.created_at || newestInboundAt || null;
+}
+
+/**
  * Store the chosen ready time on the row (action_payload.email_ready_at) so a
  * retry reads it back. Best-effort: the time is also derived from the inbound's
  * id, so a failed stamp re-derives the same value.
@@ -3518,7 +3534,7 @@ async function executeSendMessageInner(action, context, turnState = { held: null
   // Anchored on when the lead's message ARRIVED. sourceEventMeta.created_at is
   // the inbound system_events row; newestInboundAt is the fallback when the
   // source event could not be read. See decideEmailSendDelay (module top).
-  const inboundAtIso = sourceEventMeta?.created_at || newestInboundAtPre || null;
+  const inboundAtIso = emailDelayAnchorIso(sourceEventMeta, newestInboundAtPre);
   const storedReadyAtMs = payload.email_ready_at ? Date.parse(payload.email_ready_at) : NaN;
   const emailDelay = decideEmailSendDelay({
     channel,
@@ -5046,6 +5062,7 @@ export const _internal = {
   enforceNonRandySender,
   // 2026-09-18 — the 90s floor on email replies.
   decideEmailSendDelay,
+  emailDelayAnchorIso,
   // 2026-09-18 — a decision-maker message is never answered by the fallback.
   findDecisionMakerSignals,
 };
