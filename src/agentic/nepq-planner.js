@@ -40,7 +40,7 @@ import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { bestDealHintUsed } from './rehash.js';
 import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint, isRehashReady, rehashReadyLine, betterPriceReason, betterPriceInvite, betterPriceKindFor, hasBetterPrice, isItemizedAsk, REHASH_BETTER_PRICE_RX } from './rehash-nepq.js';
 import { rehashBookingFix, rehashBetterPrice } from './rehash-flags.js';
-import { readRehashTime, pickRehashTime, rehashTimeSlots, clockLabel } from './rehash-time.js';
+import { readRehashTime, pickRehashTime, rehashTimeSlots, clockLabel, rehashDaySlots, slotDayKeys as rehashSlotDayKeys } from './rehash-time.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
 import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
@@ -1319,6 +1319,25 @@ function planNepqTurnCore({
       const named = timeTalk && all.length ? rehashTimeSlots(now, all, { offered: open, nowMs }) : null;
       if (named?.exact) return confirmPlan(named.exact);
       if (named?.near?.length === 2) return offerPlan(named.near, LINES.not_open(clockLabel(named.time.minutes), named.near));
+      // 2026-10-21 (first live-build sim): "Can you call me tomorrow?" got today's
+      // times. A day named with no clock time, on a call ask, a schedule ask, a yes
+      // or an answer to our times, gets two openings that day (the open pair when
+      // it is already on that day); none that day, said plainly, and the next two.
+      // After our "When is a good day and time?" (a "Neither" to our times), the
+      // preference branch below answers: it also leaves out the times refused.
+      const dayTalk = !REHASH_TIME_ASK_RX.test(lastOut) && (askedForCall || scheduleAsk || open.length
+        || CALL_OFFER_SENTENCE_RX.test(lastOut) || bridgedRecently(outbound.map(m => m.text)));
+      const named2 = dayTalk && all.length && !isNo(now, lastOut) ? rehashDaySlots(now, all, { nowMs }) : null;
+      if (named2?.slots?.length === 2) {
+        if (open.length === 2 && open.every(x => rehashSlotDayKeys(x).has(named2.want.day))) return offerPlan(open, LINES.offer_slots(open, counters.slot_offers));
+        const dayWord = named2.want.day === 'today' || named2.want.day === 'tomorrow' ? named2.want.day : named2.want.day.charAt(0).toUpperCase() + named2.want.day.slice(1);
+        const what = `${dayWord}${named2.want.part ? ` ${named2.want.part}` : ''}`;
+        // Part 2: the call's reason before the times, unless we just said it.
+        const reason = betterPrice && !betterPriceSaid() ? `${betterPriceReason('generic', callRep)} ` : '';
+        return offerPlan(named2.slots, named2.matched
+          ? `${reason}${LINES.offer_slots(named2.slots, counters.slot_offers)}`
+          : `${reason}I don't have anything open ${what}, but I have ${named2.slots.map(x => `${x.rel || x.day} at ${x.time}${x.tz ? ` ${x.tz}` : ''}`).join(' or ')}. Which works better?`);
+      }
       // Ready to buy, or asking for the final price: the call, with its reason.
       const two = stableOffer();
       if (isRehashReady(now) && two.length === 2) {

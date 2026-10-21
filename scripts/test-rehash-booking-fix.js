@@ -207,3 +207,27 @@ test('scenario check: ready → the call; a firm no → no question', () => {
   const no = R('rehash_firm_no', [T(1, 'Did you get a chance to look over the proposal?', { step: 'post_demo' }), T(2, 'Understood. Where are you at with it?', { step: 'post_demo' })]);
   assert.ok(SCENARIO_EXPECTATIONS.rehash_firm_no(no).some(f => f.code === 'question_after_firm_no'));
 });
+
+// ── 2026-10-21 (first live-build sim): a named day with no clock time ──
+test('"Can you call me tomorrow?" → two openings tomorrow, never today\'s', () => {
+  const TODAY = [S('2026-10-20T21:30:00Z', 'Tue, Oct 20', '5:30 PM', 'today', 'Tuesday'), S('2026-10-20T22:30:00Z', 'Tue, Oct 20', '6:30 PM', 'today', 'Tuesday')];
+  const all = [...TODAY, ...ALL];
+  const p = plan('Can you call me tomorrow? We can go over it then', [out('Did you get a chance to look over the proposal?')], SLOTS(all, TODAY));
+  assert.equal(p.step, 'rehash_offer');
+  assert.ok(p.slots_to_offer.every(x => x.rel === 'tomorrow'), JSON.stringify(p.slots_to_offer));
+  assert.deepEqual(p.slots_to_offer.map(x => x.iso), [W930.iso, W200.iso]);
+  // Flag off: the soonest pair, as before.
+  assert.deepEqual(off(() => plan('Can you call me tomorrow? We can go over it then', [out('Did you get a chance to look over the proposal?')], SLOTS(all, TODAY))).slots_to_offer.map(x => x.iso), TODAY.map(x => x.iso));
+});
+
+test('a named day with nothing open says so and offers the next two', () => {
+  const p = plan('Can you call me Monday?', [out('Did you get a chance to look over the proposal?')]);
+  assert.equal(p.step, 'rehash_offer');
+  assert.match(p.fixed_line, /I don't have anything open Monday, but I have tomorrow at 9:30 AM ET or tomorrow at 10:30 AM ET\./);
+});
+
+test('"Thursday afternoon" after our offer → two Thursday afternoon times', () => {
+  const p = plan('Thursday afternoon would be better', [OFFER]);
+  assert.equal(p.step, 'rehash_offer');
+  assert.ok(p.slots_to_offer.every(x => x.dayOfWeek === 'Thursday'));
+});

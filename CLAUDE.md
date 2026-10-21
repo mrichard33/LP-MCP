@@ -416,7 +416,10 @@ asks nothing after a stated call time; the prompt gets no `availability` on a re
 booking claim with `{ rehash: true }` only (`REHASH_CALL_CLAIM_PATTERNS`, booking-claim.js). checkReply
 `question_after_post_demo_firm_no`. `bot_outcomes.booked_at` needed no change: it reads the HL appointment mirror. Gate:
 `rehash_booking_fix` on|off, scenarios `rehash_bare_time_pick`, `rehash_named_time`, `rehash_ready_to_move`,
-`rehash_firm_no`. The pre-demo bot never reads the switch (`scripts/test-rehash-predemo-unchanged.js`).
+`rehash_firm_no`. The pre-demo bot never reads the switch (`scripts/test-rehash-predemo-unchanged.js`). A day named
+with no clock time ("call me tomorrow", "Thursday afternoon") on a call ask, a yes or an open offer gets two openings
+that day (`rehashDaySlots`; the open pair when it is already that day; none → "I don't have anything open …" and the
+next two); after our "When is a good day and time?" the older preference branch answers (it leaves out refused times).
 
 **The reason for a rehash call is a better price (the user, 2026-10-21; `REHASH_BETTER_PRICE_FRAMING_ENABLED`, unset =
 on, `false` = the copy before, byte for byte).** "I may be able to do something for you, it's just easier on a quick
