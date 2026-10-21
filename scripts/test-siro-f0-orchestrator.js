@@ -75,7 +75,7 @@ const CONTEXT = {
 test('loadF0Context: an unsold OPPFDN lead with a recording generates, written as the rehash rep', async () => {
   const db = fakeSupabase({ rehash_stage: [], lp_leads: [{ lp_lead_id: '583321', lp_prospect_id: '470111', created_at_lp: '2026-10-01' }], agentic_messages: [] });
   const out = await loadF0Context(CONTEXT, { contact_id: 'c1', sequence_position: 1 }, {
-    env: {}, nowMs: NOW, deps: { supabase: db, readSiroRows: async () => [ROW], getCustomValue: async () => 'John Manieri' },
+    env: {}, nowMs: NOW, deps: { supabase: db, readSiroRows: async () => [ROW], getCustomValue: async () => 'John Manieri', getContact: async () => null },
   });
   assert.equal(out.recordingId, 'rec_1');
   assert.equal(out.vars.rehash_rep_first_name, 'John');
@@ -87,14 +87,14 @@ test('loadF0Context: an unsold OPPFDN lead with a recording generates, written a
 test('loadF0Context: no recording 16h after the demo holds; no rep name signs Reece Team; a newer lead ends it', async () => {
   const db = fakeSupabase({ rehash_stage: [], lp_leads: [], agentic_messages: [] });
   const out = await loadF0Context(CONTEXT, { contact_id: 'c1', sequence_position: 1 }, {
-    env: {}, nowMs: NOW, deps: { supabase: db, readSiroRows: async () => [], getCustomValue: async () => null, ensureRecordingForLead: async () => 'none' },
+    env: {}, nowMs: NOW, deps: { supabase: db, readSiroRows: async () => [], getCustomValue: async () => null, getContact: async () => null, ensureRecordingForLead: async () => 'none' },
   });
   assert.equal(out.vars.rehash_rep_first_name, 'Reece Team');
   assert.deepEqual(postDemoInterrupt(out.interruptInput), { hold: 2, reason: 'awaiting_siro' });
 
   const db2 = fakeSupabase({ rehash_stage: [], lp_leads: [{ lp_lead_id: '590000', lp_prospect_id: '470111', created_at_lp: '2026-10-16' }], agentic_messages: [] });
   const out2 = await loadF0Context(CONTEXT, { contact_id: 'c1', sequence_position: 2 }, {
-    env: {}, nowMs: NOW, deps: { supabase: db2, readSiroRows: async () => [ROW], getCustomValue: async () => null },
+    env: {}, nowMs: NOW, deps: { supabase: db2, readSiroRows: async () => [ROW], getCustomValue: async () => null, getContact: async () => null },
   });
   assert.equal(postDemoInterrupt(out2.interruptInput).suppress, 'newer_lead');
 });
@@ -102,12 +102,12 @@ test('loadF0Context: no recording 16h after the demo holds; no rep name signs Re
 test('loadF0Context: a sold lead and an ended rehash stage are suppressed', async () => {
   const db = fakeSupabase({ rehash_stage: [], lp_leads: [], agentic_messages: [] });
   const sold = await loadF0Context({ ...CONTEXT, lp: { ...CONTEXT.lp, disposition: 'Sale', closed_won: true } }, { contact_id: 'c1', sequence_position: 1 }, {
-    env: {}, nowMs: NOW, deps: { supabase: db, readSiroRows: async () => [ROW], getCustomValue: async () => null },
+    env: {}, nowMs: NOW, deps: { supabase: db, readSiroRows: async () => [ROW], getCustomValue: async () => null, getContact: async () => null },
   });
   assert.equal(postDemoInterrupt(sold.interruptInput).suppress, 'sold');
   const ended = fakeSupabase({ rehash_stage: [{ ghl_contact_id: 'c1', lp_lead_id: '583321', ended_at: '2026-10-16T00:00:00Z', started_at: '2026-10-15' }], lp_leads: [], agentic_messages: [] });
   const out = await loadF0Context(CONTEXT, { contact_id: 'c1', sequence_position: 3 }, {
-    env: {}, nowMs: NOW, deps: { supabase: ended, readSiroRows: async () => [ROW], getCustomValue: async () => null },
+    env: {}, nowMs: NOW, deps: { supabase: ended, readSiroRows: async () => [ROW], getCustomValue: async () => null, getContact: async () => null },
   });
   assert.equal(postDemoInterrupt(out.interruptInput).suppress, 'rehash_ended');
 });

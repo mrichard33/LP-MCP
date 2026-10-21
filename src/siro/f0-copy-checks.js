@@ -26,6 +26,8 @@ import { enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { hasSensitiveDetail } from './text-guards.js';
 import { copiesSiroDraft, repQuoteRx } from './presentation-guard.js';
 import { groundingSources, FOUR_STEP_SLOTS } from './f0-four-step.js';
+import { findExclamations } from '../agentic/discovery-discipline.js';
+import { F0_EMAIL_SUBJECT_MAX, F0_EMAIL_PREHEADER_MAX, F0_EMAIL_BODY_WORDS } from './f0-email.js';
 
 export const F0_SMS_MAX = 300;
 // 2026-10-20 (the first Four-Step previews): name + four parts + the call
@@ -48,6 +50,14 @@ const WARRANTY_RX = /\bwarrant(?:y|ies)\b|\bguarantee\b/i;
 const REHASH_RX = /\brehash\b/i;
 const SALES_REP_RX = /\b(?:your|the)\s+(?:sales\s+)?rep\s+will\b|\bsales\s+rep\b/i;
 const EMOJI_RX = /\p{Extended_Pictographic}/u;
+// 2026-10-21 (Mark, the position-0 email): the email never says "deal" (not
+// even the one hint), never calls Randy the founder (his FATHER founded Reece
+// in 1972), never writes the template's footer, an address or an unsubscribe
+// line, and never says "your rep".
+const DEAL_RX = /\bdeals?\b/i;
+const FOUNDER_RX = /\bfound(?:er|ed|ing)\b/i;
+const FOOTER_RX = /\bunsubscribe\b|\bopt[\s-]?out\b|\bprotecting\s+families\s+since\b|©|\bcopyright\b|\ball\s+rights\s+reserved\b|\b\d{2,6}\s+(?:[A-Z][a-z]+\s+){1,3}(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Way|Ct|Court|Hwy|Highway|Pkwy|Parkway)\b/;
+const YOUR_REP_RX = /\byour\s+(?:sales\s+)?(?:rep|representative|consultant)\b/i;
 const GENERIC_OPENER_RX = /^\s*(?:hi|hey|hello)?[\s,]*(?:[a-z]+[,!.]?\s+)?(?:thanks?(?:\s+you)?\s+(?:again\s+)?for\s+having\s+us|just\s+(?:checking|following)\s+(?:in|up)|hope\s+(?:you|all|this)|i\s+wanted\s+to\s+(?:check|follow)|touching\s+base)/i;
 
 const STOPWORDS = new Set(('about after again also because been before being both could does doing each from have having here into just like more most much only other over same should some such than that their them then there these they this those through very what when where which while will with would your yours you\'re window windows door doors home house price cost').split(' '));
@@ -146,31 +156,70 @@ function fourStepFailures(body, { facts, position, repFirstName, slots, firstNam
   return fail;
 }
 
+const escRx = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const firstSentence = (s) => (String(s || '').replace(/^\s*(?:hi|hey|hello|dear)?[\s,]*[A-Z][\w'’-]*\s*,\s*/i, '').match(/^[^.!?]*[.!?]?/) || [''])[0];
+const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+/**
+ * The position-0 email's own checks (formula 'email', Mark 2026-10-21): the
+ * subject, preheader and P.S. are part of the email, so the content checks
+ * read all four parts; the question and the call invite are the body's. Pure.
+ */
+function emailFailures(body, { subject = '', preheader = '', ps = '', salesRepFirstName = null } = {}) {
+  const fail = [];
+  const all = [subject, preheader, body, ps].filter(Boolean).join('\n');
+  if (!String(subject).trim() || String(subject).length > F0_EMAIL_SUBJECT_MAX) fail.push('subject_length');
+  if (!String(preheader).trim() || String(preheader).length > F0_EMAIL_PREHEADER_MAX) fail.push('preheader_length');
+  const fs = norm(firstSentence(body));
+  const ph = norm(preheader);
+  if (ph && fs && (fs === ph || fs.startsWith(ph) || ph.startsWith(fs))) fail.push('preheader_repeats_body');
+  const words = body.split(/\s+/).filter(Boolean).length;
+  if (words < F0_EMAIL_BODY_WORDS.min || words > F0_EMAIL_BODY_WORDS.max) fail.push('body_length');
+  if ((all.match(/\?/g) || []).length !== 1) fail.push('question_count');
+  if (findExclamations(all)) fail.push('exclamation');
+  if (DEAL_RX.test(all)) fail.push('deal_word');
+  if (FOUNDER_RX.test(all)) fail.push('founder');
+  if (FOOTER_RX.test(all)) fail.push('footer_text');
+  if (YOUR_REP_RX.test(all)) fail.push('your_rep');
+  // The sales rep who visited may be named ONCE, as the person who came out;
+  // never as the one who will follow up (2026-10-11: the rehash team owns it).
+  if (salesRepFirstName) {
+    const n = escRx(salesRepFirstName);
+    if ((all.match(new RegExp(`\\b${n}\\b`, 'gi')) || []).length > 1) fail.push('sales_rep_named_twice');
+    if (new RegExp(`\\b${n}\\b[^.?!]{0,50}\\b(?:will|'ll|is\\s+going\\s+to|plans?\\s+to)\\b[^.?!]{0,30}\\b(?:follow(?:ing)?\\s+up|reach(?:ing)?\\s+out|call|be\\s+in\\s+touch|get\\s+back)`, 'i').test(all)) fail.push('sales_rep_follow_up');
+  }
+  return fail;
+}
+
 /**
  * @param {string} text
  * @param {{facts?: object|null, position: number, repFirstName?: string,
- *   formula?: 'v1'|'four_step', slots?: object|null, firstName?: string|null,
- *   followupText?: string|null}} o
+ *   formula?: 'v1'|'four_step'|'email', slots?: object|null, firstName?: string|null,
+ *   followupText?: string|null, subject?: string, preheader?: string, ps?: string}} o
  * @returns {string[]} failure codes (empty = pass)
  */
-export function checkF0Copy(text, { facts = null, position = 1, repFirstName = null, formula = 'v1', slots = null, firstName = null, followupText = null } = {}) {
+export function checkF0Copy(text, { facts = null, position = 1, repFirstName = null, formula = 'v1', slots = null, firstName = null, followupText = null, subject = '', preheader = '', ps = '' } = {}) {
   const body = String(text || '').trim();
   const fail = [];
   if (!body) return ['empty'];
+  const email = formula === 'email';
   const fourStep = formula === 'four_step';
-  if (body.length > (fourStep ? F0_FOUR_STEP_SMS_MAX : F0_SMS_MAX)) fail.push('too_long');
+  if (!email && body.length > (fourStep ? F0_FOUR_STEP_SMS_MAX : F0_SMS_MAX)) fail.push('too_long');
 
   const questions = (body.match(/\?/g) || []).length;
-  if (position >= CLOSE_POSITION ? questions !== 0 : questions !== 1) fail.push('question_count');
+  // The email counts its question across every part (emailFailures).
+  if (!email && (position >= CLOSE_POSITION ? questions !== 0 : questions !== 1)) fail.push('question_count');
 
   if (MONEY_RX.test(body)) fail.push('money');
   if (TIME_RX.test(body)) fail.push('time');
   if (DAY_RX.test(body)) fail.push('day');
   if (BOOKED_RX.test(body)) fail.push('booking_claim');
   // The hint is allowed once in the sequence, at position 4 only. Four-Step:
-  // slot 4 hints at a better deal at every position that asks (1-4).
-  const hintAllowed = fourStep ? position < CLOSE_POSITION : position === HINT_POSITION;
-  if (findOfferTalk(body, { hintUsed: !hintAllowed }).length) fail.push('offer_talk');
+  // slot 4 hints at a better deal at every position that asks (1-4). The
+  // email allows no offer word at all, the P.S. included (Mark, 2026-10-21).
+  const hintAllowed = email ? false : fourStep ? position < CLOSE_POSITION : position === HINT_POSITION;
+  const offerText = email ? [subject, preheader, body, ps].filter(Boolean).join('\n') : body;
+  if (findOfferTalk(offerText, { hintUsed: !hintAllowed }).length) fail.push('offer_talk');
   if (POST_DEMO_REBUTTAL_RX.test(body)) fail.push('rebuttal');
   if (UNPROMISED_FOLLOW_UP_RX.test(body)) fail.push('unpromised_follow_up');
   if (enforceRehashCallTiming(body).changed) fail.push('call_now');
@@ -180,18 +229,30 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
   if (SALES_REP_RX.test(body)) fail.push('sales_rep_follow_up');
   if (EMOJI_RX.test(body)) fail.push('emoji');
   if (/[—–]/.test(body)) fail.push('em_dash');
-  if (GENERIC_OPENER_RX.test(body)) fail.push('generic_opener');
-  // Four-Step positions 1-4 end on the call question naming the rep instead.
-  if (repFirstName && !(fourStep && position < CLOSE_POSITION) && !signedBy(body, repFirstName)) fail.push('missing_signature');
+  // The email's job is to thank them for the visit, so its opener may.
+  if (!email && GENERIC_OPENER_RX.test(body)) fail.push('generic_opener');
+  // Four-Step positions 1-4 end on the call question naming the rep instead;
+  // the email's sign-off is the GHL template's.
+  if (repFirstName && !email && !(fourStep && position < CLOSE_POSITION) && !signedBy(body, repFirstName)) fail.push('missing_signature');
   // Ruling 7 (2026-10-19): never a death, an illness, divorce, a lost job,
   // debt or age, whatever the formula.
-  if (hasSensitiveDetail(body)) fail.push('sensitive_detail');
+  const sensitiveText = email ? [subject, preheader, body, ps].filter(Boolean).join('\n') : body;
+  if (hasSensitiveDetail(sensitiveText)) fail.push('sensitive_detail');
+  if (email && (MONEY_RX.test(`${subject}\n${preheader}\n${ps}`)) && !fail.includes('money')) fail.push('money');
   // The rep is never quoted back ("your rep Alex said…"; handoff v2 bad example).
   if (repQuoteRx(facts?.rep_first_name || null).test(body)) fail.push('rep_quoted');
   // Ruling 2: Siro's suggested text is a reference, never sent as written.
   if (followupText && copiesSiroDraft(body, followupText)) fail.push('siro_draft_copied');
 
-  if (fourStep) {
+  if (email) {
+    fail.push(...emailFailures(body, { subject, preheader, ps, salesRepFirstName: facts?.rep_first_name || null }));
+    // The Four-Step close and slots, as at position 1: the first name first,
+    // "If I could" and the call invite naming the rehash rep, both slots
+    // required and grounded in the visit. A recording is required (no facts =
+    // no email), so the grounding always runs.
+    fail.push(...fourStepFailures(body, { facts, position: 1, repFirstName, slots, firstName }));
+    if (!facts) fail.push('no_visit_facts');
+  } else if (fourStep) {
     fail.push(...fourStepFailures(body, { facts, position, repFirstName, slots, firstName }));
   } else if (facts && position <= 3) {
     const want = personalizationTokens(facts);
@@ -202,22 +263,24 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
 }
 
 /** One line per failure for the re-write note. Pure. */
-export function f0RetryNote(failures, { position }) {
+export function f0RetryNote(failures, { position, formula = 'v1' }) {
+  const email = formula === 'email';
   const why = {
-    too_long: `Keep it under ${F0_SMS_MAX} characters.`,
-    question_count: position >= CLOSE_POSITION ? 'Ask no question.' : 'Ask exactly one question.',
+    too_long: `Keep it under ${formula === 'four_step' ? F0_FOUR_STEP_SMS_MAX : F0_SMS_MAX} characters.`,
+    question_count: email ? 'Ask exactly one question in the whole email (subject, preheader, body and P.S.): the call invite at the end of the body.'
+      : position >= CLOSE_POSITION ? 'Ask no question.' : 'Ask exactly one question.',
     money: 'No price, dollar figure or discount.',
     time: 'No clock time.',
     day: 'No day of the week or "tomorrow".',
     booking_claim: 'Do not say anything is booked or confirmed.',
-    offer_talk: position === HINT_POSITION ? 'Only "the best deal possible" may hint at an offer.' : 'No offer or deal talk at all.',
+    offer_talk: email ? 'No offer, deal, discount, promotion or price talk anywhere in the email.' : position === HINT_POSITION ? 'Only "the best deal possible" may hint at an offer.' : 'No offer or deal talk at all.',
     rebuttal: 'Do not argue with their hesitation; acknowledge it.',
     unpromised_follow_up: 'Do not promise someone will reach out.',
     call_now: 'Never promise a call right now, today or shortly.',
     recorded: 'Never mention a recording or transcript.',
     warranty_pitch: 'Do not pitch the warranty.',
     rehash_word: 'Never use the word "rehash".',
-    sales_rep_follow_up: 'Do not say the sales rep will follow up.',
+    sales_rep_follow_up: email ? 'Never say the person who visited will follow up, call or reach out; the call is with the rep named in the invite.' : 'Do not say the sales rep will follow up.',
     emoji: 'No emoji.',
     em_dash: 'No dashes like — or –.',
     generic_opener: 'Do not open with "thanks for having us" or "just checking in".',
@@ -235,6 +298,18 @@ export function f0RetryNote(failures, { position }) {
     'slot_missing:reframe': 'Fill the reframe slot from <visit_facts>.',
     'slot_ungrounded:hesitation': position === 3 ? 'Slot 1 must come from what the home means to them in <visit_facts>.' : 'The hesitation slot must restate their hesitation from <visit_facts>, in their words.',
     'slot_ungrounded:reframe': 'The reframe slot must name something they told us they wanted (wants, what_it_means or scope in <visit_facts>).',
+    subject_length: `Write a subject of ${F0_EMAIL_SUBJECT_MAX} characters or fewer.`,
+    preheader_length: `Write a preheader of ${F0_EMAIL_PREHEADER_MAX} characters or fewer.`,
+    preheader_repeats_body: 'The preheader must not repeat the first sentence of the body.',
+    body_length: `Write the body in ${F0_EMAIL_BODY_WORDS.min} to ${F0_EMAIL_BODY_WORDS.max} words.`,
+    exclamation: 'No exclamation marks.',
+    deal_word: 'Never use the word "deal".',
+    founder: 'Never call anyone the founder.',
+    footer_text: 'No footer, address, copyright or unsubscribe text; the template adds the footer.',
+    your_rep: 'Never say "your rep"; name the person who visited at most once, as the one who came out.',
+    sales_rep_named_twice: 'Name the person who visited at most once.',
+    no_visit_facts: 'There is no visit on file.',
+    email_output: 'Answer as JSON: {"subject", "preheader", "body", "ps", "slots": {"hesitation", "affirm", "reframe", "if_i_could"}}.',
   };
   const line = (f) => why[f] || (f.startsWith('slot_not_in_text:') ? `Use the ${f.split(':')[1]} slot's words in the text.` : f);
   return `IMPORTANT: the previous draft failed these checks. Fix every one:\n${failures.map(f => `- ${line(f)}`).join('\n')}`;

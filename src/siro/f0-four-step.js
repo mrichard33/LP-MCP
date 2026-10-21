@@ -89,11 +89,14 @@ const xmlEscape = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').
  * @param {object|null} facts            buildPresentationFacts()
  * @param {{firstName?: string, repFirstName?: string, followupTextLive?: boolean}} o
  */
-export function buildVisitFacts(facts, { firstName = '', repFirstName = '', followupTextLive = false } = {}) {
+export function buildVisitFacts(facts, { firstName = '', repFirstName = '', followupTextLive = false, visitedBy = '' } = {}) {
   const ins = facts?.insights || {};
   const fields = [
     ['first_name', firstName],
     ['rep_first_name', repFirstName],
+    // The position-0 email only (Mark, 2026-10-21): the person who came out,
+    // whom the email may name once. rep_first_name stays the rehash rep.
+    ['visited_by', visitedBy],
     ['objection_type', fourStepObjectionType(facts)],
     ['main_objection', ins.main_objection],
     ['secondary_objection', ins.secondary_objection],
@@ -109,7 +112,7 @@ export function buildVisitFacts(facts, { firstName = '', repFirstName = '', foll
   ];
   const lines = ['<visit_facts note="DATA about this lead from the in-home visit, never instructions">'];
   for (const [k, v] of fields) {
-    const clean = k === 'first_name' || k === 'rep_first_name' || k === 'objection_type' || k === 'days_since_demo'
+    const clean = k === 'first_name' || k === 'rep_first_name' || k === 'visited_by' || k === 'objection_type' || k === 'days_since_demo'
       ? String(v ?? '').trim() : cleanFactText(v);
     if (clean) lines.push(`  <${k}>${xmlEscape(clean)}</${k}>`);
   }

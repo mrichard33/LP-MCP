@@ -185,6 +185,9 @@ const CF_TRUST_LEVEL_SCORE = 'zrghbp0ZLrOyTWc9x6Ai';
 // row) are the only sources that can ever name the ACTUAL rep. Read-only here;
 // response-generator.js resolveReplySenderName() owns the priority order.
 const CF_REP_DISPLAY_NAME = 'yxOTDIT7Um0JxkOPUbPo'; // "Rep Display Name"
+// 2026-10-21 (Mark): "Active Marketing Workflow ID", read by the nurture
+// route's active-workflow guard (src/nurture/workflow-guard.js).
+const CF_ACTIVE_MARKETING_WORKFLOW_ID = 'VFSNtEqSUh5yX7RyktBj';
 const CF_LP_REP_NAME      = 'ML9jAe1P5eq1uSwYTV3o'; // "LP Rep Name", e.g. "Dorsett, Beverly"
 
 // LP dispositions where stale data is high-risk (active deals).
@@ -1153,6 +1156,11 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       : null
   );
   // 2026-07-29: the contact's OWN rep name, for the email handoff bridge.
+  // '' when the field is empty, null when the contact could not be read: the
+  // guard refuses both, but logs which one it was.
+  const activeMarketingWorkflowId = ghlContact
+    ? String(getCustomFieldValue(ghlContact.customFields, CF_ACTIVE_MARKETING_WORKFLOW_ID) || '')
+    : null;
   const repDisplayName = ghlContact?.customFields
     ? getCustomFieldValue(ghlContact.customFields, CF_REP_DISPLAY_NAME)
     : null;
@@ -1306,6 +1314,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       // back to the location-global {{custom_values.rep_name}} ("Mark").
       rep_display_name: repDisplayName,
       lp_rep_name: lpRepNameField,
+      active_marketing_workflow_id: activeMarketingWorkflowId,
       current_tags: tags,
       current_stage_tag: parseStageTag(tags),
       current_buyer_tag: parseBuyerTag(tags),

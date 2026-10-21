@@ -18,26 +18,38 @@ import { loadF0Context } from './f0-context.js';
 import { postDemoInterrupt } from './f0-interrupts.js';
 import { checkF0Copy, f0RetryNote } from './f0-copy-checks.js';
 import { parseFourStepOutput, dropTrailingSignature, FOUR_STEP_WAIT_HOURS } from './f0-four-step.js';
+import { emailGate, f0EmailOutput, F0_EMAIL_POSITION } from './f0-email.js';
 
 /**
- * @param {{formula?: 'v1'|'four_step'}} [o]  2026-10-19: try the Four-Step
- *   prompts (version 2, read even while inactive) before F0_FORMULA_MODE flips.
+ * @param {{formula?: 'v1'|'four_step', channel?: 'sms'|'email'}} [o]
+ *   2026-10-19: try the Four-Step prompts (version 2, read even while inactive)
+ *   before F0_FORMULA_MODE flips. 2026-10-21 (Mark): channel 'email' previews
+ *   the position-0 email (its row read even while inactive), and reports what
+ *   the live path would do first: awaiting_siro, no_recording or a suppression.
  */
-export async function previewF0Generation(contactId, position, { deps = {}, formula = null } = {}) {
-  const pos = Math.min(5, Math.max(1, Number(position) || 1));
+export async function previewF0Generation(contactId, position, { deps = {}, formula = null, channel = 'sms' } = {}) {
+  const email = channel === 'email';
+  const pos = email ? F0_EMAIL_POSITION : Math.min(5, Math.max(1, Number(position) || 1));
   const fourStepPreview = formula === 'four_step';
-  const request = { contact_id: contactId, workflow_code: 'F.0', sequence_position: pos, channel: 'sms', ...(fourStepPreview ? { include_inactive: true } : {}) };
+  const request = { contact_id: contactId, workflow_code: 'F.0', sequence_position: pos, channel: email ? 'email' : 'sms', ...((fourStepPreview || email) ? { include_inactive: true } : {}) };
   const context = await (deps.buildLeadContext || buildLeadContext)(contactId, { skipCache: true, workflow_code: 'F.0' });
   const env = formula ? { ...process.env, F0_FORMULA_MODE: formula } : process.env;
   const f0 = await loadF0Context(context, request, { deps, allowEnsure: false, env });
-  const fourStep = f0.vars.formula === 'four_step';
-  context.siro = { ...f0.vars, selector_objection: fourStep ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data') };
+  const fourStep = !email && f0.vars.formula === 'four_step';
+  context.siro = { ...f0.vars, selector_objection: email ? null : fourStep ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data') };
   context.nurture_request = { workflow_code: 'F.0', sequence_position: pos };
   // 2026-10-20: as the orchestrator: a couple's first person for {{lead.first_name}}.
-  if (fourStep && !context.lead?.first_name && f0.vars.first_name) {
+  if ((fourStep || email) && !context.lead?.first_name && f0.vars.first_name) {
     context.lead = { ...(context.lead || {}), first_name: f0.vars.first_name };
   }
-  const interrupt = postDemoInterrupt(f0.interruptInput);
+  let interrupt = postDemoInterrupt(f0.interruptInput);
+  if (email) {
+    interrupt = emailGate({ pd: interrupt, facts: f0.facts });
+    // No recording: the model is never called for the email (as live).
+    if (interrupt?.suppress === 'no_recording' || interrupt?.hold) {
+      return { position: pos, channel: 'email', interrupt, would_generate: false, recording_id: null, outcome: interrupt.hold ? `hold:${interrupt.reason}:${interrupt.hold}h` : `suppressed:${interrupt.suppress}${interrupt.tag ? ` (tag ${interrupt.tag})` : ''}` };
+    }
+  }
 
   const prompt = await (deps.selectPrompt || selectPrompt)(context, request);
   if (!prompt) return { position: pos, interrupt, prompt_code: null, error: 'no F.0 prompt matched (are the sql/seeds/2026-10-16_f0_v2_prompts.sql rows applied?)' };
@@ -47,6 +59,17 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
     let raw = (await generate(p, context)).output;
     let slots = null;
     let invalid = null;
+    if (email) {
+      const out = applyAutofix(f0EmailOutput(raw), { smsMax: null }).output;
+      const safety = validateSafety(out, p, context);
+      const f0Failures = out.email_invalid ? ['email_output'] : checkF0Copy(out.email_plain_body, {
+        facts: f0.facts, position: pos, repFirstName: f0.vars.rehash_rep_first_name, formula: 'email',
+        slots: out.four_step_slots, firstName: f0.vars?.first_name || context?.lead?.first_name || null,
+        followupText: f0.vars.followup_text_line ? f0.facts?.followup_text || null : null,
+        subject: out.subject, preheader: out.preheader, ps: out.ps_text,
+      });
+      return { out, safety, f0Failures, slots: out.four_step_slots };
+    }
     if (fourStep) {
       const parsed = parseFourStepOutput(raw);
       if (parsed.ok) { slots = parsed.slots; raw = { ...raw, sms_body: dropTrailingSignature(parsed.text, pos), next_wait_hours: FOUR_STEP_WAIT_HOURS[pos] }; }
@@ -67,10 +90,34 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
     retried = await attempt({
       ...prompt,
       system_prompt: `${prompt.system_prompt}\n\nIMPORTANT: A previous attempt failed these checks: ${[...first.safety.failures, ...first.f0Failures].join(', ')}.` +
-        (first.f0Failures.length ? `\n\n${f0RetryNote(first.f0Failures, { position: pos })}` : ''),
+        (first.f0Failures.length ? `\n\n${f0RetryNote(first.f0Failures, { position: pos, formula: email ? 'email' : fourStep ? 'four_step' : 'v1' })}` : ''),
     });
   }
   const final = retried || first;
+  if (email) {
+    const o = final.out || {};
+    return {
+      position: pos,
+      channel: 'email',
+      interrupt,
+      would_generate: !interrupt,
+      prompt_code: prompt.prompt_code,
+      recording_id: f0.recordingId,
+      rep_first_name: f0.vars.rehash_rep_first_name,
+      visited_by: f0.facts?.rep_first_name || null,
+      subject: o.subject || null,
+      preheader: o.preheader || null,
+      body: o.email_plain_body || null,
+      ps: o.ps_text || null,
+      slots: final.slots,
+      checks: {
+        safety: final.safety.passed ? 'pass' : final.safety.failures,
+        f0: final.f0Failures.length ? final.f0Failures : 'pass',
+        first_attempt_failed: retried ? [...first.safety.failures, ...first.f0Failures] : [],
+      },
+      outcome: (final.safety.passed && !final.f0Failures.length) ? (interrupt ? `suppressed:${interrupt.suppress || interrupt.reason}` : 'awaiting_approval') : 'suppressed_low_conf',
+    };
+  }
   return {
     position: pos,
     interrupt,

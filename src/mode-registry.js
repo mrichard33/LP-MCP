@@ -254,6 +254,11 @@ export const MODES = Object.freeze([
     goLive: 'the four-step preview passes the checks for the 10 preflight recordings with no price, discount or sensitive detail; activate the version-2 F.0 rows first',
     note: 'F.0 v2 copy (ruling 6): v1 = the 2026-10-16 prompts; four_step = the Four-Step "If I could …, would you …?" prompts (version 2 rows, <visit_facts>, slot checks).',
   }),
+  m('F0_EMAIL_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-21', decider: 'Mark', evidence: { table: 'agentic_messages' },
+    goLive: 'a week of approved position-0 emails in #contact-rehash (F.0 email prompt row active first)',
+    note: 'F.0 v2 position-0 email, written from the Siro visit as the rehash rep (src/siro/f0-email.js): off skips it quietly, shadow drafts it for approval, live sends it. Decides the email alone; F0_V2_MODE=off still stops every F.0 touch.',
+  }),
   m('F0_V2_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-16', evidence: { table: 'agentic_messages' },
     note: 'F.0 v2 post-demo texts from the nurture orchestrator: off generates nothing, shadow forces approval (drafts + #contact-rehash card), live honours NURTURE_SHADOW_WORKFLOWS.',

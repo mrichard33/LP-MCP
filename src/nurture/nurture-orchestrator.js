@@ -157,6 +157,8 @@ import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from 
 import { newestManualOutbound, lastInboundAt } from '../services/human-takeover-io.js';
 import { siroConfig, siroModes, siroRecordingUrl } from '../siro/config.js';
 import { postToSlack } from '../slack.js';
+import { isF0EmailRequest, allowsPositionZero, asksPositionZero, f0EmailMode, f0EmailShadow, emailGate, f0EmailOutput } from '../siro/f0-email.js';
+import { parseWorkflowIds, activeWorkflowDecision } from './workflow-guard.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
 
@@ -197,6 +199,19 @@ export async function runNurtureGeneration(request) {
     return finishResponse(generation_id, false, 'context_build_failed', startedAt);
   }
 
+  // Step 1a — only the workflow the contact is in may write its drafts (Mark,
+  // 2026-10-21; src/nurture/workflow-guard.js). Before the audit row and any
+  // GHL write: a refusal leaves the contact's drafts exactly as they were.
+  const guard = activeWorkflowDecision({
+    code: request.workflow_code,
+    mapping: parseWorkflowIds(process.env.NURTURE_WORKFLOW_IDS),
+    activeId: context?.lead?.active_marketing_workflow_id ?? null,
+  });
+  if (guard.decision === 'refuse') {
+    console.log(`[Nurture] wrong active workflow code=${request.workflow_code} expected=${guard.expected} active=${guard.active ?? (context?.lead?.active_marketing_workflow_id === null ? 'unreadable' : 'empty')} contact=${request.contact_id} ${generation_id}`);
+    return finishResponse(generation_id, false, 'wrong_active_workflow', startedAt);
+  }
+
   // Write pending row early so we always have an audit anchor, even
   // if a later step throws.
   await createPendingRow(generation_id, request, context);
@@ -205,6 +220,9 @@ export async function runNurtureGeneration(request) {
   // the visit data, the post-demo interrupts and the wait for Siro, all
   // before any model call. force_send skips the interrupts, never the read.
   const isF0 = request.workflow_code === F0_WORKFLOW;
+  // 2026-10-21 (Mark): F.0 v2 position 0 is an email written from the visit
+  // (src/siro/f0-email.js); positions 1-5 are the texts, unchanged.
+  const isF0Email = isF0EmailRequest(request);
   let f0 = null;
   if (isF0) {
     if (siroModes().f0 === 'off') {
@@ -212,22 +230,31 @@ export async function runNurtureGeneration(request) {
       await safeClearDrafts(request.contact_id, 'f0_v2_off');
       return finishResponse(generation_id, false, 'f0_v2_off', startedAt);
     }
+    if (isF0Email && f0EmailMode() === 'off') {
+      await updateStatus(generation_id, 'suppressed_interrupt', 'f0_email_off');
+      await safeClearDrafts(request.contact_id, 'f0_email_off');
+      return finishResponse(generation_id, false, 'f0_email_off', startedAt);
+    }
     f0 = await loadF0Context(context, request);
     context.siro = {
       ...f0.vars,
       // The "no-visit-data" prompt variant when the visit is not on file.
       // Four-Step (2026-10-19): the variant is Siro's MAIN objection type.
-      selector_objection: f0.vars.formula === 'four_step' ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data'),
+      // The email has ONE row for every objection.
+      selector_objection: isF0Email ? null : f0.vars.formula === 'four_step' ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data'),
     };
     context.nurture_request = { workflow_code: request.workflow_code, sequence_position: request.sequence_position };
     // 2026-10-20: the Four-Step prompt reads {{lead.first_name}}; a couple's
     // field ("George/Paula") left it empty and the model guessed "Gorge".
-    if (f0.vars.formula === 'four_step' && !context.lead?.first_name && f0.vars.first_name) {
+    if ((f0.vars.formula === 'four_step' || isF0Email) && !context.lead?.first_name && f0.vars.first_name) {
       context.lead = { ...(context.lead || {}), first_name: f0.vars.first_name };
     }
     await stampSiroRecording(generation_id, f0.recordingId);
-    if (request.force_send !== true) {
-      const pd = postDemoInterrupt(f0.interruptInput);
+    let pd = request.force_send !== true ? postDemoInterrupt(f0.interruptInput) : null;
+    // The email is never written without the recording, force_send included:
+    // past the cap the workflow sends its fixed fallback template instead.
+    if (isF0Email && (request.force_send !== true || !f0.facts)) pd = emailGate({ pd, facts: f0.facts });
+    if (pd) {
       if (pd?.hold) {
         console.log(JSON.stringify({ level: 'info', type: 'intentional_suppression', status: 'suppressed_overlap', reason: pd.reason, workflow_code: request.workflow_code, sequence_position: request.sequence_position, ghl_contact_id: request.contact_id, generation_id, hold_h: pd.hold }));
         await updateStatus(generation_id, 'suppressed_overlap', pd.reason);
@@ -243,6 +270,9 @@ export async function runNurtureGeneration(request) {
         console.log(JSON.stringify({ level: 'info', type: 'intentional_suppression', status: 'suppressed_interrupt', reason: pd.suppress, terminal: pd.terminal, workflow_code: request.workflow_code, sequence_position: request.sequence_position, ghl_contact_id: request.contact_id, generation_id }));
         await updateStatus(generation_id, 'suppressed_interrupt', pd.suppress);
         await safeClearDrafts(request.contact_id, `interrupt:${pd.suppress}`);
+        // no_recording: the tag tells the workflow to send its fallback
+        // template. Added once (a contact that already has it is left alone).
+        if (pd.tag) await addTagOnce(request.contact_id, pd.tag, context, generation_id);
         return finishResponse(generation_id, false, pd.suppress, startedAt);
       }
     }
@@ -317,6 +347,13 @@ export async function runNurtureGeneration(request) {
 
   // Step 3 — select prompt (fall back to GENERIC if no specific match)
   let prompt = await selectPrompt(context, request);
+  // The email's row is seeded inactive: until it is switched on, position 0 is
+  // a quiet skip (no FALLBACK row, no error card) and the workflow goes on.
+  if (!prompt && isF0Email) {
+    await updateStatus(generation_id, 'suppressed_interrupt', 'email_prompt_inactive');
+    await safeClearDrafts(request.contact_id, 'email_prompt_inactive');
+    return finishResponse(generation_id, false, 'email_prompt_inactive', startedAt);
+  }
   if (!prompt) {
     prompt = await fetchFallbackPrompt(request.workflow_code, request.channel);
     if (!prompt) {
@@ -367,7 +404,7 @@ export async function runNurtureGeneration(request) {
   try {
     genResult = await generateNurtureContent(prompt, context);
     retryCount = genResult.generationRetries || 0;
-    if (isF0) genResult = { ...genResult, output: fourStepOutput(genResult.output, f0, request) };
+    if (isF0) genResult = { ...genResult, output: f0Output(genResult.output, f0, request) };
   } catch (err) {
     const genRetries = err.generationRetries || 1;
     await updateStatus(generation_id, 'failed_generation', err.message.slice(0, 200), genRetries);
@@ -399,10 +436,10 @@ export async function runNurtureGeneration(request) {
         ...prompt,
         system_prompt: prompt.system_prompt +
           `\n\nIMPORTANT: A previous attempt failed these safety checks: ${safety.failures.join(', ')}. Details: ${safety.details.join('; ')}. You MUST fix all of them in this attempt. These are non-negotiable compliance and trust requirements.` +
-          (safety.f0Failures?.length ? `\n\n${f0RetryNote(safety.f0Failures, { position: request.sequence_position })}` : ''),
+          (safety.f0Failures?.length ? `\n\n${f0RetryNote(safety.f0Failures, { position: request.sequence_position, formula: f0CheckFormula(f0, request) })}` : ''),
       };
       genResult = await generateNurtureContent(constrainedPrompt, context);
-      if (isF0) genResult = { ...genResult, output: fourStepOutput(genResult.output, f0, request) };
+      if (isF0) genResult = { ...genResult, output: f0Output(genResult.output, f0, request) };
       // Add any generation-internal retries from the safety-retry's
       // generate call on top of the safety retry itself.
       retryCount += genResult.generationRetries || 0;
@@ -434,13 +471,14 @@ export async function runNurtureGeneration(request) {
   }
 
   // F.0: the recording and the position ride in ai_msg_meta_json.
-  if (isF0) output = { ...output, extra_meta: { siro_recording_id: f0?.recordingId || null, position: request.sequence_position } };
+  if (isF0) output = { ...output, extra_meta: { siro_recording_id: f0?.recordingId || null, position: request.sequence_position, ...(isF0Email ? { workflow_code: F0_WORKFLOW, channel: 'email' } : {}) } };
 
   // Step 7 — writeback. Two paths:
   //   - SHADOW_MODE env flag → drafts only + approval card
   //   - else → full two-phase writeback (sends the email)
   try {
-    if (isShadowWorkflow(request.workflow_code)) {
+    // The email goes live on its own switch (the user, 2026-10-21).
+    if (isF0Email ? f0EmailShadow(process.env, SHADOW_MODE) : isShadowWorkflow(request.workflow_code)) {
       await writeDraftsOnly(request.contact_id, output, generation_id, 1.0);
       await markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution);
       if (isF0) {
@@ -513,18 +551,23 @@ export async function runNurtureGeneration(request) {
 function runOutputChecks(output, prompt, context, f0, request) {
   const safety = validateSafety(output, prompt, context);
   if (!f0) return safety;
-  const fourStep = f0.vars?.formula === 'four_step';
+  const formula = f0CheckFormula(f0, request);
+  const fourStep = formula === 'four_step';
+  const email = formula === 'email';
   const f0Failures = output?.four_step_invalid
     ? ['four_step_output']
-    : checkF0Copy(output?.sms_body, {
-      facts: f0.facts,
-      position: Number(request.sequence_position) || 1,
-      repFirstName: f0.vars?.rehash_rep_first_name || null,
-      formula: fourStep ? 'four_step' : 'v1',
-      slots: output?.four_step_slots || null,
-      firstName: (fourStep ? f0.vars?.first_name : null) || context?.lead?.first_name || null,
-      followupText: f0.vars?.followup_text_line ? f0.facts?.followup_text || null : null,
-    });
+    : output?.email_invalid
+      ? ['email_output']
+      : checkF0Copy(email ? output?.email_plain_body : output?.sms_body, {
+        facts: f0.facts,
+        position: email ? 0 : Number(request.sequence_position) || 1,
+        repFirstName: f0.vars?.rehash_rep_first_name || null,
+        formula,
+        slots: output?.four_step_slots || null,
+        firstName: ((fourStep || email) ? f0.vars?.first_name : null) || context?.lead?.first_name || null,
+        followupText: f0.vars?.followup_text_line ? f0.facts?.followup_text || null : null,
+        ...(email ? { subject: output?.subject || '', preheader: output?.preheader || '', ps: output?.ps_text || '' } : {}),
+      });
   if (!f0Failures.length) return safety;
   return {
     passed: false,
@@ -532,6 +575,30 @@ function runOutputChecks(output, prompt, context, f0, request) {
     details: [...safety.details, ...f0Failures.map(f => `F0:${f}`)],
     f0Failures,
   };
+}
+
+/** The checkF0Copy formula for an F.0 turn: the email, else the text formula. */
+function f0CheckFormula(f0, request) {
+  if (isF0EmailRequest(request)) return 'email';
+  return f0?.vars?.formula === 'four_step' ? 'four_step' : 'v1';
+}
+
+/** The F.0 output shape: the position-0 email, else the Four-Step text. */
+function f0Output(output, f0, request) {
+  return isF0EmailRequest(request) ? f0EmailOutput(output) : fourStepOutput(output, f0, request);
+}
+
+/** Add one tag unless the contact already carries it. Never throws. */
+async function addTagOnce(contactId, tag, context, generationId) {
+  const has = (context?.lead?.current_tags || []).some(t => String(t).toLowerCase() === tag);
+  if (has || !contactId) return;
+  try {
+    const { ghlFetch } = await import('../actions/helpers.js');
+    await ghlFetch('POST', `/contacts/${contactId}/tags`, { tags: [tag] });
+    console.log(`[NurtureOrch] ${generationId} tag ${tag} added to ${contactId}`);
+  } catch (err) {
+    console.warn(`[NurtureOrch] ${generationId} tag ${tag} failed for ${contactId}: ${err.message}`);
+  }
 }
 
 /**
@@ -595,6 +662,26 @@ export function buildF0ApprovalCard({ request, context, generationId, output, pr
   const first = lead.first_name || 'This lead';
   const phone = slackPhone(lead.phone);
   const loc = process.env.GHL_LOCATION_ID || '';
+  // 2026-10-21 (Mark): the position-0 email's card shows all four parts; the
+  // email's gate is "AI Msg Send Ready" (the texts' is "AI SMS Send Ready").
+  if (isF0EmailRequest(request)) {
+    return [
+      '✅ F.0 POST-DEMO EMAIL READY — please review (position 0, the evening of the demo)',
+      `${first}${phone ? ` · ${phone}` : ''} · ${prospectLabel(context?.lp?.prospect_id)}`,
+      `Prompt: ${prompt?.prompt_code || 'unknown'}`,
+      '',
+      `Subject: ${String(output?.subject || '').trim()}`,
+      `Preheader: ${String(output?.preheader || '').trim()}`,
+      '',
+      String(output?.email_plain_body || '').trim(),
+      ...(output?.ps_text ? ['', `P.S. ${String(output.ps_text).trim()}`] : []),
+      '',
+      recordingId ? `Visit: ${siroRecordingUrl(recordingId)}` : null,
+      loc ? `Contact: https://app.gohighlevel.com/v2/location/${loc}/contacts/detail/${request.contact_id}` : null,
+      'TO SEND: set "AI Msg Send Ready" = Yes on the contact in GHL. TO SKIP: leave it.',
+      `gen ${generationId}`,
+    ].filter(l => l !== null).join('\n');
+  }
   return [
     `✅ F.0 POST-DEMO TEXT READY — please review (position ${request.sequence_position} of 5)`,
     `${first}${phone ? ` · ${phone}` : ''} · ${prospectLabel(context?.lp?.prospect_id)}`,
@@ -1144,7 +1231,14 @@ export function registerNurtureRoutes(app) {
         return res.status(200).json({ error: "channel must be 'email', 'sms', or 'email+sms'", send_ready: false });
       }
 
-      const seqResolved = await resolveSequencePosition(body.contact_id, body.sequence_position);
+      // 2026-10-21 (Mark): position 0 is F.0's email and nothing else; any
+      // other caller asking for it is refused, 200 with the code (the user:
+      // GHL treats a non-200 as a failed step), before any read.
+      const allowZero = allowsPositionZero(body);
+      if (asksPositionZero(body.sequence_position) && !allowZero) {
+        return res.status(200).json({ error: 'unsupported_position', send_ready: false });
+      }
+      const seqResolved = await resolveSequencePosition(body.contact_id, body.sequence_position, { allowZero });
       console.log(`[NurtureOrch] seq_pos resolved=${seqResolved.position} source=${seqResolved.source} payload="${body.sequence_position ?? ''}"`);
 
       // v2.1: force_send is admin/test-only. Coerce true/false/"true"/"false"

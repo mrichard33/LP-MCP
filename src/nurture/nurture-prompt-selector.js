@@ -31,6 +31,9 @@ import supabase from '../supabase.js';
  */
 export function f0FormulaAllows(p, request, context) {
   if (request?.workflow_code !== 'F.0') return true;
+  // 2026-10-21 (Mark): the position-0 email has ONE prompt row that serves
+  // both text formulas; the formula only picks among the SMS rows.
+  if (p?.channel === 'email') return true;
   const fourStep = context?.siro?.formula === 'four_step';
   return fourStep ? Number(p?.version) === 2 : Number(p?.version ?? 1) !== 2;
 }

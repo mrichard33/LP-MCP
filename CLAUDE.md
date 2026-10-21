@@ -896,6 +896,51 @@ compared only with one that forced the same modes). Scenarios `rehash_if_i_could
 one variable each: `SIRO_FOLLOWUP_TEXT_MODE=off`, `REHASH_DEAL_HINT_MODE=once`, `HUMAN_TAKEOVER_MODE=off`,
 `SIRO_CONTEXT_MODE=shadow`, `F0_FORMULA_MODE=v1`.
 
+## F.0 v2 position 0: the post-demo email (Mark, 2026-10-21)
+
+The evening of an unsold demo, F.0 v2 sends ONE email written from the Siro recording as the rehash rep, before the
+texts, through the same `/api/agentic/nurture/generate` call (`workflow_code F.0`, `sequence_position 0`, `channel
+email`). It replaces the old static F.0 email ("What we saw at your home"); only its job carries over. One rule, one
+home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy checks are `checkF0Copy` formula `email`.
+- **Position 0 is F.0 by email only.** The route answers any other caller `200 { error: 'unsupported_position' }`
+  (never a 4xx: the user, 2026-10-21, GHL treats a non-200 as a failed step); the resolver takes 0 only when the
+  route allows it (`coerceSeqPos({ allowZero })`; before, a 0 silently became the field value or 1).
+- **No recording, no email.** The `awaiting_siro` hold is reused with a cap of `F0_EMAIL_HOLD_CAP_ET` (default 08:30 ET
+  the day after the demo's ET date, 2h steps, the last one shorter); past it `emailGate` suppresses `no_recording`,
+  clears the drafts and adds the tag `f0-no-recording` once, and the workflow sends its fixed fallback template. The
+  model is never called without a recording, `force_send` included. Every other suppression is as for the texts.
+- **The email**: the model fills the four Four-Step slots from `<visit_facts>` (which, for the email, also carries
+  `visited_by`, the sales rep who came out, and is built whatever `F0_FORMULA_MODE` says) and returns
+  `{ subject, preheader, body, ps, slots }`; `f0EmailOutput` turns the plain body into escaped `<p>` paragraphs for
+  `ai_email_body_draft` (S4.5's shape) and keeps the plain body for the checks. ONE prompt row,
+  `F.0-P0-email-V1` (`sql/seeds/2026-10-21_f0_v2_email_prompt.sql`, built by `scripts/build-f0-four-step-seed.mjs`,
+  seeded INACTIVE; `f0FormulaAllows` lets email rows through both formulas). An inactive row is a quiet
+  `email_prompt_inactive`, never the GroupMe no-prompt card.
+- **Checks (formula `email`)**: the first name first, "If I could" and the call invite naming the rehash rep as the
+  ONE question of the whole email (subject, preheader, body, P.S.), hesitation and reframe slots required and grounded,
+  subject ≤ 60, preheader ≤ 90 and not the first sentence, body 120–180 words; never money, offer talk or the word
+  "deal" (not even the hint), an exclamation, "founder", "your rep", the sales rep named twice or following up, a
+  footer / address / unsubscribe line, a sensitive detail, a quote of the rep or Siro's draft copied. No signature (the
+  template signs) and the thank-you opener is allowed. One re-write, then `suppressed_low_conf`: a quiet exit to
+  position 1, never a fixed email.
+- **The rehash rep is the follower, for every F.0 touch**: `resolveRehashRepFirst` (`f0-context.js`): `rehashRepFor`
+  (2026-10-15) → `REHASH_TEAM_USER_NAMES` / the GHL user, else the `rehash_rep_name` custom value, else "Reece Team".
+- **`F0_EMAIL_MODE` off|shadow|live, default shadow, decides the email ALONE** (the user, 2026-10-21: the email and the
+  texts go live independently): `F0_V2_MODE=off` and the global `NURTURE_SHADOW_MODE` still stop it, but the `F.0`
+  entry in `NURTURE_SHADOW_WORKFLOWS` governs the texts only. Shadow: drafts + an email card in #contact-rehash (all
+  four parts; approve with **AI Msg Send Ready = Yes**). Rollback: `F0_EMAIL_MODE=off`.
+- **Active-workflow guard, every nurture workflow** (`src/nurture/workflow-guard.js`): with `NURTURE_WORKFLOW_IDS`
+  ("F.0:<id>,S4.5:f99fba97-6d2f-4fd6-966c-b5e5e36f8938"; the S4.5 id the field holds in the HL mirror, the handoff's
+  "…8e7f2ff2e2bd" was a typo) a code with an entry is checked against the contact's Active Marketing Workflow ID
+  (`VFSNtEqSUh5yX7RyktBj`, `context.lead.active_marketing_workflow_id`: '' empty, null unreadable) right after the
+  context build, before the audit row: a mismatch, an empty field or an unreadable contact answers
+  `200 { error: 'wrong_active_workflow' }` and writes nothing; a code with no entry is not checked.
+- **A reply threads**: GHL keeps every email of a contact in one conversation, template sends included (15 of 15 S4.5
+  contacts, 2026-10-21), and `inboundReplyEmailId` answers with the lead's reply id. No change was needed.
+- GHL build and Railway steps: `docs/f0-v2-workflow-spec.md` ("Position 0"). Preview:
+  `siro_lead_presentation { preview_f0_position: 0, channel: 'email' }` (reads the inactive row, reports a hold or
+  `no_recording` without a model call). Tests: `scripts/test-f0-email.js`, `scripts/test-nurture-workflow-guard.js`.
+
 ## Revin: every text it sends or receives, one thread per contact (2026-10-19)
 
 Until now all we kept of Revin AI's texting was its ~160-character LP summary note (`note_origin = 'lp_revin'`, still
