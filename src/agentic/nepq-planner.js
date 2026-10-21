@@ -3025,7 +3025,11 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     // she can make it."), so the times and the question are missing (2026-10-03
     // logs). Its words stay, the reference's ask goes after them, and no
     // re-write is needed: a re-write cost 10-35s on SMS and often missed too.
-    if (failed.length) {
+    // 2026-10-21 (first live-build sim, REHASH_BOOKING_FIX_ENABLED): a booked
+    // rehash call's confirm is never glued after the model's own words ("You're
+    // all set, Monica. I'll call you soon. You're all set for today at 9:30 AM
+    // ET. …"): a draft that misses the time ships the confirm line alone.
+    if (failed.length && !(plan.rehash_fix && plan.step === 'rehash_confirm')) {
       const repaired = appendReferenceAsk(body, refLine, failed);
       if (repaired && !checkAgainstReference(repaired, refLine, refSlots, plan).length) {
         changes.push('reference_ask_appended');

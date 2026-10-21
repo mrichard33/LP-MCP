@@ -231,3 +231,11 @@ test('"Thursday afternoon" after our offer → two Thursday afternoon times', ()
   assert.equal(p.step, 'rehash_offer');
   assert.ok(p.slots_to_offer.every(x => x.dayOfWeek === 'Thursday'));
 });
+
+test('a booked call\'s confirm is never glued after the model\'s own words (first live-build sim)', () => {
+  const p = plan('9:30', [OFFER_B]);
+  assert.equal(p.step, 'rehash_confirm');
+  const e = enforceNepqPlan("You're all set, Pat. I'll call you soon.", p);
+  assert.equal(e.text, "You're all set for tomorrow at 9:30 AM ET. I'll call you at this number then.");
+  assert.ok(!e.changes.includes('reference_ask_appended'), e.changes.join());
+});
