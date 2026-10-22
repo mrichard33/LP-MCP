@@ -21,7 +21,8 @@
 -- (sql/011 and sql/014 are frozen history), so a re-ingest cannot bring the old text back.
 --
 -- HOW TO APPLY: run each statement on its own; each returns the row count it changed (expect 1) and is guarded so a
--- second run changes 0. The old text goes into metadata->'prior_text_2026_10_22'.
+-- second run changes 0. The MCP query tool refuses a data-modifying WITH: there, run the inner UPDATE and read the
+-- check at the bottom (applied 2026-10-22, all five rewritten). The old text goes into metadata->'prior_text_2026_10_22'.
 --
 -- AFTER APPLYING:
 --   POST /n8n/kb/reembed {"chunk_ids": [3249, 3254, 3255, 3275, 3276]}
@@ -37,11 +38,13 @@
 WITH u AS (
   UPDATE kb_embeddings SET
     metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('prior_text_2026_10_22', chunk_text),
+    -- The labels (TRIGGERS, NOTES) are followed by a private-use character from the PDF ingest, so match the text
+    -- after them, never the label.
     chunk_text = replace(replace(chunk_text,
-        $t$TRIGGERS "renting," "not the owner," "landlord," "apartment," "lease"$t$,
-        $t$TRIGGERS "I'm renting," "not the owner," "my landlord," "my apartment," "my lease"$t$),
-        $t$NOTES Leave door open for future homeownership.$t$,
-        $t$NOTES Leave door open for future homeownership. Only for someone who rents the home they live in. An owner
+        $t$"renting," "not the owner," "landlord," "apartment," "lease"$t$,
+        $t$"I'm renting," "not the owner," "my landlord," "my apartment," "my lease"$t$),
+        $t$Leave door open for future homeownership.$t$,
+        $t$Leave door open for future homeownership. Only for someone who rents the home they live in. An owner
 who rents the home OUT to tenants is not a renter: a normal lead (the user, 2026-10-20).$t$)
   WHERE active AND id = 3275
     AND chunk_text LIKE $t$%"not the owner," "landlord," "apartment,"%$t$
