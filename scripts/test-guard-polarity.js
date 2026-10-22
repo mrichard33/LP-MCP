@@ -108,6 +108,16 @@ export const CASES = [
     },
   },
   {
+    // investment_owner chat, 2026-10-22: a phone ask written with "." on a
+    // discovery turn got a second question appended to it.
+    guard: 'enforceNepqPlan (discovery turn: one question, no detail ask)',
+    mustChange: () => {
+      const r = enforceNepqPlan("For a flip, we can handle that. Let me get someone from our team to walk through the details with you. What's the best number to reach you on.", { required_move: 'consequence', recent_outbound: [], booking: { allowed: false } });
+      return (r.text.match(/\?/g) || []).length === 1 && !/number|someone/i.test(r.text);
+    },
+    mustPass: () => enforceNepqPlan('Got it. How long has that been going on?', { required_move: 'consequence', recent_outbound: [], booking: { allowed: false } }).text === 'Got it. How long has that been going on?',
+  },
+  {
     guard: 'enforceSignOff',
     mustChange: () => enforceSignOff("Sounds good, Erica. We'll have someone from our team give you a call when it's a better time.", { inbound: 'I can call back when I have more time. Ty' }).changed === true,
     mustPass: () => enforceSignOff('Thanks. Someone from our team will give you a call tomorrow.', { inbound: 'Have a good day' }).changed === false,
