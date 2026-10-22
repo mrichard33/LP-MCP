@@ -7,8 +7,12 @@
  * appointment to LP reality. The estimate appointment may live on any of the
  * three in-home calendars — Window Estimate, Measurement Verification, or
  * Home Protection Assessment (MV and HPA are just different names for the
- * WE) — and is reconciled in place wherever it lives; new appointments are
- * always created on the WE calendar. LP IS THE AUTHORITY here, which is why
+ * WE) — and is reconciled in place wherever it lives. NEW appointments go on
+ * the calendar the contact's tags pick (inHomeCalendarFor): Measurement
+ * Verification for an estimate-calculator lead (Mark, 2026-10-02 / 2026-10-22:
+ * Joie Ritger 693j3LxrjTSqZKoIdoTV, set by the call center in LP, landed on WE
+ * while the bot books calculator leads on MV), Window Estimate for everyone
+ * else. LP IS THE AUTHORITY here, which is why
  * this module exists instead of reusing book_appointment /
  * update_appointment_status:
  *
@@ -50,7 +54,9 @@ import { claimAppointmentCreate, releaseAppointmentCreate } from './appointment-
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { getContactCached } from '../actions/contact-cache.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
-import { BOOKING_CALENDARS, isInHomeCalendarId, isGhlOnlyCalendarId } from '../knowledge/booking-calendar-router.js';
+import {
+  BOOKING_CALENDARS, isInHomeCalendarId, isGhlOnlyCalendarId, inHomeCalendarFor, calendarNameForKey,
+} from '../knowledge/booking-calendar-router.js';
 import { syncCancelledAppointmentState } from '../actions/handlers/appointment-field-sync.js';
 import { lpWallClockToGhlStartTime, wallClockToIso } from '../appointment-dates.js';
 // NOTE: slot-check.js imports normalizeGhlStartTime from THIS module, so this
@@ -67,7 +73,8 @@ export const WINDOW_ESTIMATE_CALENDAR_ID = BOOKING_CALENDARS.WINDOW_ESTIMATE;
 // Measurement Verification and Home Protection Assessment are just different
 // names for the Window Estimate: the lead's estimate appointment may live on
 // any of the three in-home calendars. Reconciliation targets the pool; NEW
-// appointments are always created on the WE calendar. (Deliberately an
+// appointments are created on MV for a calculator lead and on WE for everyone
+// else (resolveCreateCalendar, 2026-10-22). (Deliberately an
 // explicit list, not isInHomeCalendarId: a future in-home calendar should
 // not silently join the pool.)
 export const ESTIMATE_CALENDAR_IDS = new Set([
@@ -104,14 +111,14 @@ export function etHourFromStartTime(startTime) {
 // "A team member needs to be selected"). Every WE appointment since July 1
 // (607/607 in the HL mirror) is assigned to this house booking account, so
 // creates default to it; env-overridable without a deploy.
-const DEFAULT_ASSIGNED_USER_ID =
+export const DEFAULT_ASSIGNED_USER_ID =
   process.env.LP_GHL_SYNC_ASSIGNED_USER_ID || '3K6HtoPyBLWeQrrnSnCD';
 
 // Full set from handlers/appointments.js (not exported there). Required here:
 // fetchUpcomingAppointments filters only cancelled/noshow/no-show, so
 // 'canceled', 'no_show' and 'invalid' leak through — without this re-filter a
 // Set would reschedule a dead appointment and a Cnf would resurrect it.
-const NON_ACTIVE_APPOINTMENT_STATUSES = new Set([
+export const NON_ACTIVE_APPOINTMENT_STATUSES = new Set([
   'cancelled', 'canceled', 'no_show', 'noshow', 'no-show', 'invalid',
 ]);
 
@@ -340,7 +347,22 @@ async function contactHasConsentBlock(contactId, contactCache) {
 }
 
 /**
- * Reconcile the GHL Window Estimate calendar to one lp_leads row.
+ * The calendar a NEW estimate appointment goes on, from the contact's tags
+ * (the same router the bot books with). A failed contact read falls back to
+ * Window Estimate: a wrong-calendar visit can be moved, a missing one cannot.
+ */
+async function resolveCreateCalendar(contactId, contactCache) {
+  try {
+    const contact = await getContactCached(contactId, contactCache);
+    return inHomeCalendarFor(Array.isArray(contact?.tags) ? contact.tags : []);
+  } catch (err) {
+    console.warn(`[LpGhlApptSync] contact read failed for ${contactId}, creating on Window Estimate: ${err.message}`);
+    return { calendar_id: WINDOW_ESTIMATE_CALENDAR_ID, calendar_key: 'WINDOW_ESTIMATE', reason: 'contact_read_failed' };
+  }
+}
+
+/**
+ * Reconcile the GHL estimate calendars to one lp_leads row.
  *
  * The `lead` row is INJECTED (no supabase read here) so the caller controls
  * freshness and tests run with supabase unset.
@@ -359,6 +381,8 @@ async function contactHasConsentBlock(contactId, contactCache) {
 export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null, toNotify = true, contactCache, dryRun = false }) {
   if (!contactId) throw new Error('reconcileLpAppointmentToGhl: contactId is required');
   if (!lead) throw new Error('reconcileLpAppointmentToGhl: lead row is required');
+  // One contact read serves both the consent guard and the create calendar.
+  contactCache = contactCache || new Map();
 
   const kind = classifyDisposition(lead.disposition_code, { confirmed: lpConfirmedFlag(lead, live) });
   // Cancel keeps reading the row (it only needs to know there was one); Set and
@@ -526,6 +550,8 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
     // otherwise read "no appointment" and POST a duplicate. FAIL-OPEN (see the
     // claim service): a claim infra error never strands a legitimate booking.
     const slotMs = Date.parse(startTime);
+    const target = await resolveCreateCalendar(contactId, contactCache);
+    const calendarId = target.calendar_id;
 
     // Slot-uniqueness gate. This path's own lookup above is scoped to the
     // ESTIMATE CALENDAR POOL, so it cannot see a slot already held by I.LP-IN
@@ -536,11 +562,11 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
     // failed lookup rather than booking blind).
     if (isSlotCheckEnabled()) {
       const check = await findExistingAppointment({
-        contactId, calendarId: WINDOW_ESTIMATE_CALENDAR_ID, startTime,
+        contactId, calendarId, startTime,
       });
       if (check.outcome === 'match') {
         void emitSlotCheckEvent('noop_already_exists', {
-          contactId, calendarId: WINDOW_ESTIMATE_CALENDAR_ID, startTime,
+          contactId, calendarId, startTime,
           matched: check.appointment,
           extra: { caller: 'rule', site: 'reconcileLpAppointmentToGhl' },
         });
@@ -548,7 +574,7 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
       }
       if (check.outcome === 'error') {
         void emitSlotCheckEvent('query_failed', {
-          contactId, calendarId: WINDOW_ESTIMATE_CALENDAR_ID, startTime, matched: null,
+          contactId, calendarId, startTime, matched: null,
           extra: { caller: 'rule', site: 'reconcileLpAppointmentToGhl', reason: check.reason },
         });
         throw new Error(`slot check failed before create: ${check.reason}`);
@@ -561,12 +587,12 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
     }
     try {
       const body = {
-        calendarId: WINDOW_ESTIMATE_CALENDAR_ID,
+        calendarId,
         locationId: GHL_LOCATION_ID,
         contactId,
         startTime,
         endTime: endTimeFor(startTime),
-        title: 'Window Estimate',
+        title: calendarNameForKey(target.calendar_key) || 'Window Estimate',
         appointmentStatus: plan.status,
         assignedUserId: DEFAULT_ASSIGNED_USER_ID,
         toNotify,
@@ -580,16 +606,20 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, live = null
       const appointmentId = res?.id || res?.appointment?.id || null;
       if (!appointmentId) console.warn(`[LpGhlApptSync] POST created appointment for ${contactId} but no id in response`);
       void emitSlotCheckEvent('created', {
-        contactId, calendarId: WINDOW_ESTIMATE_CALENDAR_ID, startTime, matched: null,
+        contactId, calendarId, startTime, matched: null,
         extra: {
           caller: 'rule',
           site: 'reconcileLpAppointmentToGhl',
           appointmentId,
           resolved_title: fmt.title,
+          calendar_reason: target.reason,
           address_populated: fmt.addressPopulated,
         },
       });
-      return { ...base, outcome: 'created', appointment_id: appointmentId, new_status: plan.status };
+      return {
+        ...base, outcome: 'created', appointment_id: appointmentId, new_status: plan.status,
+        calendar_id: calendarId, calendar_reason: target.reason,
+      };
     } catch (err) {
       // Release the claim so the executor's retry (or a sibling action) can
       // re-attempt — a failed create must not leave the slot claimed for the TTL.

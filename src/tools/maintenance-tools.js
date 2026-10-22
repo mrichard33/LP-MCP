@@ -45,6 +45,12 @@
  *                              "remove the routing and account numbers that were
  *                              already entered"). Counts only, never a number;
  *                              dry run by default. Original PDFs are kept.
+ *
+ *   calculator_appt_move_run   (2026-10-22) moves calculator leads' upcoming
+ *                              Window Estimate visits to Measurement Verification
+ *                              in place (src/admin/move-calculator-appts.js; the
+ *                              LP→GHL sync used to create them all on WE). Same
+ *                              background job pattern; preview by default.
  */
 import { z } from 'zod';
 
@@ -168,6 +174,31 @@ export function makeGhlAttributionCleanupRun(deps = {}) {
   };
 }
 
+export function makeCalculatorApptMoveRun(deps = {}) {
+  const {
+    run = async (opts) => {
+      const mod = await import('../admin/move-calculator-appts.js');
+      return mod.runCalculatorApptMove(opts, await mod.defaultDeps());
+    },
+  } = deps;
+  return async ({ job_id = null, dry_run = true, contact_ids = [] } = {}) => {
+    if (job_id) {
+      const job = cleanupJobs.get(job_id);
+      return job ? { ok: true, ...job } : { ok: false, error: 'job_not_found (jobs live in memory; a deploy clears them)' };
+    }
+    const id = `calcmove_${Date.now().toString(36)}`;
+    const job = { job_id: id, status: 'running', dry_run: dry_run !== false, started_at: new Date().toISOString(), report: null, error: null };
+    cleanupJobs.set(id, job);
+    while (cleanupJobs.size > 20) cleanupJobs.delete(cleanupJobs.keys().next().value);
+    Promise.resolve()
+      .then(() => run({ dryRun: dry_run !== false, contactIds: contact_ids }))
+      .then((report) => { job.report = report; job.status = 'completed'; })
+      .catch((err) => { job.error = String(err?.message || err).slice(0, 500); job.status = 'failed'; })
+      .finally(() => { job.completed_at = new Date().toISOString(); });
+    return { ok: true, job_id: id, dry_run: dry_run !== false, next_step: 'Call again with this job_id for the report.' };
+  };
+}
+
 export function makeInvoiceBankRedactRun(deps = {}) {
   const { load = () => import('../marketing/bank-redact-backfill.js'), backfillDeps = {} } = deps;
   return async ({ dry_run = true } = {}) => {
@@ -177,6 +208,21 @@ export function makeInvoiceBankRedactRun(deps = {}) {
 }
 
 export function registerMaintenanceTools(server, deps = {}) {
+  server.tool(
+    'calculator_appt_move_run',
+    'One-time move (2026-10-22): estimate-calculator leads whose upcoming visit the LP→GHL sync created on Window '
+      + 'Estimate are moved IN PLACE to Measurement Verification (one PUT: same time and status, toNotify false; never a '
+      + 'cancel and rebook), each read back; stops at the first failure. A contact that already has an active MV visit '
+      + 'is listed, never touched. Preview by default (writes nothing). Runs in the background: the first call returns '
+      + 'job_id; call again with job_id for the report.',
+    {
+      job_id: z.string().optional().describe('return the report of an earlier run'),
+      dry_run: z.boolean().optional().default(true).describe('true (default) previews only; false moves the appointments'),
+      contact_ids: z.array(z.string()).optional().default([]).describe('only these GHL contacts (default: every calculator-tagged contact)'),
+    },
+    async (args) => text(await makeCalculatorApptMoveRun(deps)(args)),
+  );
+
   server.tool(
     'invoice_bank_redact_run',
     'Erase bank routing and account numbers already saved with marketing invoices (the user, 2026-10-19): the stored '
