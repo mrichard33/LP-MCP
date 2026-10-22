@@ -14,7 +14,7 @@ import { selectPrompt } from '../nurture/nurture-prompt-selector.js';
 import { generateNurtureContent } from '../nurture/nurture-generator.js';
 import { applyAutofix } from '../nurture/nurture-autofix.js';
 import { validateSafety } from '../nurture/nurture-safety-validator.js';
-import { loadF0Context } from './f0-context.js';
+import { loadF0Context, applyGreetingName } from './f0-context.js';
 import { postDemoInterrupt } from './f0-interrupts.js';
 import { checkF0Copy, f0RetryNote } from './f0-copy-checks.js';
 import { parseFourStepOutput, dropTrailingSignature, FOUR_STEP_WAIT_HOURS } from './f0-four-step.js';
@@ -38,10 +38,8 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
   const fourStep = !email && f0.vars.formula === 'four_step';
   context.siro = { ...f0.vars, selector_objection: email ? null : fourStep ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data') };
   context.nurture_request = { workflow_code: 'F.0', sequence_position: pos };
-  // 2026-10-20: as the orchestrator: a couple's first person for {{lead.first_name}}.
-  if ((fourStep || email) && !context.lead?.first_name && f0.vars.first_name) {
-    context.lead = { ...(context.lead || {}), first_name: f0.vars.first_name };
-  }
+  // As the orchestrator: the cleaned greeting name for {{lead.first_name}} (2026-10-20, 2026-10-22).
+  applyGreetingName(context, f0, { fourStep, email });
   let interrupt = postDemoInterrupt(f0.interruptInput);
   if (email) {
     interrupt = emailGate({ pd: interrupt, facts: f0.facts });
@@ -64,7 +62,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
       const safety = validateSafety(out, p, context);
       const f0Failures = out.email_invalid ? ['email_output'] : checkF0Copy(out.email_plain_body, {
         facts: f0.facts, position: pos, repFirstName: f0.vars.rehash_rep_first_name, formula: 'email',
-        slots: out.four_step_slots, firstName: f0.vars?.first_name || context?.lead?.first_name || null,
+        slots: out.four_step_slots, firstName: f0.vars?.first_name || null,
         followupText: f0.vars.followup_text_line ? f0.facts?.followup_text || null : null,
         subject: out.subject, preheader: out.preheader, ps: out.ps_text,
       });
@@ -79,7 +77,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
     const safety = validateSafety(out, p, context);
     const f0Failures = invalid ? ['four_step_output'] : checkF0Copy(out?.sms_body, {
       facts: f0.facts, position: pos, repFirstName: f0.vars.rehash_rep_first_name,
-      formula: fourStep ? 'four_step' : 'v1', slots, firstName: (fourStep ? f0.vars?.first_name : null) || context?.lead?.first_name || null,
+      formula: fourStep ? 'four_step' : 'v1', slots, firstName: fourStep ? (f0.vars?.first_name || null) : (context?.lead?.first_name || null),
       followupText: f0.vars.followup_text_line ? f0.facts?.followup_text || null : null,
     });
     return { out, safety, f0Failures, slots };

@@ -56,6 +56,33 @@ export function postDemoStopFrom({ conversation = [], tags = [] } = {}) {
   return !list.slice(stopAt + 1).some(m => !isOutbound(m) && /\?/.test(textOf(m)));
 }
 
+/**
+ * The first name an F.0 touch may greet, or '' (2026-10-22, the live preview's
+ * "Hi A,"): GHL held the first name "a" (LP: "AJ / Anita"), and any non-empty
+ * GHL name won, so the email and its subject opened on a lone initial. A
+ * couple's field keeps its first person (firstPersonName); a first word of
+ * fewer than two letters ("a", "A.", "a j") is no name; two or three capitals
+ * typed as the name ("AJ") stay as typed rather than becoming "Aj". Pure.
+ */
+export function greetingName(raw) {
+  const person = firstPersonName(raw);
+  const firstWord = person.split(/\s+/)[0] || '';
+  if (firstWord.replace(/[^\p{L}]/gu, '').length < 2) return '';
+  const typed = String(raw || '').split(/\/|&|\+|\s+and\s+/i)[0].trim();
+  if (/^\p{Lu}{2,3}$/u.test(typed)) return typed;
+  return person;
+}
+
+/**
+ * The prompt reads {{lead.first_name}}, so an F.0 touch that opens on a name
+ * (Four-Step texts, the email) greets the cleaned name or none at all, never
+ * the raw field. Mutates context.lead; a no-op for v1 texts.
+ */
+export function applyGreetingName(context, f0, { fourStep = false, email = false } = {}) {
+  if (!(fourStep || email) || !f0?.vars || f0.vars.first_name === undefined) return;
+  context.lead = { ...(context.lead || {}), first_name: f0.vars.first_name || '' };
+}
+
 /** The lead texted after our last F.0 touch. Pure. */
 export function repliedSince({ conversation = [], lastTouchAt = null } = {}) {
   const t = Date.parse(lastTouchAt || '');
@@ -223,13 +250,14 @@ export async function loadF0Context(context, request, { env = process.env, deps 
     // 2026-10-20: the formula opens on the first name. A couple's field
     // ("George/Paula") is no name to the reply writer, so it is read here and
     // its first person used; with none at all the text opens without a name.
-    // A linked test contact's name is its own, never the real lead's.
-    let firstName = lead.first_name || '';
+    // A linked test contact's name is its own, never the real lead's. A lone
+    // initial in GHL is no name: LP's lead is read instead (greetingName).
+    let firstName = greetingName(lead.first_name);
     if (!firstName && demoLeadId && !testLink) {
       firstName = await safe('lp_leads first_name', async () => {
         const { data, error } = await supabase.from('lp_leads').select('first_name').eq('lp_lead_id', demoLeadId).limit(1);
         if (error) throw new Error(error.message);
-        return firstPersonName(data?.[0]?.first_name);
+        return greetingName(data?.[0]?.first_name);
       }, '');
     }
     vars.first_name = firstName || '';

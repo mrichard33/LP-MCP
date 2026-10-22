@@ -923,6 +923,11 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   footer / address / unsubscribe line, a sensitive detail, a quote of the rep or Siro's draft copied. No signature (the
   template signs) and the thank-you opener is allowed. One re-write, then `suppressed_low_conf`: a quiet exit to
   position 1, never a fixed email.
+- **The greeting name is cleaned, never the raw field (2026-10-22).** The live preview opened "Hi A," because GHL's
+  first name was "a" (LP: "AJ / Anita") and any non-empty GHL name won. `greetingName` (`f0-context.js`): a couple's first
+  person, a first word under two letters is no name (then LP's lead, then none), two or three typed capitals stay ("AJ");
+  `applyGreetingName` puts the result (even '') in `{{lead.first_name}}` for the email and Four-Step texts, in the
+  orchestrator and the preview alike. A misspelled GHL name ("gorge") is a data fix in GHL, not a guess in code.
 - **The rehash rep is the follower, for every F.0 touch**: `resolveRehashRepFirst` (`f0-context.js`): `rehashRepFor`
   (2026-10-15) → `REHASH_TEAM_USER_NAMES` / the GHL user, else the `rehash_rep_name` custom value, else "Reece Team".
 - **`F0_EMAIL_MODE` off|shadow|live, default shadow, decides the email ALONE** (the user, 2026-10-21: the email and the
@@ -1485,6 +1490,13 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   after Outlook's per-send noise is stripped (`bodyShaText`: `[cid:…]`, safe-links), and after analysis
   `findDuplicateInvoice` drops a document whose invoice number AND total match an existing one (unless both vendors are
   known and differ; a rejected one never counts), remembered as `duplicate_invoice` in `marketing_invoice_skips`.
+- **A newer version asks before it replaces (the user, 2026-10-22).** The same vendor and invoice number with a
+  DIFFERENT total is a newer version (`findEarlierVersion`, never a rejected or already-replaced one): its card leads
+  with "Newer version of invoice #N … original $X, this one $Y (±$Z). Should this version replace the original?",
+  the button reads **Approve & replace**, flag `newer_version_of_invoice` (never auto-approved), and the original's
+  card gets one thread reply (`newerVersionThreadNote`). Approving it supersedes the original's lines whether they were
+  approved or still in review (`replaceEarlierInvoice`), redraws the original card as ♻️ replaced (no buttons) and
+  replies in its thread; Reject keeps the original. The same total is still a copy (above) and never asks.
 - **Nothing sits on the Failed list (the user, 2026-10-13).** A failure a retry cannot fix removes the document and its
   rows (`removeDocument`) and posts one line naming the file and the error; a service outage keeps the row for n8n's
   retry, and `purgeStaleFailedDocuments` (nightly) removes one still failed a day later, with one line.
@@ -2066,7 +2078,12 @@ rent my rent is $589" read as nothing). A renter or a commercial block plans `no
 `no_question` on EVERY turn (`openingsGate`, and `gateForStage` before its time-offer check), so `discovery_question_added`
 never glues a question after the no. Data: `sql/seeds/2026-10-20_owners_of_rentals_welcome.sql` (LIB-P16, the scope proof
 points, the RENTER handler's keywords, which matched a landlord's "rent" / "landlord"). Gate scenarios `landlord_lead` and
-`investment_owner` replace `landlord`.
+`investment_owner` replace `landlord`. **The model's own turn-away of an owner is corrected in code (2026-10-22).** The
+live chat told `landlord_lead` "We work with homeowners on their primary residences … it wouldn't be the right fit for
+us"; no prompt said it. `fixClaims` rule `owner_rental_declined` (`job-scope.js`: "primary residence", "a home you live
+in", or a rental word with a turn-away in one sentence) becomes "We work with homeowners, and that includes homes you rent
+out."; it is skipped when the lead rents (`homeownerFromThread` 'no'), so `TENANT_LINE` stands. The scorer's
+`owner_declined` reads the same words (`SCORING_VERSION` 2026-10-22.1).
 
 **No rentals, no commercial, a three-opening minimum, impact only (the user, 2026-10-13; rentals and investments
 superseded 2026-10-20, above).** A landlord was booked like
