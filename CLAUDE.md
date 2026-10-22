@@ -899,8 +899,8 @@ one variable each: `SIRO_FOLLOWUP_TEXT_MODE=off`, `REHASH_DEAL_HINT_MODE=once`, 
 ## F.0 v2 position 0: the post-demo email (Mark, 2026-10-21)
 
 The evening of an unsold demo, F.0 v2 sends ONE email written from the Siro recording as the rehash rep, before the
-texts, through the same `/api/agentic/nurture/generate` call (`workflow_code F.0`, `sequence_position 0`, `channel
-email`). It replaces the old static F.0 email ("What we saw at your home"); only its job carries over. One rule, one
+texts, through the same `/api/agentic/nurture/generate` call (`workflow_code F.0`, `channel email`, internal position 0,
+which the workflow sends as 1 since 2026-10-21, below). It replaces the old static F.0 email ("What we saw at your home"); only its job carries over. One rule, one
 home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy checks are `checkF0Copy` formula `email`.
 - **Position 0 is F.0 by email only.** The route answers any other caller `200 { error: 'unsupported_position' }`
   (never a 4xx: the user, 2026-10-21, GHL treats a non-200 as a failed step); the resolver takes 0 only when the
@@ -937,9 +937,30 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   `200 { error: 'wrong_active_workflow' }` and writes nothing; a code with no entry is not checked.
 - **A reply threads**: GHL keeps every email of a contact in one conversation, template sends included (15 of 15 S4.5
   contacts, 2026-10-21), and `inboundReplyEmailId` answers with the lead's reply id. No change was needed.
-- GHL build and Railway steps: `docs/f0-v2-workflow-spec.md` ("Position 0"). Preview:
-  `siro_lead_presentation { preview_f0_position: 0, channel: 'email' }` (reads the inactive row, reports a hold or
+- GHL build and Railway steps: `docs/f0-v2-workflow-spec.md` ("Position 1"). Preview:
+  `siro_lead_presentation { preview_f0_position: 1 }` (reads the inactive row, reports a hold or
   `no_recording` without a model call). Tests: `scripts/test-f0-email.js`, `scripts/test-nurture-workflow-guard.js`.
+- **The workflow numbers from 1: email = 1, texts = 2-6 (the user, 2026-10-21).** GHL saves a numeric field set to 0 as
+  blank: the first test's "Update Pre-send Fields" set 0 and the generate call got an empty position, so the email ran
+  as text 1. `f0InternalPosition` (`f0-email.js`) maps the GHL number ONCE, in the generate route, before anything
+  else reads it: email 1 → 0, sms 2..6 → 1..5, a legacy email 0 → 0 (`[F0] legacy position 0`), anything else
+  `200 { error: 'unsupported_position' }`. Inside LP-MCP the email is still 0 and the texts 1-5 (prompt rows,
+  `FOUR_STEP_WAIT_HOURS`, the P1-P5 rules, P5 terminal); the route sets `request.ghl_position`.
+  `agentic_messages.sequence_position` stores the GHL number, `generated_meta.internal_position` the inside one; S4.5 and
+  every other workflow keep their own numbering. The preview takes the GHL number (`numbering: 'internal'` keeps the old
+  0-5 for one release). hold-complete passes the number through and the engagement route keys on the generation id.
+- **F.0 can be tested on a test contact (the user, 2026-10-21).** The first test linked Mark Test to Mr. Jackson's visit by
+  hand (a cloned `siro_recordings` row and a hand-made `rehash_stage` row); the rehash sweep closed the stage because Mark
+  Test's own LP lead is 'Data', and every call after it was `rehash_ended`. `F0_TEST_LINKS` ("testContactId:realLpLeadId,…",
+  empty = off; registered in the mode registry) + the tag `aios-test` (`testLinkFor`, `src/siro/f0-test-link.js`; both
+  required, never throws): `loadF0Context` reads the linked lead's Siro rows only (no ensure, no rehash_stage, no
+  lp_leads), the demo is always now − 2h, the interrupts read unsold post-demo in rehash with no newer lead, appointment
+  or note DQ, sold only by the test contact's own `deal-won`, the first name is the test contact's; `siroForContext`
+  reads the same visit on the reply path; the rehash sweep skips every listed contact (`testLinkedContactIds`);
+  `isShadowTurn` makes it LIVE for F.0 whatever the F.0 shadow settings (`F0_V2_MODE=off`, `F0_EMAIL_MODE=off` and the
+  global `NURTURE_SHADOW_MODE` still stop it); its cards start "TEST —" and its rows carry `generated_meta.test_link`.
+  Nothing is ever written to, sent to, tagged on or carded for the linked lead. Never hand-make a `siro_recordings` or
+  `rehash_stage` row for a test again. Tests: `scripts/test-f0-positions.js`, `scripts/test-f0-test-link.js`.
 
 ## Revin: every text it sends or receives, one thread per contact (2026-10-19)
 

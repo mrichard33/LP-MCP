@@ -8,6 +8,23 @@ email, and F.0's own trigger, follower step and pause gate. LP-MCP writes every
 text from the Siro recording of the visit, as the rehash rep; the workflow only
 waits, gates and sends.
 
+## Positions (the user, 2026-10-21)
+
+GHL saves a numeric custom field set to 0 as BLANK, so the workflow numbers from 1.
+On 2026-10-21 "Update Pre-send Fields" set the position to 0 and the generate call
+got an empty position: the email was treated as text position 1. The workflow
+sends the GHL number; LP-MCP maps it once (`f0InternalPosition`, `src/siro/f0-email.js`).
+
+| What | `AI Msg Sequence Position` (GHL sends) | Inside LP-MCP | `channel` |
+|---|---|---|---|
+| The post-demo email | **1** | 0 | `email` |
+| Text 1 … text 5 | **2, 3, 4, 5, 6** | 1 … 5 (6 is terminal) | `sms` |
+
+Anything else for F.0 (a text at 1, the email at 2, a 7) answers
+`{ error: 'unsupported_position' }`, HTTP 200. A bare 0 by email still works
+(logged `[F0] legacy position 0`). `agentic_messages.sequence_position` stores the
+GHL number; `generated_meta.internal_position` the inside one.
+
 ## Steps
 
 1. **Trigger**: as F.0 today (P1 stage → "7. Appointment Completed", and the
@@ -16,16 +33,21 @@ waits, gates and sends.
    workflows, **Add to Workflow "Assign Rehash Team to Lead"** (the rep as
    follower), the rep display name, `stage:post-appointment`. Keep the won guard
    (→ C.0) and the objection pre-check only if you still want O.0 to run first.
-2. **Init**: `AI Msg Sequence Position` (`ai_msg_sequence_position`) = 1 when empty.
-   The workflow owns this field, as in S4.5; LP-MCP never writes it.
+2. **Init** ("SMS START – Set Position 2", renamed from "… Set Position 1"):
+   `AI Msg Sequence Position` (`ai_msg_sequence_position`) = **2**. The workflow owns
+   this field, as in S4.5; LP-MCP never writes it, and it is never 0.
 3. **First wait**: until **09:30 ET the next calendar day** (ruling 2 below). A
    6 PM demo texts the next morning; Siro has processed the recording by then.
+   On 2026-10-21 "Wait 1 Hour (Until 9:30 AM)" released at 8:50 PM: confirm its
+   advanced window resumes only 9:30–9:45 AM; if it still releases early, replace
+   it with "Wait until 9:30 AM next day".
 4. **Reset Send Gate**: `AI SMS Send Ready` = No.
 5. **Webhook POST** `https://lp-mcp-production.up.railway.app/api/agentic/nurture/generate`
    - header `Authorization: Bearer <MESSAGE_ENGINE_TOKEN>` (the same value S4.5 uses)
    - body / custom data: `contact_id = {{contact.id}}`, `workflow_code = F.0`,
-     `sequence_position = {{contact.ai_msg_sequence_position}}`, `channel = sms`
-6. **Hold branch**: if `Hold Dynamic Wait Hours` (`hold_dynamic_wait_hours`) has a
+     `sequence_position = {{contact.ai_msg_sequence_position}}` (2-6), `channel = sms`
+6. **Hold branch**: if **Next Wait Hours** (`MZkFWOFDzf8OKTy2O4od`, merge tag
+   `{{contact.next_wait_hours}}`; LP-MCP's key `hold_dynamic_wait_hours`) has a
    value → clear it → wait that many hours → POST
    `/api/agentic/hold-complete` with `{ contact_id, return_to: "f0_v2", refire: false,
    sequence_position, workflow_code: "F.0" }` → **go to step 4**. The generate
@@ -43,13 +65,13 @@ waits, gates and sends.
      day, or stuck: same as S4.5's stuck branch (internal notification to Mark,
      tag `f0-stuck`, exit).
 8. **Send SMS** `{{contact.ai_sms_body_draft}}` from the same number F.0 uses today
-   (727-800-4578, the rehash line).
+   (727-474-8052, the rehash line).
 9. **Webhook POST** `https://lp-mcp-production.up.railway.app/api/agentic/messages/engagement`
    with `generation_id = {{contact.ai_msg_generation_id}}`, `event = sms_sent`
    (the engagement route; note the path is `/messages/engagement`, not `/nurture/engagement`).
 10. **Pause gate** (existing "Pause Workflow Active?"): a reply parks the contact;
     the reply path owns the conversation (it reads the same Siro visit).
-11. **Wait** `{{contact.ai_msg_next_wait_hours}}` hours. `0` → exit (position 5 is terminal).
+11. **Wait** `{{contact.ai_msg_next_wait_hours}}` hours. `0` → exit (position 6, the fifth text, is terminal).
 12. **Update** `AI Msg Sequence Position` + 1, clear the previous message values,
     and **Fire Self for Next Cycle** (as S4.5).
 
@@ -62,19 +84,20 @@ these at generate time, so a missed exit costs one quiet 24h wait, never a text.
 **Cutover**: pause the old F.0 (do not delete it) the day F.0 v2 goes live. None
 of its generic SMS steps carry over.
 
-## Position 0: the post-demo email (Mark, 2026-10-21)
+## Position 1: the post-demo email (Mark, 2026-10-21)
 
 The evening of the demo, before the first text, F.0 v2 sends ONE email written
 from the Siro recording as the rehash rep. It REPLACES the old static F.0 email
 ("What we saw at your home, <name>"): delete that step from the old copy, keep
 nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
 
-0a. **Set** `AI Msg Sequence Position` = 0. **Reset** `AI Msg Send Ready` = No.
+0a. **"Update Pre-send Fields"**: `AI Msg Sequence Position` = **1** (was 0: GHL
+    saves a 0 as blank). **Reset** `AI Msg Send Ready` = No.
 0b. **Webhook POST** `/api/agentic/nurture/generate`, same header as step 5, body
-    `contact_id = {{contact.id}}`, `workflow_code = F.0`, `sequence_position = 0`,
-    `channel = email`. Position 0 is accepted for F.0 by email only (any other
-    caller gets `{ error: 'unsupported_position' }`, HTTP 200).
-0c. **Hold branch**, as step 6: if `Hold Dynamic Wait Hours` has a value → clear
+    `contact_id = {{contact.id}}`, `workflow_code = F.0`, `sequence_position = 1`,
+    `channel = email`. Position 1 by email is the email; anything else F.0 does not
+    use gets `{ error: 'unsupported_position' }`, HTTP 200.
+0c. **Hold branch**, as step 6: if **Next Wait Hours** has a value → clear
     it → wait that many hours → go back to 0a's reset and 0b. LP-MCP holds in 2h
     steps while the recording is not in yet, up to `F0_EMAIL_HOLD_CAP_ET` (08:30 ET
     the day after the demo).
@@ -86,7 +109,7 @@ nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
     lead, suppressed, F0_EMAIL_MODE off, prompt not active): go to 0g quietly.
     Timeout with an id → in approval too long: go to 0g (no email).
 0f. **Send email** with the branded template: subject `{{contact.ai_email_subject_draft}}`,
-    preheader `{{contact.ai_email_preheader_draft}}`, body `{{contact.ai_email_body_draft}}`
+    preheader **AI Email Preview Draft** (`C8mSMxWqXGr1HvxrImyx`, `{{contact.ai_email_preheader_draft}}`), body `{{contact.ai_email_body_draft}}`
     (HTML paragraphs), P.S. `{{contact.ai_email_ps_draft}}` (the Template A / B
     branch as S4.5: an empty P.S. means no P.S. block). **From: the rehash rep
     (John)**. The template's footer reads only "Protecting families since 1972"
@@ -94,8 +117,8 @@ nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
     address or an unsubscribe line). Then **Webhook POST**
     `/api/agentic/messages/engagement` with `generation_id = {{contact.ai_msg_generation_id}}`,
     `event = email_sent`; opens and clicks post as S4.5's do.
-0g. **Set** `AI Msg Sequence Position` = 1 and go on to the 09:30 ET wait (step 3).
-    `AI Msg Next Wait Hours` is 0 at position 0 and is NOT read there.
+0g. Go on to step 2 ("SMS START – Set Position 2") and the 09:30 ET wait (step 3).
+    `AI Msg Next Wait Hours` is 0 for the email and is NOT read there.
 
 A reply to the email lands in the same GHL conversation (GHL keeps one per
 contact, the workflow's template sends included); the reply path answers in the
@@ -115,6 +138,23 @@ contact as for a text.
 4. After a week of approved emails: `F0_EMAIL_MODE=live`. The email and the texts
    go live independently. Rollback, one variable: `F0_EMAIL_MODE=off`.
 
+## Testing on a test contact (the user, 2026-10-21)
+
+`F0_TEST_LINKS` (Railway, empty = off) = `testContactId:realLpLeadId,…`, e.g.
+`hZOcPk6XmMvWVvjZJ7mz:583780`. A listed contact that carries the tag **`aios-test`**
+reads that real lead's Siro visit (read-only) and is treated as an unsold post-demo
+lead in rehash: its demo is always two hours ago, so the email never waits for Siro.
+It is LIVE for F.0 whatever `NURTURE_SHADOW_WORKFLOWS`, `F0_V2_MODE=shadow` or
+`F0_EMAIL_MODE=shadow` say (`F0_V2_MODE=off` and `NURTURE_SHADOW_MODE` still stop it),
+the rehash sweep never touches it, and its rows carry `generated_meta.test_link`. Its
+name is its own, never the real lead's. Nothing is ever written to, sent to, tagged on
+or carded for the real lead; any #contact-rehash card for it starts "TEST —".
+
+For Mark Test: tag `aios-test`; remove it from S5.1 Decision Compression Reactivation
+if the 2026-10-21 run enrolled it; remove `active-f.0` and `stage:post-appointment`;
+keep LP Disposition = OPPFDN. Then fire the F.0 v2 webhook: the email about 2h later,
+the first text at the next 9:30 AM from 727-474-8052, the rest on LP-MCP's spacing.
+
 ## Approval while in shadow
 
 `NURTURE_SHADOW_WORKFLOWS` holds `F.0` (and `F0_V2_MODE=shadow` forces it): every
@@ -131,15 +171,15 @@ Verify each exists on the contact before building:
 | Key | GHL field id | Written |
 |---|---|---|
 | `ai_sms_body_draft` | `xr0EkxRCshI6tlm4dpvO` | the text |
-| `ai_msg_meta_json` | `2KB3bkyJ92DGExsFiIIJ` | includes `siro_recording_id` and `position` |
-| `ai_msg_next_wait_hours` | `h6OyxuBTv7w7ieub1P9y` | 48 / 48 / 72 / 168 / 0 (position 0: 0, not read) |
+| `ai_msg_meta_json` | `2KB3bkyJ92DGExsFiIIJ` | includes `siro_recording_id`, `position` (inside) and `ghl_position` |
+| `ai_msg_next_wait_hours` | `h6OyxuBTv7w7ieub1P9y` | 48 / 48 / 72 / 168 / 0 for positions 2-6 (the email: 0, not read) |
 | `ai_msg_generation_id` | `sxmZVqEc1KCgpauUbTAt` | the generation id (empty after a suppression) |
 | `ai_msg_confidence` | `vo7aZJT2J1ozVv3cux0T` | |
 | `ai_sms_send_ready` | `kIOFapo85KNwpq95Qhl7` | Yes only when not in shadow |
 | `ai_msg_send_ready` | `PMq1AzXFX3nudZgNFxbw` | Yes only when not in shadow |
-| `hold_dynamic_wait_hours` | `MZkFWOFDzf8OKTy2O4od` | only on a hold |
-| `ai_email_subject_draft` / `ai_email_preheader_draft` / `ai_email_body_draft` / `ai_email_ps_draft` | `hmmFUscWqxH1On6WPCP3` / `C8mSMxWqXGr1HvxrImyx` / `WP3BnkdAsINf13CCYGbr` / `vrAbErigvAzLCU9jj7kT` | the position-0 email (2026-10-21); blank at positions 1-5 |
-| `ai_msg_sequence_position` | `apoe5TFnilPriJmIzvbo` | **workflow-owned; LP-MCP never writes it** |
+| `hold_dynamic_wait_hours` (GHL label **Next Wait Hours**, `{{contact.next_wait_hours}}`) | `MZkFWOFDzf8OKTy2O4od` | only on a hold |
+| `ai_email_subject_draft` / `ai_email_preheader_draft` (GHL label **AI Email Preview Draft**) / `ai_email_body_draft` / `ai_email_ps_draft` | `hmmFUscWqxH1On6WPCP3` / `C8mSMxWqXGr1HvxrImyx` / `WP3BnkdAsINf13CCYGbr` / `vrAbErigvAzLCU9jj7kT` | the email at position 1 (2026-10-21); blank at positions 2-6 |
+| `ai_msg_sequence_position` | `apoe5TFnilPriJmIzvbo` | **workflow-owned, never 0; LP-MCP never writes it** |
 
 ## Rulings needed from Mark (defaults used until ruled)
 

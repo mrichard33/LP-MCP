@@ -31,6 +31,7 @@ import { rehashRepFor } from '../config/rehash-assignee.js';
 import { rehashTeamUserIds } from '../agentic/rehash-state.js';
 import { rehashRepFirstName, ghlUserFirstName } from '../agentic/rehash-slots.js';
 import { isF0EmailRequest, emailHoldWindow } from './f0-email.js';
+import { testLinkFor } from './f0-test-link.js';
 
 const HOUR_MS = 3_600_000;
 const SENT_STATUSES = ['ghl_sent_confirmed', 'generated_ready'];
@@ -105,11 +106,19 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   const lead = context?.lead || {};
   const tags = (lead.current_tags || []).map(t => String(t).toLowerCase());
   const read = deps.readSiroRows || readSiroRows;
-  const readArgs = { supabase, contactId: request.contact_id, leadIds: [lp.lead_id], prospectId: lp.prospect_id };
+  // 2026-10-21 (the user): a test contact (tag aios-test, listed in
+  // F0_TEST_LINKS) reads the visit of the real LP lead it is linked to, and
+  // nothing else of that lead: no Siro ensure, no rehash_stage, no lp_leads.
+  const testLink = deps.testLink !== undefined ? deps.testLink : testLinkFor(request.contact_id, lead.current_tags, env);
+  const readArgs = testLink
+    ? { supabase, contactId: null, leadIds: [testLink.lpLeadId], prospectId: null }
+    : { supabase, contactId: request.contact_id, leadIds: [lp.lead_id], prospectId: lp.prospect_id };
   // 2026-10-21 (Mark): the position-0 email waits for the recording until the
-  // cap (08:30 ET the day after the demo), not the texts' 24h.
+  // cap (08:30 ET the day after the demo), not the texts' 24h. A linked test
+  // contact's demo is always two hours ago, so the email never waits for Siro.
   const email = isF0EmailRequest(request);
-  const demoAtMs = (f) => Date.parse(f?.recorded_at || lp.demo_date || lp.last_appointment_date || lp.appointment_date || '');
+  const testDemoAtMs = nowMs - 2 * HOUR_MS;
+  const demoAtMs = (f) => (testLink ? testDemoAtMs : Date.parse(f?.recorded_at || lp.demo_date || lp.last_appointment_date || lp.appointment_date || ''));
   const waitFor = (f) => (email
     ? emailHoldWindow({ demoAtMs: demoAtMs(f), nowMs, capEt: cfg.f0EmailHoldCapEt, stepH: cfg.waitHoldH })
     : { waitMaxH: cfg.waitMaxH, waitHoldH: cfg.waitHoldH });
@@ -117,7 +126,7 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   let rows = await safe('siro_recordings', () => read(readArgs), []);
   let facts = buildPresentationFacts(rows, { now: nowMs });
   const ageBefore = demoAgeHours({ facts, lp, nowMs });
-  if (!facts && allowEnsure && Number.isFinite(ageBefore) && ageBefore < waitFor(facts).waitMaxH && lp.lead_id) {
+  if (!facts && allowEnsure && !testLink && Number.isFinite(ageBefore) && ageBefore < waitFor(facts).waitMaxH && lp.lead_id) {
     const ensured = await (deps.ensureRecordingForLead || ensureRecordingForLead)(
       { lp_lead_id: lp.lead_id, phone: lead.phone, demo_date: lp.demo_date, appointment_date: lp.last_appointment_date || lp.appointment_date },
       { env, deps, nowMs },
@@ -133,7 +142,7 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   // Rehash: the demo lead's own 30-day window and its rehash_stage row. Tags
   // are NOT read here: F.0 itself carries active-f.0, which would read as
   // "in rehash" forever.
-  const stageRows = await safe('rehash_stage', async () => {
+  const stageRows = testLink ? [] : await safe('rehash_stage', async () => {
     const { data, error } = await supabase.from('rehash_stage')
       .select('ghl_contact_id, lp_lead_id, demo_date, started_at, ended_at').eq('ghl_contact_id', request.contact_id);
     if (error) throw new Error(error.message);
@@ -145,7 +154,7 @@ export async function loadF0Context(context, request, { env = process.env, deps 
     || isInRehash({ tags: [], currentLead, stage, nowMs, env });
 
   // A newer lead on the prospect than the demo lead.
-  const newest = lp.prospect_id ? await safe('lp_leads', async () => {
+  const newest = (lp.prospect_id && !testLink) ? await safe('lp_leads', async () => {
     const { data, error } = await supabase.from('lp_leads').select('lp_lead_id, created_at_lp')
       .eq('lp_prospect_id', String(lp.prospect_id)).order('created_at_lp', { ascending: false }).limit(1);
     if (error) throw new Error(error.message);
@@ -163,14 +172,15 @@ export async function loadF0Context(context, request, { env = process.env, deps 
     return data?.[0]?.generated_at || null;
   }, null);
 
-  const sold = lpSold(lp) || isCustomerP2(context) || tags.includes('deal-won');
+  // A linked test contact is sold only by its OWN tag; its LP lead is 'Data'.
+  const sold = testLink ? tags.includes('deal-won') : (lpSold(lp) || isCustomerP2(context) || tags.includes('deal-won'));
   const postAppointment = isPostDemoLead({ lp, tags, stageTag: lead.current_stage_tag || null });
 
   // The rehash rep's first name: the follower on the lead, else the GHL
   // custom value rehash_rep_name; never guessed: "Reece Team" when none.
   const rehashRepFirst = await resolveRehashRepFirst(request.contact_id, { env, deps });
 
-  const age = demoAgeHours({ facts, lp, nowMs });
+  const age = testLink ? 2 : demoAgeHours({ facts, lp, nowMs });
   const modes = siroModes(env);
   const followupTextLive = modes.followupText === 'live';
   const vars = {
@@ -192,8 +202,9 @@ export async function loadF0Context(context, request, { env = process.env, deps 
     // 2026-10-20: the formula opens on the first name. A couple's field
     // ("George/Paula") is no name to the reply writer, so it is read here and
     // its first person used; with none at all the text opens without a name.
+    // A linked test contact's name is its own, never the real lead's.
     let firstName = lead.first_name || '';
-    if (!firstName && demoLeadId) {
+    if (!firstName && demoLeadId && !testLink) {
       firstName = await safe('lp_leads first_name', async () => {
         const { data, error } = await supabase.from('lp_leads').select('first_name').eq('lp_lead_id', demoLeadId).limit(1);
         if (error) throw new Error(error.message);
@@ -216,13 +227,14 @@ export async function loadF0Context(context, request, { env = process.env, deps 
     rows,
     vars,
     recordingId: facts?.recording_id || null,
+    testLink: testLink || null,
     interruptInput: {
       lpSold: sold,
-      unsoldPostDemo: isUnsoldPostDemo({ postAppointment, rehash: rehashActive, sold }),
-      rehashActive,
-      newerLead,
-      appointmentOnFile: !!appointmentOnFile({ upcomingAppointments: [], lp, nowMs }),
-      noteDq: !!context?.lead_facts?.note_dq,
+      unsoldPostDemo: testLink ? true : isUnsoldPostDemo({ postAppointment, rehash: rehashActive, sold }),
+      rehashActive: testLink ? true : rehashActive,
+      newerLead: testLink ? false : newerLead,
+      appointmentOnFile: testLink ? false : !!appointmentOnFile({ upcomingAppointments: [], lp, nowMs }),
+      noteDq: testLink ? false : !!context?.lead_facts?.note_dq,
       postDemoStop: postDemoStopFrom({ conversation: context?.conversation_recent || [], tags }),
       repliedSinceLastTouch: repliedSince({ conversation: context?.conversation_recent || [], lastTouchAt: lastTouch }),
       tags,

@@ -461,3 +461,24 @@ test('the reply writer never treats a sold lead as rehash by its tag (source gua
   const src = fs.readFileSync(new URL('../src/response-generator.js', import.meta.url), 'utf8');
   assert.match(src, /const rehashTagged = channel === 'sms' && !lpSold\(context\.lp\) && isRehashContact\(/);
 });
+
+// 2026-10-21 (the user): the first F.0 test's hand-made stage was closed by
+// this sweep (Mark Test's own LP lead is 'Data'). A contact listed in
+// F0_TEST_LINKS is never opened, closed, tagged or untagged.
+test('sweep (live): a test contact linked by F0_TEST_LINKS is skipped entirely', async () => {
+  const TEST = 'hZOcPk6XmMvWVvjZJ7mz';
+  const sb = fakeSupabase({
+    leads: { [TEST]: [{ lp_lead_id: '583364', disposition_code: 'Data', appointment_date: null }] },
+    stageRows: [{ ghl_contact_id: TEST, lp_lead_id: '583780', demo_date: '2026-10-14' }],
+  });
+  let reads = 0;
+  const res = await runRehashTagSweep(sweepDeps(sb, {
+    env: { ...env, F0_TEST_LINKS: `${TEST}:583780` },
+    getContact: async () => { reads++; return { tags: ['rehash', 'aios-test'] }; },
+  }));
+  assert.equal(res.counts.test_linked_skipped, 1);
+  assert.equal(res.counts.release, 0);
+  assert.equal(reads, 0);
+  assert.deepEqual(sb.inserted, []);
+  assert.equal(sb.stage[0].ended_at, null);
+});

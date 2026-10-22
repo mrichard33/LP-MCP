@@ -17,6 +17,15 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
   its fixed fallback (tag `f0-no-recording`). Behind `F0_EMAIL_MODE`, default
   shadow (drafts + an approval card in #contact-rehash), and its prompt row is
   seeded inactive, so nothing a customer sees changes until Mark switches it on.
+- **F.0 v2 positions start at 1: the email is 1, the texts 2 to 6.** GHL saves
+  a number field set to 0 as blank, so on the first test the email arrived with
+  no position and was treated as a text. The workflow now sends 1 for the email;
+  LP-MCP maps it once, and the saved row shows the workflow's number.
+- **F.0 v2 can be tested end to end on a test contact.** `F0_TEST_LINKS` links a
+  contact tagged `aios-test` to a real lead's recorded visit (read only). That
+  contact is treated as an unsold post-demo lead, gets the email and texts live,
+  and is never touched by the rehash sweep. Nothing is ever sent or written to
+  the real lead. Empty = off.
 - **A nurture workflow writes drafts only for contacts it actually holds.**
   With `NURTURE_WORKFLOW_IDS` set, a generate call from a workflow the contact
   is no longer in is refused and nothing is written.

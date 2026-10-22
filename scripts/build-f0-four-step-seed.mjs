@@ -228,13 +228,17 @@ if (EMAIL_SEED) {
 -- position 1, never a fixed email). No recording by the cap → no model call at
 -- all: the workflow sends its fallback template (tag f0-no-recording).
 --
--- Seeded INACTIVE: until it is switched on, position 0 is a quiet skip
--- (email_prompt_inactive). siro_lead_presentation { preview_f0_position: 0,
--- channel: 'email' } previews it while inactive. Go-live (Mark), in this order:
+-- Seeded INACTIVE: until it is switched on, the email is a quiet skip
+-- (email_prompt_inactive). siro_lead_presentation { preview_f0_position: 1 }
+-- previews it while inactive (the workflow numbers the email 1 since
+-- 2026-10-21; the row keeps the internal position 0). Go-live (Mark):
 --   update public.agentic_messaging_prompts set active = true, updated_at = now()
 --     where prompt_code = 'F.0-P0-email-V1';
 --   then F0_EMAIL_MODE=shadow (explicit) on Railway; after a week of approved
 --   emails, F0_EMAIL_MODE=live. Rollback: F0_EMAIL_MODE=off.
+-- 2026-10-21: this row and the Four-Step version-2 text rows were activated
+-- by hand for the Mark Test run; they stay active (re-running this seed never
+-- changes active).
 --
 -- Idempotent: ON CONFLICT (prompt_code) updates the copy in place and never
 -- touches active. Built by scripts/build-f0-four-step-seed.mjs.
