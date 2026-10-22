@@ -60,6 +60,8 @@ const SLOTS = {
 const EMAIL = { subject: 'Thank you for having us, James', preheader: 'A few thoughts on those rear windows and Christmas', ps: '' };
 const opts = (extra = {}) => ({ facts: FACTS, position: 0, repFirstName: 'John', formula: 'email', slots: SLOTS, firstName: 'James', ...EMAIL, ...extra });
 
+// 2026-10-21: 0 is the INTERNAL position. The workflow sends 1 for the email
+// (GHL saves a 0 as blank); scripts/test-f0-positions.js holds that mapping.
 test('position 0 is the F.0 email and nothing else', () => {
   assert.equal(isF0EmailRequest({ workflow_code: 'F.0', sequence_position: 0, channel: 'email' }), true);
   assert.equal(isF0EmailRequest({ workflow_code: 'F.0', sequence_position: 1, channel: 'sms' }), false);
@@ -217,6 +219,7 @@ test('the email approval card shows all four parts and the email gate', () => {
     prompt: { prompt_code: 'F.0-P0-email-V1' }, recordingId: 'rec_1',
   });
   assert.match(card, /F\.0 POST-DEMO EMAIL READY/);
+  assert.match(card, /position 1, the evening of the demo/, 'the workflow numbering');
   assert.match(card, /Subject: Thank you for having us, James/);
   assert.match(card, /Preheader: /);
   assert.match(card, /quick call with John\?/);

@@ -19,6 +19,7 @@ import { ensureRecordingForLead } from './ensure-recording.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { isInRehash, rehashLeadFromContext } from '../agentic/rehash-state.js';
 import { prospectLabel } from '../format-helpers.js';
+import { testLinkFor } from './f0-test-link.js';
 
 const READ_BUDGET_MS = 1500;
 const COLS = 'recording_id, rep_name, rep_email, result, recorded_at, summary, moments, followup_score, followup_status, followup_action, insights, pricing, followup_text, processed, deleted, lp_lead_id, lp_prospect_id, ghl_contact_id';
@@ -58,13 +59,19 @@ export async function readSiroRows({ supabase = supabaseDefault, contactId = nul
 export async function siroForContext({ contactId, lp, lead }, { env = process.env, deps = {} } = {}) {
   const mode = siroModes(env).context;
   const none = { mode, rows: [], facts: null, applied: false };
-  if (mode === 'off' || !needsPresentation({ lp, lead })) return none;
+  // 2026-10-21 (the user): a linked test contact (aios-test + F0_TEST_LINKS)
+  // reads the real lead's visit, read-only, so the rehash bot answers it with
+  // that visit. Its own LP lead is 'Data', so it is past no demo of its own.
+  const testLink = deps.testLink !== undefined ? deps.testLink : testLinkFor(contactId, lead?.current_tags, env);
+  if (mode === 'off' || (!testLink && !needsPresentation({ lp, lead }))) return none;
   const read = deps.readSiroRows || readSiroRows;
-  const args = { supabase: deps.supabase || supabaseDefault, contactId, leadIds: [lp?.lead_id], prospectId: lp?.prospect_id };
+  const args = testLink
+    ? { supabase: deps.supabase || supabaseDefault, contactId: null, leadIds: [testLink.lpLeadId], prospectId: null }
+    : { supabase: deps.supabase || supabaseDefault, contactId, leadIds: [lp?.lead_id], prospectId: lp?.prospect_id };
   let rows = [];
   try {
     rows = await within(read(args), READ_BUDGET_MS);
-    if (!rows.length && lp?.lead_id) {
+    if (!rows.length && lp?.lead_id && !testLink) {
       const ensured = await (deps.ensureRecordingForLead || ensureRecordingForLead)({
         lp_lead_id: lp.lead_id, phone: lead?.phone, demo_date: lp.demo_date, appointment_date: lp.appointment_date || lp.last_appointment_date,
       }, { env, deps });

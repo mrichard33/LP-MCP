@@ -157,7 +157,8 @@ import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from 
 import { newestManualOutbound, lastInboundAt } from '../services/human-takeover-io.js';
 import { siroConfig, siroModes, siroRecordingUrl } from '../siro/config.js';
 import { postToSlack } from '../slack.js';
-import { isF0EmailRequest, allowsPositionZero, asksPositionZero, f0EmailMode, f0EmailShadow, emailGate, f0EmailOutput } from '../siro/f0-email.js';
+import { isF0EmailRequest, allowsPositionZero, asksPositionZero, f0EmailMode, f0EmailShadow, emailGate, f0EmailOutput, f0InternalPosition } from '../siro/f0-email.js';
+import { testLinkFor } from '../siro/f0-test-link.js';
 import { parseWorkflowIds, activeWorkflowDecision } from './workflow-guard.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
@@ -175,6 +176,19 @@ export function isShadowWorkflow(workflowCode, env = process.env, globalShadow =
   if (globalShadow) return true;
   if (workflowCode === F0_WORKFLOW && siroModes(env).f0 === 'shadow') return true;
   return siroConfig(env).nurtureShadowWorkflows.includes(String(workflowCode || ''));
+}
+
+/**
+ * Drafts + approval (true) or the live writeback (false) for one turn. The
+ * F.0 email goes live on its own switch (the user, 2026-10-21); a linked test
+ * contact (src/siro/f0-test-link.js) is live for F.0 whatever
+ * NURTURE_SHADOW_WORKFLOWS, F0_V2_MODE=shadow or F0_EMAIL_MODE=shadow say:
+ * only the global NURTURE_SHADOW_MODE still holds it (F0_V2_MODE=off and
+ * F0_EMAIL_MODE=off stop the turn before this). Pure.
+ */
+export function isShadowTurn({ workflowCode, isF0Email = false, testLink = null }, env = process.env, globalShadow = SHADOW_MODE) {
+  if (testLink && workflowCode === F0_WORKFLOW) return !!globalShadow;
+  return isF0Email ? f0EmailShadow(env, globalShadow) : isShadowWorkflow(workflowCode, env, globalShadow);
 }
 
 /**
@@ -212,6 +226,14 @@ export async function runNurtureGeneration(request) {
     return finishResponse(generation_id, false, 'wrong_active_workflow', startedAt);
   }
 
+  // 2026-10-21 (the user): a test contact linked to a real visit
+  // (src/siro/f0-test-link.js). Decided once, before the audit row, so every
+  // row of a linked contact carries generated_meta.test_link.
+  const testLink = request.workflow_code === F0_WORKFLOW
+    ? testLinkFor(request.contact_id, context?.lead?.current_tags || [])
+    : null;
+  request.row_meta = f0RowMeta(request, testLink);
+
   // Write pending row early so we always have an audit anchor, even
   // if a later step throws.
   await createPendingRow(generation_id, request, context);
@@ -235,7 +257,8 @@ export async function runNurtureGeneration(request) {
       await safeClearDrafts(request.contact_id, 'f0_email_off');
       return finishResponse(generation_id, false, 'f0_email_off', startedAt);
     }
-    f0 = await loadF0Context(context, request);
+    f0 = await loadF0Context(context, request, { deps: { testLink } });
+    if (testLink) console.log(`[F0] test link live: ${request.contact_id} → lead ${testLink.lpLeadId} ${generation_id}`);
     context.siro = {
       ...f0.vars,
       // The "no-visit-data" prompt variant when the visit is not on file.
@@ -453,7 +476,7 @@ export async function runNurtureGeneration(request) {
       if (!safety.passed) {
         await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
           `safety_failed_after_retry:${safety.failures.join(',')}`,
-          { output, safety_failures: safety.failures, safety_details: safety.details, retry_count: retryCount, autofixes: autofixesApplied, evolution });
+          { output, safety_failures: safety.failures, safety_details: safety.details, retry_count: retryCount, autofixes: autofixesApplied, evolution, row_meta: request.row_meta });
         await safeClearDrafts(request.contact_id, `safety_failed:${safety.failures.join(',')}`);
         if (!isF0) await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'safety_failed_after_retry', {
           safetyFailures: safety.failures,
@@ -471,19 +494,22 @@ export async function runNurtureGeneration(request) {
   }
 
   // F.0: the recording and the position ride in ai_msg_meta_json.
-  if (isF0) output = { ...output, extra_meta: { siro_recording_id: f0?.recordingId || null, position: request.sequence_position, ...(isF0Email ? { workflow_code: F0_WORKFLOW, channel: 'email' } : {}) } };
+  if (isF0) output = { ...output, extra_meta: { siro_recording_id: f0?.recordingId || null, position: request.sequence_position, ghl_position: request.ghl_position ?? null, ...(isF0Email ? { workflow_code: F0_WORKFLOW, channel: 'email' } : {}) } };
 
   // Step 7 — writeback. Two paths:
   //   - SHADOW_MODE env flag → drafts only + approval card
   //   - else → full two-phase writeback (sends the email)
   try {
-    // The email goes live on its own switch (the user, 2026-10-21).
-    if (isF0Email ? f0EmailShadow(process.env, SHADOW_MODE) : isShadowWorkflow(request.workflow_code)) {
+    // The email goes live on its own switch (the user, 2026-10-21). A linked
+    // test contact is live for F.0 whatever NURTURE_SHADOW_WORKFLOWS,
+    // F0_V2_MODE=shadow or F0_EMAIL_MODE=shadow say; only the global
+    // NURTURE_SHADOW_MODE (and F0_V2_MODE=off, above) still stop it.
+    if (isShadowTurn({ workflowCode: request.workflow_code, isF0Email, testLink: f0?.testLink })) {
       await writeDraftsOnly(request.contact_id, output, generation_id, 1.0);
-      await markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution);
+      await markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution, request.row_meta);
       if (isF0) {
         // Slack only (CLAUDE.md: never a GroupMe-only path for new work).
-        const card = buildF0ApprovalCard({ request, context, generationId: generation_id, output, prompt, recordingId: f0?.recordingId });
+        const card = buildF0ApprovalCard({ request, context, generationId: generation_id, output, prompt, recordingId: f0?.recordingId, testLink: f0?.testLink });
         const posted = await postToSlack(card, siroConfig().f0ApprovalChannel);
         if (!posted.ok) console.warn(`[NurtureOrch] F.0 approval card failed ${generation_id}: ${posted.error}`);
       } else {
@@ -500,7 +526,7 @@ export async function runNurtureGeneration(request) {
   }
 
   // Step 8 — final audit (pass path only)
-  const messageRowId = await markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution);
+  const messageRowId = await markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution, request.row_meta);
 
   // Step 8b — Bot Review Phase 0 fingerprint. Detached, post-writeback: the
   // message is already in GHL's draft fields, so nothing here can affect it.
@@ -657,7 +683,9 @@ async function stampSiroRecording(generation_id, recordingId) {
  * label (never an LP lead id), a 10-digit phone, the draft as it would go,
  * and how to approve: the gate is a GHL field a person flips. Pure.
  */
-export function buildF0ApprovalCard({ request, context, generationId, output, prompt, recordingId }) {
+export function buildF0ApprovalCard({ request, context, generationId, output, prompt, recordingId, testLink = null }) {
+  // A linked test contact's card says so on its first line (2026-10-21).
+  const test = testLink ? 'TEST — ' : '';
   const lead = context?.lead || {};
   const first = lead.first_name || 'This lead';
   const phone = slackPhone(lead.phone);
@@ -666,7 +694,7 @@ export function buildF0ApprovalCard({ request, context, generationId, output, pr
   // email's gate is "AI Msg Send Ready" (the texts' is "AI SMS Send Ready").
   if (isF0EmailRequest(request)) {
     return [
-      '✅ F.0 POST-DEMO EMAIL READY — please review (position 0, the evening of the demo)',
+      `${test}✅ F.0 POST-DEMO EMAIL READY — please review (position 1, the evening of the demo)`,
       `${first}${phone ? ` · ${phone}` : ''} · ${prospectLabel(context?.lp?.prospect_id)}`,
       `Prompt: ${prompt?.prompt_code || 'unknown'}`,
       '',
@@ -683,7 +711,7 @@ export function buildF0ApprovalCard({ request, context, generationId, output, pr
     ].filter(l => l !== null).join('\n');
   }
   return [
-    `✅ F.0 POST-DEMO TEXT READY — please review (position ${request.sequence_position} of 5)`,
+    `${test}✅ F.0 POST-DEMO TEXT READY — please review (text ${request.sequence_position} of 5, position ${request.ghl_position ?? (Number(request.sequence_position) || 1) + 1})`,
     `${first}${phone ? ` · ${phone}` : ''} · ${prospectLabel(context?.lp?.prospect_id)}`,
     `Prompt: ${prompt?.prompt_code || 'unknown'} · next wait ${output?.next_wait_hours ?? '?'}h`,
     '',
@@ -856,13 +884,35 @@ async function safeClearDrafts(contactId, reason) {
   }
 }
 
+/**
+ * What every agentic_messages row of an F.0 turn carries in generated_meta
+ * (2026-10-21): the internal position beside the GHL number the row stores,
+ * and the test link when there is one. {} for every other workflow. Pure.
+ */
+export function f0RowMeta(request, testLink = null) {
+  if (request?.workflow_code !== F0_WORKFLOW) return {};
+  return {
+    internal_position: request.sequence_position ?? null,
+    ...(testLink ? { test_link: { lp_lead_id: testLink.lpLeadId } } : {}),
+  };
+}
+
+/** The sequence_position an agentic_messages row stores: the GHL number when there is one. Pure. */
+export function rowSequencePosition(request) {
+  return request?.ghl_position ?? request?.sequence_position ?? null;
+}
+
 async function createPendingRow(generation_id, request, context) {
   if (!supabase) return;
+  const meta = request.row_meta || {};
   const { error } = await supabase.from('agentic_messages').insert({
     generation_id,
     ghl_contact_id: request.contact_id,
     workflow_code: request.workflow_code,
-    sequence_position: request.sequence_position,
+    // 2026-10-21: F.0 stores the GHL number (email 1, texts 2-6), so the row
+    // matches what the workflow shows; the internal one is in generated_meta.
+    sequence_position: rowSequencePosition(request),
+    ...(Object.keys(meta).length ? { generated_meta: meta } : {}),
     channel: request.channel,
     context_snapshot: context,
     send_status: 'pending',
@@ -909,7 +959,7 @@ async function updateStatus(generation_id, newStatus, reason, retryCount = null)
 async function updateRowOnSuppress(generation_id, status, reason, extras) {
   if (!supabase) return;
   const output = extras.output || {};
-  const meta = { ...output };
+  const meta = { ...output, ...(extras.row_meta || {}) };
   delete meta.body_html;
   delete meta.sms_body;
   // Stash safety details in confidence_breakdown so the audit trail
@@ -944,7 +994,7 @@ async function updateRowOnSuppress(generation_id, status, reason, extras) {
  * as the fingerprint's message_ref; handoff §4.1 keys nurture on it). Returns
  * null on any failure — callers must treat the id as optional.
  */
-async function markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution = null) {
+async function markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution = null, rowMeta = {}) {
   if (!supabase) return null;
   const { data, error } = await supabase.from('agentic_messages')
     .update({
@@ -954,7 +1004,7 @@ async function markGeneratedReady(generation_id, output, retryCount, autofixesAp
       generated_body: output.body_html || null,
       generated_ps: output.ps_text || null,
       generated_sms: output.sms_body || null,
-      generated_meta: pickMeta(output),
+      generated_meta: { ...pickMeta(output), ...(rowMeta || {}) },
       confidence_score: null,
       confidence_breakdown: autofixesApplied?.length ? { autofixes: autofixesApplied } : null,
       retry_count: retryCount,
@@ -973,7 +1023,7 @@ async function markGeneratedReady(generation_id, output, retryCount, autofixesAp
   return data?.id ?? null;
 }
 
-async function markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution = null) {
+async function markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution = null, rowMeta = {}) {
   if (!supabase) return;
   const { error } = await supabase.from('agentic_messages')
     .update({
@@ -984,7 +1034,7 @@ async function markAwaitingApproval(generation_id, output, retryCount, autofixes
       generated_body: output.body_html || null,
       generated_ps: output.ps_text || null,
       generated_sms: output.sms_body || null,
-      generated_meta: pickMeta(output),
+      generated_meta: { ...pickMeta(output), ...(rowMeta || {}) },
       confidence_score: null,
       confidence_breakdown: autofixesApplied?.length ? { autofixes: autofixesApplied } : null,
       retry_count: retryCount,
@@ -1241,6 +1291,19 @@ export function registerNurtureRoutes(app) {
       const seqResolved = await resolveSequencePosition(body.contact_id, body.sequence_position, { allowZero });
       console.log(`[NurtureOrch] seq_pos resolved=${seqResolved.position} source=${seqResolved.source} payload="${body.sequence_position ?? ''}"`);
 
+      // 2026-10-21 (the user): F.0's workflow numbers from 1 (email = 1,
+      // texts = 2-6) because GHL saves a 0 as blank; LP-MCP keeps email = 0
+      // and texts = 1-5 inside. Mapped once, here; every other workflow keeps
+      // its own numbering.
+      const f0Pos = body.workflow_code === 'F.0'
+        ? f0InternalPosition({ channel: body.channel, sequence_position: seqResolved.position })
+        : null;
+      if (f0Pos?.error) {
+        console.log(`[NurtureOrch] F.0 ${f0Pos.error} channel=${body.channel} position=${seqResolved.position} contact=${body.contact_id}`);
+        return res.status(200).json({ error: f0Pos.error, send_ready: false });
+      }
+      if (f0Pos?.legacy) console.log(`[F0] legacy position 0 contact=${body.contact_id} (the workflow should send 1 for the email)`);
+
       // v2.1: force_send is admin/test-only. Coerce true/false/"true"/"false"
       // to a strict boolean so a payload typo can't accidentally bypass
       // interrupts in production.
@@ -1249,7 +1312,8 @@ export function registerNurtureRoutes(app) {
       const result = await runNurtureGeneration({
         contact_id: body.contact_id,
         workflow_code: body.workflow_code,
-        sequence_position: seqResolved.position,
+        sequence_position: f0Pos ? f0Pos.position : seqResolved.position,
+        ...(f0Pos ? { ghl_position: f0Pos.ghlPosition } : {}),
         sequence_source: seqResolved.source,
         channel: body.channel,
         enrollment_reason: body.enrollment_reason || null,

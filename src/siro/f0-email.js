@@ -12,6 +12,9 @@
  * shape live here; the copy checks are checkF0Copy formula 'email'
  * (f0-copy-checks.js); the orchestrator and the preview only call these.
  *
+ *   - The workflow sends the email as position 1 and the texts as 2-6 since
+ *     2026-10-21 (GHL saves a 0 as blank); f0InternalPosition maps them back,
+ *     so everything below still reads the email as 0.
  *   - Position 0 is valid for F.0 + email only. Any other workflow or channel
  *     asking for 0 is refused (unsupported_position). Before this a 0 silently
  *     became the contact field's position or 1.
@@ -49,6 +52,35 @@ export function isF0EmailRequest(req) {
 /** May this caller ask for position 0? Only F.0 by email. Pure. */
 export function allowsPositionZero({ workflow_code, channel } = {}) {
   return workflow_code === 'F.0' && channel === F0_EMAIL_CHANNEL;
+}
+
+/**
+ * F.0's GHL numbering → LP-MCP's (the user, 2026-10-21). GHL saves a numeric
+ * custom field set to 0 as BLANK: the 2026-10-21 test's "Update Pre-send
+ * Fields" set AI Msg Sequence Position = 0 and the generate call got an empty
+ * position, so the email was never treated as position 0 (agentic_messages
+ * read channel email, sequence_position 1). The workflow now sends email = 1,
+ * texts = 2..6; inside LP-MCP the email stays 0 and the texts 1..5, so the
+ * prompt rows, FOUR_STEP_WAIT_HOURS, the P1-P5 copy rules and P5's terminal
+ * step are unchanged. Applied ONCE, where the generate route parses an F.0
+ * request. A bare 0 by email is the legacy number (logged by the caller).
+ * Pure.
+ * @returns {{ position: number, ghlPosition: number, legacy: boolean } | { error: 'unsupported_position' }}
+ */
+export function f0InternalPosition({ channel, sequence_position } = {}) {
+  const raw = sequence_position;
+  const n = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
+  const i = Number.isFinite(n) && Math.floor(n) === n ? n : NaN;
+  if (channel === F0_EMAIL_CHANNEL && i === 1) return { position: F0_EMAIL_POSITION, ghlPosition: 1, legacy: false };
+  if (channel === F0_EMAIL_CHANNEL && i === 0) return { position: F0_EMAIL_POSITION, ghlPosition: 0, legacy: true };
+  if (channel === 'sms' && i >= 2 && i <= 6) return { position: i - 1, ghlPosition: i, legacy: false };
+  return { error: 'unsupported_position' };
+}
+
+/** The GHL number of an internal F.0 position (email 0 → 1, text n → n + 1). Pure. */
+export function f0GhlPosition(internal) {
+  const n = Number(internal);
+  return Number.isFinite(n) ? n + 1 : null;
 }
 
 /** The payload asked for position 0 explicitly ("0" or 0). Pure. */

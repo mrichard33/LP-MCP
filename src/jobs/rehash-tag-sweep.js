@@ -41,6 +41,7 @@
 
 import { runJob } from '../job-runner.js';
 import { pickCurrentLead } from '../current-lead.js';
+import { testLinkedContactIds } from '../siro/f0-test-link.js';
 import {
   decideRehash, rehashRoutingMode, rehashDays, rehashTeamUserIds, stageFromRows,
 } from '../agentic/rehash-state.js';
@@ -234,6 +235,16 @@ export async function runRehashTagSweep(deps = {}) {
     ids = await readCandidates(d, nowMs);
   } catch (err) {
     return { ok: false, mode, counts, errors: [err.message], insufficient_evidence: true };
+  }
+  // 2026-10-21 (the user): a test contact linked to a real visit
+  // (F0_TEST_LINKS) is never opened, closed, tagged or untagged here: its own
+  // LP lead is 'Data', so the sweep closed the hand-made stage of the first
+  // test and every F.0 call after it was suppressed rehash_ended.
+  const linked = testLinkedContactIds(d.env);
+  if (linked.size) {
+    const before = ids.length;
+    ids = ids.filter((id) => !linked.has(id));
+    counts.test_linked_skipped = before - ids.length;
   }
 
   const slice = passSlice(ids, nowMs);

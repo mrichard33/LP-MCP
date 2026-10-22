@@ -23,7 +23,7 @@ test('shadow per workflow: F.0 is in shadow by default; F0_V2_MODE=shadow forces
 
 test('the approval card names the prospect, never a lead id, and a 10-digit phone', () => {
   const card = buildF0ApprovalCard({
-    request: { contact_id: 'c1', sequence_position: 2 },
+    request: { contact_id: 'c1', sequence_position: 2, ghl_position: 3 },
     context: { lead: { first_name: 'Dana', phone: '+1 (352) 555-0188' }, lp: { prospect_id: '470111', lead_id: '583321' } },
     generationId: 'gen_1', output: { sms_body: 'Hi Dana, … - John', next_wait_hours: 48 }, prompt: { prompt_code: 'F.0-P2-price-V1' }, recordingId: 'rec_1',
   });
@@ -31,6 +31,7 @@ test('the approval card names the prospect, never a lead id, and a 10-digit phon
   assert.match(card, /3525550188/);
   assert.doesNotMatch(card, /583321/);
   assert.match(card, /AI SMS Send Ready/);
+  assert.match(card, /text 2 of 5, position 3/, 'internal text 2 is the workflow\'s position 3 (2026-10-21)');
   assert.match(card, /https:\/\/app\.siro\.ai\/analyze\/rec_1/);
 });
 

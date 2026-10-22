@@ -15,6 +15,7 @@ import { buildPresentationFacts, renderPresentationBlock } from '../siro/present
 import { buildDemoNote } from '../siro/demo-note.js';
 import { siroConfig, siroModes } from '../siro/config.js';
 import { previewF0Generation } from '../siro/f0-preview.js';
+import { f0InternalPosition } from '../siro/f0-email.js';
 import { runSiroRecordingSync } from '../jobs/siro-recording-sync.js';
 import { resolveOrganizationId, monthStartIso } from '../jobs/siro-rep-scorecard-sync.js';
 import { normalizePhone10 } from '../lead-leak-classify.js';
@@ -30,6 +31,24 @@ async function rowsFor({ lp_lead_id, lp_prospect_id, ghl_contact_id }, limit = 1
   const { data, error } = await q;
   if (error) throw new Error(error.message);
   return data || [];
+}
+
+/**
+ * The preview's position (2026-10-21): the workflow's numbering by default
+ * (1 = email, 2-6 = texts, mapped by f0InternalPosition, the route's own
+ * rule); numbering 'internal' keeps 0 = email, 1-5 = texts for one release.
+ */
+export function previewF0Position({ preview_f0_position: p, numbering = 'ghl', channel = null }) {
+  if (numbering === 'internal') {
+    const ch = channel || (p === 0 ? 'email' : 'sms');
+    if ((p === 0) !== (ch === 'email') || p > 5) return { error: 'internal numbering: 0 is the email (channel "email"); 1-5 are texts (channel "sms")' };
+    return { position: p, channel: ch };
+  }
+  const ch = p === 1 ? 'email' : 'sms';
+  if (channel && channel !== ch) return { error: 'position 1 is the email; positions 2-6 are the texts' };
+  const mapped = f0InternalPosition({ channel: ch, sequence_position: p });
+  if (mapped.error || mapped.legacy) return { error: 'position 1 is the email; positions 2-6 are the texts (numbering "internal" for the old 0-5)' };
+  return { position: mapped.position, channel: ch };
 }
 
 export function registerSiroTools(server) {
@@ -103,12 +122,13 @@ export function registerSiroTools(server) {
 
   server.tool(
     'siro_lead_presentation',
-    'The PRESENTATION block exactly as the reply writer sees it for a lead (from the newest matched Siro recording), optionally the GHL demo-note text (include_note) and a DRY RUN of the F.0 v2 text for one position 1-5, or of the position-0 email (preview_f0_position: 0 with channel email: subject, preheader, body, P.S.) (prompt selected, copy-check result, interrupt; nothing is written to GHL or agentic_messages; needs ghl_contact_id). Mark\'s evidence before flipping SIRO_CONTEXT_MODE, SIRO_DEMO_NOTE_MODE or F.0. An empty block means no matched, processed recording, not that there was no visit.',
+    'The PRESENTATION block exactly as the reply writer sees it for a lead (from the newest matched Siro recording), optionally the GHL demo-note text (include_note) and a DRY RUN of one F.0 v2 touch in the workflow numbering (preview_f0_position 1 = the post-demo email: subject, preheader, body, P.S.; 2-6 = the texts; numbering "internal" keeps the old 0 = email, 1-5 = texts for one release) (prompt selected, copy-check result, interrupt; nothing is written to GHL or agentic_messages; needs ghl_contact_id). Mark\'s evidence before flipping SIRO_CONTEXT_MODE, SIRO_DEMO_NOTE_MODE or F.0. An empty block means no matched, processed recording, not that there was no visit.',
     {
       lp_lead_id: z.string().optional(), lp_prospect_id: z.string().optional(), ghl_contact_id: z.string().optional(),
       include_note: z.boolean().optional(),
-      preview_f0_position: z.number().int().min(0).max(5).optional().describe('1-5: an F.0 text. 0: the post-demo email (with channel "email").'),
-      channel: z.enum(['sms', 'email']).optional().describe('F.0 preview channel: sms (positions 1-5, default) or email (position 0; its prompt row is read even while inactive).'),
+      preview_f0_position: z.number().int().min(0).max(6).optional().describe('The F.0 workflow position: 1 = the post-demo email, 2-6 = the texts. With numbering "internal": 0 = the email, 1-5 = the texts.'),
+      numbering: z.enum(['ghl', 'internal']).optional().describe('ghl (default, what the workflow sends since 2026-10-21) or internal (the old numbering, kept for one release).'),
+      channel: z.enum(['sms', 'email']).optional().describe('F.0 preview channel. Optional: the position decides it; when given it must match.'),
       formula: z.enum(['v1', 'four_step']).optional().describe('F.0 preview formula (default: Railway\'s F0_FORMULA_MODE). four_step reads the version-2 Four-Step prompts even while they are inactive.'),
     },
     async (a) => {
@@ -124,9 +144,9 @@ export function registerSiroTools(server) {
       if (a.include_note) out.demo_note = facts ? buildDemoNote(facts) : null;
       if (a.preview_f0_position != null) {
         const contactId = a.ghl_contact_id || rows.find(r => r.ghl_contact_id)?.ghl_contact_id;
-        const channel = a.channel || (a.preview_f0_position === 0 ? 'email' : 'sms');
-        if ((a.preview_f0_position === 0) !== (channel === 'email')) out.f0_preview = { error: 'position 0 is the email (channel "email"); positions 1-5 are texts (channel "sms")' };
-        else out.f0_preview = contactId ? await previewF0Generation(contactId, a.preview_f0_position, { formula: a.formula || null, channel }) : { error: 'no GHL contact for this lead' };
+        const pos = previewF0Position(a);
+        if (pos.error) out.f0_preview = { error: pos.error };
+        else out.f0_preview = contactId ? await previewF0Generation(contactId, pos.position, { formula: a.formula || null, channel: pos.channel }) : { error: 'no GHL contact for this lead' };
       }
       return ok(out);
     },

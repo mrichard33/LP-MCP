@@ -259,6 +259,11 @@ export const MODES = Object.freeze([
     goLive: 'a week of approved position-0 emails in #contact-rehash (F.0 email prompt row active first)',
     note: 'F.0 v2 position-0 email, written from the Siro visit as the rehash rep (src/siro/f0-email.js): off skips it quietly, shadow drafts it for approval, live sends it. Decides the email alone; F0_V2_MODE=off still stops every F.0 touch.',
   }),
+  m('F0_TEST_LINKS', 'bot', 'choice', ['', '<testContactId>:<realLpLeadId>,…'], '', {}, {
+    since: '2026-10-21', decider: 'Mark', evidence: { table: 'agentic_messages' },
+    goLive: 'empty = off; set per test contact ("testContactId:realLpLeadId,…"), only contacts tagged aios-test are linked',
+    note: 'F.0 test link (src/siro/f0-test-link.js): a listed contact tagged aios-test reads the real lead\'s Siro visit (read-only), skips the rehash sweep, and is live for F.0 whatever the F.0 shadow settings; generated_meta.test_link marks its rows. Nothing is ever written to the real lead.',
+  }),
   m('F0_V2_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-16', evidence: { table: 'agentic_messages' },
     note: 'F.0 v2 post-demo texts from the nurture orchestrator: off generates nothing, shadow forces approval (drafts + #contact-rehash card), live honours NURTURE_SHADOW_WORKFLOWS.',
