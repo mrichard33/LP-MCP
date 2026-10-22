@@ -3180,6 +3180,16 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     if (kept.length && kept.length < all.length) { body = kept.join(' '); changes.push('detail_request_dropped'); }
     const restored = restoreQuestionMark(body);
     if (restored.changed) { body = restored.text; changes.push('question_mark_restored'); }
+    // A question written with "." BEFORE the real one is a second question
+    // (investment_owner chat, 2026-10-22, after #1429: "Before we talk through
+    // options, what's driving the timeline on this flip. Are you looking to get
+    // them in before you list?"). The last question stays; the earlier one goes.
+    // "What a great project." is an exclamation, never a question.
+    const parts = splitSentences(body);
+    if (body.includes('?') && parts.length > 1) {
+      const kept = parts.filter((x, i) => i === parts.length - 1 || !/\.\s*$/.test(x) || /^\s*what\s+an?\s/i.test(x) || !restoreQuestionMark(x).changed);
+      if (kept.length < parts.length) { body = kept.join(' '); changes.push('dotted_question_dropped'); }
+    }
   }
   if (discoveryTurn && !body.includes('?')) {
     body = `${body.replace(/\s+$/, '')} ${discoveryQuestion(plan)}`.trim();

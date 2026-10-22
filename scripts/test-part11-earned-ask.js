@@ -175,3 +175,15 @@ test('a discovery turn drops a detail ask and never stacks a second question', (
   // A reply that is only the ask is never emptied.
   assert.equal(enforceNepqPlan("What's the best number to reach you?", p).text, "What's the best number to reach you?");
 });
+
+// investment_owner chat after #1429 (2026-10-22): a question written with "."
+// before the real question was a second question.
+test('a discovery turn keeps one question when an earlier one ends in "."', () => {
+  const p = { required_move: 'consequence', recent_outbound: [], booking: { allowed: false } };
+  const out = enforceNepqPlan("Twelve windows is a solid-sized project. Before we talk through options, what's driving the timeline on this flip. Are you looking to get them in before you list?", p);
+  assert.equal(out.text, 'Twelve windows is a solid-sized project. Are you looking to get them in before you list?');
+  assert.ok(out.changes.includes('dotted_question_dropped'));
+  // An exclamation and a plain statement stay.
+  assert.equal(enforceNepqPlan('What a great project. How long has that been going on?', p).text, 'What a great project. How long has that been going on?');
+  assert.equal(enforceNepqPlan('Twelve windows is a solid project. How long has that been going on?', p).text, 'Twelve windows is a solid project. How long has that been going on?');
+});
