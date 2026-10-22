@@ -22,6 +22,12 @@
 // with the partner sync off, or with PARTNER_FIVE9_REMOVAL_MODE=off (the cards too: the
 // owner sync still posts its own). The on-demand run, dry run by default, is
 // POST /n8n/admin/partner-owner/five9-sweep (src/partners/routes.js).
+// 2026-10-22 (Mark, Build 3): the same pass runs the RFED integrity guard
+// (src/partners/rfed-integrity.js) on every contact whose live OWNER is a partner:
+// Ross owns it in GHL ⇒ its newest LP lead must be RFED with the original's Source,
+// Sub-Source and Promoter. A card, never a fix. The scheduled pass needs the Five9 mode
+// on; { integrityOnly } (POST /n8n/admin/partner-owner/rfed-integrity) runs the guard
+// alone, whatever that mode, and skips the Five9 work.
 
 import { runJob } from '../job-runner.js';
 import { partnerSyncConfig, postGhlSetCard } from '../partners/owner-sync.js';
@@ -29,6 +35,7 @@ import { loadPartnerMap } from '../partners/owner-resolver.js';
 import {
   partnerFive9Mode, ensurePartnerFive9Removal, releasePartnerFive9, settleRecentGroups, partnerFor,
 } from '../partners/five9-removal.js';
+import { rfedIntegrityMode, checkPartnerContact } from '../partners/rfed-integrity.js';
 
 export const JOB_ID = 'partner-five9-sweep';
 const INTERVAL_MS = 30 * 60 * 1000;
@@ -102,20 +109,30 @@ async function newestLead(d, contactId) {
 
 /**
  * One pass. deps: { supabase, ghlFetch, hlRunSQL, getListsInfo, postToSlack, alertPosted, env, now, log }
- * opts: { dryRun } — a dry run reads and reports; it claims, queues, posts and releases nothing.
+ * opts: { dryRun, integrityOnly } — a dry run reads and reports; it claims, queues, posts and releases
+ * nothing. integrityOnly runs only the RFED integrity guard (no Five9 removal, release or GHL-set card).
  */
-export async function runPartnerFive9Sweep(deps = {}, { dryRun = false } = {}) {
+export async function runPartnerFive9Sweep(deps = {}, { dryRun = false, integrityOnly = false } = {}) {
   const env = deps.env || process.env;
   const now = deps.now || Date.now;
   const log = deps.log || console.log;
   const cfg = partnerSyncConfig(env);
   const mode = partnerFive9Mode(env);
+  const integrityMode = rfedIntegrityMode(env);
   if (!cfg.enabled && !dryRun) return { ok: true, skipped: cfg.reason };
-  if (mode === 'off' && !dryRun) return { ok: true, skipped: 'mode_off' };
+  // The scheduled pass belongs to the Five9 mode (job-registry mirrors that gate);
+  // PARTNER_FIVE9_REMOVAL_MODE=off stops the scheduled guard too. integrityOnly is
+  // the on-demand guard run, whatever the Five9 mode.
+  if (mode === 'off' && !dryRun && !integrityOnly) return { ok: true, skipped: 'mode_off' };
+  const doFive9 = !integrityOnly && (mode !== 'off' || dryRun);
+  const doIntegrity = integrityMode !== 'off';
+  if (!doFive9 && !doIntegrity) return { ok: true, skipped: 'integrity_mode_off' };
   const d = { ...deps, env, now, log };
   if (!d.supabase) d.supabase = (await import('../supabase.js')).default;
   if (!d.ghlFetch) d.ghlFetch = (await import('../actions/helpers.js')).ghlFetch;
   if (!d.hlRunSQL) d.hlRunSQL = (await import('../admin/hl-client.js')).hlRunSQL;
+  if (doIntegrity && !d.postToSlack) d.postToSlack = (await import('../slack.js')).postToSlack;
+  if (doIntegrity && !d.alertPosted) d.alertPosted = await import('../alert-posted.js');
   const fdeps = { ...d };
 
   const map = await loadPartnerMap(d);
@@ -124,7 +141,8 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false } = {}) {
   const nameOf = (id) => map.find((r) => String(r.ghl_user_id) === String(id))?.partner_name || null;
   const nowMs = now();
   const { candidates, errors } = await candidateIds(d, map, nowMs);
-  const counts = { candidates: candidates.length, read: 0, partner_owned: 0, memo_skipped: 0, removals: {}, released: 0, ghl_set_cards: 0, read_errors: 0 };
+  const counts = { candidates: candidates.length, read: 0, partner_owned: 0, memo_skipped: 0, removals: {}, released: 0, ghl_set_cards: 0, read_errors: 0, integrity: {}, integrity_cards: 0 };
+  const integrityHits = [];
   const contacts = [];
   for (const c of candidates) {
     const memo = notPartnerMemo.get(c.id);
@@ -144,7 +162,7 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false } = {}) {
     const hit = partnerFor(contact, map);
     if (!hit) {
       notPartnerMemo.set(c.id, nowMs);
-      if (c.source === 'removed') {
+      if (c.source === 'removed' && doFive9) {
         const r = await releasePartnerFive9({ contactId: c.id, contact, partnerRows: map, trigger: 'sweep_not_partner', dryRun, deps: fdeps });
         if (r.outcome === 'released' || r.outcome === 'would_release') counts.released++;
         contacts.push({ contact_id: c.id, owner: owner || null, five9: r.outcome });
@@ -154,6 +172,21 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false } = {}) {
     notPartnerMemo.delete(c.id);
     counts.partner_owned++;
     const partnerName = hit.row.partner_name || nameOf(owner);
+    // Build 3: only a partner OWNER is checked (a tag alone is not ownership).
+    if (doIntegrity && partnerIds.has(owner)) {
+      let g;
+      try {
+        g = await checkPartnerContact({ contactId: c.id, contact, map, dryRun, deps: fdeps });
+      } catch (err) {
+        g = { outcome: 'unknown', why: `threw: ${err.message}` };
+      }
+      counts.integrity[g.outcome] = (counts.integrity[g.outcome] || 0) + 1;
+      if (g.posted) counts.integrity_cards++;
+      if (g.outcome === 'mismatch' || g.outcome === 'unknown') {
+        integrityHits.push({ contact_id: c.id, partner: partnerName, outcome: g.outcome, mismatches: g.mismatches || null, why: g.why || null, posted: !!g.posted });
+      }
+    }
+    if (!doFive9) continue;
     let card = null;
     // The "set by GHL" card is about the OWNER: a tag alone (GHL has not reassigned yet) posts none.
     if (!dryRun && partnerIds.has(owner)) {
@@ -175,11 +208,14 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false } = {}) {
     });
   }
   let settled = null;
-  if (!dryRun && mode === 'enforce') {
+  if (doFive9 && !dryRun && mode === 'enforce') {
     try { settled = await settleRecentGroups({ deps: fdeps }); } catch (err) { errors.push(`settle: ${err.message}`); }
   }
-  log(`[PartnerFive9Sweep] ${dryRun ? 'DRY RUN ' : ''}${mode}: ${counts.candidates} candidate(s), ${counts.read} read, ${counts.partner_owned} partner-owned, removals ${JSON.stringify(counts.removals)}, ${counts.released} released${errors.length ? `, ${errors.length} error(s)` : ''}`);
-  return { ok: errors.length === 0, mode, dry_run: dryRun, ...counts, settled, contacts: contacts.slice(0, 200), errors: errors.slice(0, 10) };
+  log(`[PartnerFive9Sweep] ${dryRun ? 'DRY RUN ' : ''}${doFive9 ? mode : 'five9 skipped'}: ${counts.candidates} candidate(s), ${counts.read} read, ${counts.partner_owned} partner-owned, removals ${JSON.stringify(counts.removals)}, ${counts.released} released; integrity (${integrityMode}) ${JSON.stringify(counts.integrity)}${errors.length ? `, ${errors.length} error(s)` : ''}`);
+  return {
+    ok: errors.length === 0, mode, integrity_mode: integrityMode, dry_run: dryRun, ...counts, settled,
+    contacts: contacts.slice(0, 200), integrity_hits: integrityHits.slice(0, 200), errors: errors.slice(0, 10),
+  };
 }
 
 let timer = null;
@@ -210,7 +246,7 @@ export function startPartnerFive9SweepScheduler(env = process.env) {
   };
   timer = setInterval(tick, INTERVAL_MS);
   if (typeof timer.unref === 'function') timer.unref();
-  console.log(`[PartnerFive9Sweep] scheduler started — mode ${partnerFive9Mode(env)}, every 30m`);
+  console.log(`[PartnerFive9Sweep] scheduler started — five9 ${partnerFive9Mode(env)}, rfed integrity ${rfedIntegrityMode(env)}, every 30m`);
   return timer;
 }
 

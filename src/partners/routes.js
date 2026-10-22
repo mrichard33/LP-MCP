@@ -13,6 +13,11 @@
 //   2026-10-22: one partner Five9 sweep now (src/jobs/partner-five9-sweep.js). A dry
 //   run lists every partner-owned contact and the lists it would leave, writing and
 //   posting nothing; dry_run false is the backfill (log or enforce, per the mode).
+// POST /n8n/admin/partner-owner/rfed-batch  { action: plan|record|verify, ids?, batch_no?, sheet? }
+//   2026-10-22 (Build 2): Mark's 50 1-Leg leads → RFED (src/partners/rfed-batch-run.js).
+// POST /n8n/admin/partner-owner/rfed-integrity  { dry_run = true }
+//   2026-10-22 (Build 3): the RFED integrity guard alone (no Five9 work). dry_run false
+//   posts the cards when PARTNER_RFED_INTEGRITY_MODE=alert.
 //
 // These write GHL owners, so they take a STRICT operator check (no soft launch):
 // production runs AUTH_SOFT_LAUNCH=true, which would let a token-less request in.
@@ -62,6 +67,38 @@ export function registerPartnerOwnerRoutes(app, { authenticate = denyAll, deps =
     try {
       const result = dryRun ? await runPartnerFive9Sweep(deps, { dryRun: true }) : await runPartnerFive9SweepTick();
       return res.json({ ok: true, dry_run: dryRun, result });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // 2026-10-22 (Mark, Build 3): the RFED integrity guard alone. Dry run default: lists
+  // every partner-owned contact whose newest LP lead is not on the partner's branch or
+  // does not carry the original's Source / Sub-Source / Promoter. Never a fix.
+  app.post('/n8n/admin/partner-owner/rfed-integrity', authenticate, async (req, res) => {
+    const dryRun = (req.body || {}).dry_run !== false;
+    try {
+      const result = await runPartnerFive9Sweep(deps, { dryRun, integrityOnly: true });
+      return res.json({ ok: true, dry_run: dryRun, result });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // 2026-10-22 (Mark, Build 2): the 50 1-Leg leads → RFED. action plan (read-only; sheet:true
+  // also returns the LP-ready lines with names and phones, to the caller only), record
+  // (approved ids → partner_rfed_batch), verify (the created RFED leads). Never writes LP,
+  // GHL or Five9: LP's API cannot create a lead past the inbound queue or pick the branch.
+  app.post('/n8n/admin/partner-owner/rfed-batch', authenticate, async (req, res) => {
+    const body = req.body || {};
+    try {
+      const run = await import('./rfed-batch-run.js');
+      const ids = Array.isArray(body.ids) && body.ids.length ? body.ids.map(String) : undefined;
+      let result;
+      if (body.action === 'record') result = await run.recordRfedBatch({ approvedIds: ids, batchNo: body.batch_no ?? null, deps });
+      else if (body.action === 'verify') result = await run.verifyRfedBatch({ batchNo: body.batch_no ?? null, deps });
+      else result = await run.planRfedBatch({ ...(ids ? { ids } : {}), sheet: body.sheet === true, deps });
+      return res.json({ ok: true, action: body.action || 'plan', result });
     } catch (err) {
       return res.status(500).json({ ok: false, error: err.message });
     }

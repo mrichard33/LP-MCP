@@ -26,6 +26,8 @@ export const NOT_NULL = Object.freeze({
   partner_owner_assignments: ['ghl_contact_id', 'ghl_user_id'],
   // 2026-10-22: supabase/migrations/20261022120000_partner_five9_removals.sql.
   partner_five9_removals: ['ghl_contact_id', 'action', 'mode'],
+  // 2026-10-22: supabase/migrations/20261022180000_partner_rfed_batch.sql.
+  partner_rfed_batch: ['origin_lp_lead_id', 'partner_branch', 'product', 'status'],
 });
 
 function notNullViolation(table, rows) {

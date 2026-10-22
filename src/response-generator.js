@@ -4286,14 +4286,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
         const tz = promptTimezoneFor(context);
         rehashCallSlots = await memo('rehash_call_slots', () => readRehashCallSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
       }
-      // 2026-10-20 (handoff v3): ONLY a contact whose open objection state is
-      // APPOINTMENT_DISRUPTION.one_leg, or (2026-10-21) one tagged phone-team,
-      // gets the phone presentation branch; every other contact (an absent
-      // spouse on a new lead included) plans as before.
+      // 2026-10-22 (Mark): ONLY a contact tagged phone-team gets the phone
+      // presentation branch (a 1 Leg state alone no longer does); every other
+      // contact (an absent spouse on a new lead included) plans as before.
       if (phonePresentationActive({ objectionState: context.objection_state, tags: context.lead?.current_tags || context.lead?.tags || [], postDemo: postDemoLead, rehash: !!rehash, channel: 'sms' })) {
         const tz = promptTimezoneFor(context);
         phonePresentationSlots = await memo('phone_presentation_slots', () => readPhonePresentationSlots({ contactId, timezone: tz, tzLabel: tzLabel(tz) }));
-        if (phonePresentationSlots) console.log(`[OneLegPresentation] ${contactId}: 1 Leg / phone-team contact — ${phonePresentationSlots.offer.length} phone presentation time(s) to offer`);
+        if (phonePresentationSlots) console.log(`[OneLegPresentation] ${contactId}: phone-team contact — ${phonePresentationSlots.offer.length} phone presentation time(s) to offer`);
       }
       leadStage = opts.dryRun === true ? (opts.leadStageOverride || null) : await readStageForPlanner(contactId);
       // 2026-10-18 (Phase 1 item 4): the plan step our previous SENT reply ran

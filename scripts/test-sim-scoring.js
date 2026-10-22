@@ -478,7 +478,7 @@ test('Phase 0: the six scenarios carry the spec\'s expectations; every scenario 
 test('Phase 0: the scorecard reports a pass rate per family, and a family that falls is worse', () => {
   const fam = (scenario, family, ok) => ({ ...result(scenario, [turn(1, 'hi', ok ? 'What got you looking?' : null)]), family });
   const card = scoreRun([fam('fam_a', 'new_lead', true), fam('fam_b', 'rehash', false), fam('fam_c', 'booking', true)]);
-  assert.equal(SCORING_VERSION, '2026-10-22.3');
+  assert.equal(SCORING_VERSION, '2026-10-22.4');
   assert.deepEqual(card.pass_rate_by_family.rehash, { conversations: 1, passed: 0, pass_rate: 0 });
   assert.equal(card.pass_rate_by_family.new_lead.pass_rate, 1);
   const text = formatScorecard(card);
@@ -516,8 +516,16 @@ test('phone_team_books_call: a phone-team lead offered a visit fails (with the c
     const bad = { ...result('phone_team_books_call', [turn(1, 'When can we talk?', 'I have Tue at 10 AM or Wed at 2 PM. Which works better?', { nepq: { step: 'offer_slots' } })]), channel: 'sms', would_do: [{ kind: 'would_book_appointment', payload: { calendar_name: 'Window Estimate' }, turn: 1 }] };
     const codes = scoreResult(bad).failures.map(f => f.code);
     assert.ok(codes.includes('no_phone_presentation'), codes.join(','));
-    assert.ok(codes.includes('one_leg_booked_visit'), codes.join(','));
+    assert.ok(codes.includes('phone_team_booked_visit'), codes.join(','));
   } finally {
     if (prev === undefined) delete process.env.PHONE_PRESENTATION_CALENDAR_ID; else process.env.PHONE_PRESENTATION_CALENDAR_ID = prev;
   }
+});
+
+// 2026-10-22 (Mark): the phone presentation is for phone-team contacts only.
+test('one_leg_phone_presentation: a 1 Leg lead with no tag must keep the normal offer', () => {
+  const pp = { ...result('one_leg_phone_presentation', [turn(1, 'Can we reschedule?', 'I have Tue at 10 AM or Wed at 2 PM for a call. Which works better?', { nepq: { step: 'pp_offer' } })]), channel: 'sms' };
+  assert.ok(scoreResult(pp).failures.some(f => f.code === 'phone_presentation_not_phone_team'));
+  const normal = { ...result('one_leg_phone_presentation', [turn(1, 'Can we reschedule?', 'I have Tue at 10 AM or Wed at 2 PM. Which works better?', { nepq: { step: 'offer_slots' } })]), channel: 'sms' };
+  assert.ok(!scoreResult(normal).failures.some(f => f.code === 'phone_presentation_not_phone_team'));
 });

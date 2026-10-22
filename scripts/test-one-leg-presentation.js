@@ -46,15 +46,16 @@ const plan = (trigger, conversation = [], phonePresentation = PP) => planNepqTur
   discipline: { booking: { allowed: true, reason: 'x' } }, nowMs: NOW, knownOpenings: true, phonePresentation,
 });
 
-test('only an open one_leg state, a configured calendar and SMS turn the branch on', () => {
-  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, env: ENV }), true);
-  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, env: {} }), false, 'no calendar → inert');
-  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, env: { ...ENV, ONE_LEG_PRESENTATION_MODE: 'off' } }), false);
-  assert.equal(pp.phonePresentationActive({ objectionState: { state_code: 'APPOINTMENT_DISRUPTION.no_show' }, env: ENV }), false);
-  assert.equal(pp.phonePresentationActive({ objectionState: null, env: ENV }), false);
-  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, rehash: true, env: ENV }), false);
-  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, postDemo: true, env: ENV }), false);
-  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, channel: 'livechat', env: ENV }), false);
+// 2026-10-22 (Mark): the phone presentation is for phone-team contacts ONLY. A 1
+// Leg state alone (no tag) keeps the normal offer: a 1 Leg lead reaches Ross only
+// through a new RFED lead in LP, which makes the partner sync add the tag.
+test('a 1 Leg state alone no longer turns the branch on (phone-team only, 2026-10-22)', () => {
+  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, env: ENV }), false, 'one_leg, no tag → normal offer');
+  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, tags: ['active-s5.2'], env: ENV }), false);
+  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, tags: ['phone-team'], env: ENV }), true, 'one_leg AND tagged → on');
+  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, tags: ['phone-team'], env: { ...ENV, ONE_LEG_PRESENTATION_MODE: 'off' } }), false);
+  assert.equal(pp.phonePresentationActive({ objectionState: ONE_LEG, tags: ['phone-team'], postDemo: true, env: ENV }), false);
+  assert.equal(pp.isOneLegContact(ONE_LEG), true, 'the state reader is unchanged');
 });
 
 test('a phone-team contact (an outside partner\'s lead, 2026-10-21) gets the branch too; the tag alone, any case', async () => {

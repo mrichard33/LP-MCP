@@ -74,9 +74,15 @@ export function isPhoneTeamContact(tags) {
   return Array.isArray(tags) && tags.some((t) => String(t || '').trim().toLowerCase() === PHONE_TEAM_TAG);
 }
 
-/** Does this reply turn get the phone presentation branch? Pure. */
+/**
+ * Does this reply turn get the phone presentation branch? Pure.
+ * 2026-10-22 (Mark): ONLY a contact tagged phone-team. A 1 Leg objection state
+ * alone no longer turns it on: a 1 Leg lead reaches Ross (and the phone
+ * presentation) only through a NEW LP lead on RFED, which makes the partner
+ * sync add the tag. objectionState stays in the signature for callers' logs.
+ */
 export function phonePresentationActive({ objectionState, tags = [], postDemo = false, rehash = false, channel = 'sms', env = process.env } = {}) {
-  return channel === 'sms' && !postDemo && !rehash && (isOneLegContact(objectionState) || isPhoneTeamContact(tags))
+  return channel === 'sms' && !postDemo && !rehash && isPhoneTeamContact(tags)
     && onePresentationMode(env) === 'live' && !!phonePresentationCalendarId(env);
 }
 

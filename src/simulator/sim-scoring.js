@@ -49,7 +49,9 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // (the same chat, the next day's wording, after .1 went live).
 // 2026-10-22.3: owner_declined also reads "our estimates are for homeowners", "if you own a home in the future" (the
 // old renter script in kb_embeddings 3275, copied after .2 went live) and "check with the owner".
-export const SCORING_VERSION = '2026-10-22.3';
+// 2026-10-22.4 (Mark): one_leg_phone_presentation now expects the NORMAL offer: the phone
+// presentation is for phone-team contacts only.
+export const SCORING_VERSION = '2026-10-22.4';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -400,22 +402,23 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (did(r, /would_file_callback_five9/)) out.push({ code: 'rehash_dialed', detail: 'a rehash hand-off was filed to Five9' });
     return out;
   },
-  // 2026-10-20 (handoff v3, Mark): a 1 Leg contact is offered the phone
-  // presentation and never a visit; anyone else keeps the normal offer.
-  one_leg_phone_presentation: (r) => {
+  // 2026-10-20 (handoff v3, Mark): a 1 Leg contact was offered the phone
+  // presentation. 2026-10-22 (Mark): ONLY a phone-team contact is; a 1 Leg lead
+  // with no tag keeps the normal offer, like anyone else.
+  one_leg_phone_presentation: (r) => (planSteps(r).some(s => String(s).startsWith('pp_'))
+    ? [{ code: 'phone_presentation_not_phone_team', detail: 'a 1 Leg contact with no phone-team tag got the phone presentation' }] : []),
+  // 2026-10-21 (the user): a phone-team lead is offered the call, never a visit.
+  phone_team_books_call: (r) => {
     if (!String(process.env.PHONE_PRESENTATION_CALENDAR_ID || '').trim()) return [];
     const out = [];
-    if (!planSteps(r).some(s => String(s).startsWith('pp_'))) out.push({ code: 'no_phone_presentation', detail: 'a 1 Leg contact was not offered the phone presentation' });
+    if (!planSteps(r).some(s => String(s).startsWith('pp_'))) out.push({ code: 'no_phone_presentation', detail: 'a phone-team contact was not offered the phone presentation' });
     for (const w of wouldDo(r)) {
-      if (w.kind === 'would_book_appointment' && w.payload?.phone_presentation !== true) out.push({ code: 'one_leg_booked_visit', detail: String(w.payload?.calendar_name || w.payload?.calendar_id || 'a visit'), turn: w.turn });
+      if (w.kind === 'would_book_appointment' && w.payload?.phone_presentation !== true) out.push({ code: 'phone_team_booked_visit', detail: String(w.payload?.calendar_name || w.payload?.calendar_id || 'a visit'), turn: w.turn });
     }
     return out;
   },
-  // 2026-10-21 (the user): a phone-team lead is offered the call, never a visit.
-  phone_team_books_call: (r) => SCENARIO_EXPECTATIONS.one_leg_phone_presentation(r)
-    .map(f => (f.code === 'no_phone_presentation' ? { ...f, detail: 'a phone-team contact was not offered the phone presentation' } : f)),
   absent_spouse_normal_offer: (r) => (planSteps(r).some(s => String(s).startsWith('pp_'))
-    ? [{ code: 'phone_presentation_not_one_leg', detail: 'a contact not in one_leg got the phone presentation' }] : []),
+    ? [{ code: 'phone_presentation_not_phone_team', detail: 'a contact with no phone-team tag got the phone presentation' }] : []),
   rehash_book_call: (r) => {
     const out = rehashLaneFailures(r);
     if (!planSteps(r).includes('rehash_offer')) out.push({ code: 'no_rehash_call_times', detail: 'no Rehash Call times were offered' });

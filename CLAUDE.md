@@ -1324,7 +1324,7 @@ only for a contact THIS code assigned (an open `partner_owner_assignments` row, 
 on the return) whose owner is still that partner, and returns it to the Reece team user 3K6HtoPyBLWeQrrnSnCD (handoff v3,
 2026-10-20); an internal owner is never touched; a dispositioned lead that stays in the branch keeps the partner.
 **A partner GHL put on the contact is never ours to move (handoff v3):** GHL S5.2 Appointment Rescue v2, branch "I. 1
-Leg", assigns 1 Leg leads to Ross itself. With no open assignment for that partner, a return or a reassign is logged
+Leg", assigned 1 Leg leads to Ross itself (Mark turned that tag step off on 2026-10-22; below). With no open assignment for that partner, a return or a reassign is logged
 `skipped_not_ours` and nothing is written; a matching lead already owned by that partner is a `noop` and creates no
 assignment. Every write is read back (a kept owner is `failed`), noted on the contact, logged in
 `partner_owner_log`, and posts ONE card per lead + reason + owner to `PARTNER_ALERT_SLACK_CHANNEL` (`alert-posted`, unset
@@ -1340,9 +1340,9 @@ it. A failed tag keeps the owner and is retried next pass (the memo needs `detai
 only for a contact WE assigned. The customer gets ONE SMS and ONE email, both GHL's (S5.2 / U.RFED): `phone-team` is
 in the send gate's OPERATIONAL_HOLD and the legacy SUPPRESS_TAGS (outreach only; the bot still answers every reply),
 and `executeAddToWorkflow` refuses any code enrollment but S5.2 for it (`skipped_phone_team`;
-`PHONE_TEAM_HOLD_ENABLED=false` is the rollback). The bot tries to book the call: `phonePresentationActive` counts
-`phone-team` like 1 Leg (same calendar, same hold, same both-decision-makers question), and the booking guard reads the
-tag live. Gate scenario `phone_team_books_call`.
+`PHONE_TEAM_HOLD_ENABLED=false` is the rollback). The bot tries to book the call: since 2026-10-22 ONLY a `phone-team`
+contact gets the phone presentation (same calendar, same hold, same both-decision-makers question; a 1 Leg state alone no
+longer does), and the booking guard reads the tag live. Gate scenario `phone_team_books_call`.
 
 **A partner-owned lead leaves every Reece Five9 list, and GHL's hand-off is seen (handoff, 2026-10-22).** Micaella
 dialed Ross's 1 Leg leads after GHL had handed them over. `ensurePartnerFive9Removal` (`src/partners/five9-removal.js`)
@@ -1367,8 +1367,33 @@ inventory read. A partner GHL put there (rule 3b) is still never moved, but post
 off | log (default: records `mode='log'` rows only) | enforce; the executor runs the rows unarmed only while it is still
 enforce. `POST /n8n/admin/partner-owner/five9-sweep {dry_run}` lists every partner-owned contact and the lists it would
 leave (dry run default). The real fix is LP excluding partner-owned leads from its export (ask LP).
-**A 1 Leg contact is offered a phone presentation, both decision makers on the call (Mark, handoff v3, 2026-10-20).**
-Only a contact whose OPEN objection state is `APPOINTMENT_DISRUPTION.one_leg` (rule `LP_DISP_1LEG_TO_ONELEG`) gets it:
+**One-Leg → RFED: a NEW RFED lead in LP is the only way a lead reaches Ross (Mark, 2026-10-22).** No automatic day-3
+hand-off (`src/one-leg/day3.js`, job `one-leg-day3`, `one_leg_handoffs`, `ONE_LEG_RFED_MODE` were NOT approved; see
+`docs/ghl-one-leg-day3.md`). Mark turned off S5.2 "I. 1 Leg"'s `phone-team` step. The one trigger stays: a new LP lead on
+RFED → the partner sync makes Ross the owner and adds `phone-team` → U.RFED + the Five9 removal. **The promoter rule
+(replaces the 2026-10-21 "Promoter blank for canvass"):** an RFED lead copies Source, Sub-Source AND Promoter from the
+original lead, canvass included; Promoter is blank only when the original had none; a promoter name that does not match
+exactly one LP promoter id BLOCKS the row, never sends it blank. **LP's API cannot do it:** every create path (addLead,
+`/api/Leads/LeadAdd`, `/api/Leads/AddLead`) lands in the inbound queue, LP picks the branch from the zip (no inquiry landed
+on RFED in 21 days; the RFED leads since 10/01 were moved there by hand), and LP's auto-import took 0 of 974 inquiries
+whose phone was already in LP. So Mark's 50 (`MARK_50`, `src/partners/rfed-batch.js`, pure) are created in LP directly
+(LP support or a person, from the sheet), and the original 1-Leg lead stays as it is. `src/partners/rfed-batch-run.js`
+(`POST /n8n/admin/partner-owner/rfed-batch`, CLI `scripts/rfed-1leg-batch.js`): `plan` (read-only; skips a sale, a DNC
+of any kind, a new live appointment, a newer lead, a waiting inquiry or a lead no longer 1Leg; an unreadable read
+blocks; `sheet: true` returns the LP lines to the caller only), `record` (approved ids → `partner_rfed_batch`), `verify`
+(the RFED lead with the same fields, Ross the owner, `phone-team`, a `partner_five9_removals` row). It never writes LP,
+GHL or Five9. **The guard: Ross owns it in GHL ⇒ it must be RFED in LP.** `src/partners/rfed-integrity.js`, run in the
+partner Five9 sweep's loop after its live read (no extra GHL reads): a contact whose live OWNER is a partner (a tag alone
+is not) must have its newest LP lead (`newestLead`) on the partner's branch, with the Source / Sub-Source / Promoter of the
+lead it came from (the `partner_rfed_batch` origin, else the newest 1Leg lead on the prospect within 180 days; none →
+branch only, since a lead LP moved to RFED is its own original). A failed read or no LP lead is "could not tell": no card.
+ONE card per contact + mismatch set to `PARTNER_ALERT_SLACK_CHANNEL` (audit `partner_rfed_integrity`, permanent), never
+a fix. `PARTNER_RFED_INTEGRITY_MODE` off | log (default: `job_runs.detail.integrity` / `integrity_hits`) | alert; the
+scheduled pass needs `PARTNER_FIVE9_REMOVAL_MODE` on, and `POST /n8n/admin/partner-owner/rfed-integrity {dry_run}` runs it
+alone.
+**A phone-team contact is offered a phone presentation, both decision makers on the call (Mark, handoff v3, 2026-10-20;
+phone-team ONLY since 2026-10-22).** Only a contact tagged `phone-team` gets it (an open `APPOINTMENT_DISRUPTION.one_leg`
+state alone no longer does: a 1 Leg lead reaches Ross through a new RFED lead, above):
 `phonePresentationActive` (`src/agentic/one-leg-presentation.js`; SMS, not post-demo, not rehash) passes the real
 openings of `PHONE_PRESENTATION_CALENDAR_ID` to `planNepqTurn({ phonePresentation })`. Two times (`pp_offer`), a pick is
 HELD while the lead is asked "will both of you be on the call?" (`pp_hold_dm`), only a yes books it (`pp_confirm` →
@@ -1376,9 +1401,10 @@ HELD while the lead is asked "will both of you be on the call?" (`pp_hold_dm`), 
 works for both (`pp_dm_no`); any plan that would still offer VISIT times offers these instead, or none
 (`phonePresentationOffer`). The price is gone over on the call, never a number in a text. The calendar is GHL-only
 (`isGhlOnlyCalendarId`: a 1Leg lead is post-issue, so an LP SetAppointment would mint a new lead), `executeBookAppointment`
-refuses it for any contact not in one_leg (`skipped_not_one_leg`, fail closed) and leaves its assignee to the calendar.
-Every other contact, a "my wife isn't home" new lead included, keeps the normal offer. GHL S5.2 "I. 1 Leg" still owns
-every 1 Leg message, its timing and the Ross assignment: this is a reply branch only, never a sender. Live chat does
+refuses it for any contact without a live-read `phone-team` tag (`skipped_not_one_leg`, reason `not_phone_team`, fail
+closed) and leaves its assignee to the calendar. Every other contact, a 1 Leg lead with no tag and a "my wife isn't home"
+new lead included, keeps the normal offer (scenario `one_leg_phone_presentation` checks it). GHL S5.2 "I. 1 Leg" still
+owns every 1 Leg message and its timing: this is a reply branch only, never a sender. Live chat does
 not take it (its fast lane has no objection state). `ONE_LEG_PRESENTATION_MODE` off|live, default live, inert until the
 calendar id is set. `recovery_cadence` on `objection_state_policies` is informational (nothing in src/ reads it); the
 one_leg row reads days 0/3/5/8 (sms, sms, email, sms) to match the workflow, and `recovery_touch_count` stays as it is

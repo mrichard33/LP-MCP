@@ -506,6 +506,14 @@ export const MODES = Object.freeze([
       goLive: 'the handoff: run in log, review which lists each Ross contact would leave (partner_five9_removals mode log), then enforce',
       note: 'A contact a partner owns in GHL (our sync or GHL S5.2 "I. 1 Leg") comes off every Reece outbound list (not Sale / Rehash / Inbound Queue), again after each 6 AM LP load; never the Five9 DNC. log records only.',
     }),
+  // 2026-10-22 (Mark, Build 3): Ross owns it in GHL ⇒ its newest LP lead must be RFED, same Source / Sub-Source / Promoter.
+  m('PARTNER_RFED_INTEGRITY_MODE', 'sales', 'enum', ['off', 'log', 'alert'], 'log',
+    { live: ['alert'], shadow: ['log'], off: ['off'] }, {
+      since: '2026-10-22', decider: 'Mark',
+      evidence: job('partner-five9-sweep'),
+      goLive: 'Mark reads the first log run (job_runs.detail.integrity / integrity_hits of partner-five9-sweep, or POST /n8n/admin/partner-owner/rfed-integrity) and says to alert',
+      note: 'A contact a partner OWNS in GHL whose newest LP lead is not on the partner branch, or does not carry the original lead\'s Source / Sub-Source / Promoter, gets ONE card (alert). Never a fix: no owner change, no LP write.',
+    }),
   m('CANCEL_RESET_ROUTING_MODE', 'dialer', 'enum', OSL, 'live', OSL_S, {
     since: '2026-10-15', decider: 'the user', evidence: job('cancel-reset-routing'),
     goLive: 'ruled live by the user on 2026-10-15: every cancelled lead goes to Resets-Hot',

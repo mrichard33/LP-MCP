@@ -312,11 +312,10 @@ export const SCENARIOS = Object.freeze({
   price_then_goodbye: { title: 'Price ask, then "have a good day" (Erica Hilts)', family: 'objection', expect: { 3: { question_allowed: false, no_clock: true }, 4: { question_allowed: false, no_clock: true } }, persona: DANA, turns: ["Hi, I'm looking to get a bay window. The area is about 6ft wide", "Ok I see. What's an average price including installation?", 'Thank you for your time, just needing an average estimation, not exact pricing. Have a good day.', 'I can call back when I have more time. Ty'] },
   slider_only: { title: 'One sliding glass door (meets the minimum)', family: 'booking', persona: DANA, autoAnswer: true, turns: ['I need to replace our sliding glass door', 'Yes, please set up a visit'] },
   // ── 2026-10-20 (handoff v3): the 1 Leg phone presentation ──
-  // A 1 Leg contact (open state APPOINTMENT_DISRUPTION.one_leg) is offered a
-  // phone presentation with both decision makers, never another visit; a lead
-  // NOT in that state who says the spouse is away keeps the normal offer. The
-  // 1 Leg check applies only when PHONE_PRESENTATION_CALENDAR_ID is set.
-  one_leg_phone_presentation: { title: '1 Leg: reschedule ask gets the phone presentation, both decision makers', family: 'booking', persona: ONE_LEG_LEAD, channels: ['sms'], turns: ['Can we reschedule? My husband had to work when the rep came.'] },
+  // 2026-10-22 (Mark): the phone presentation is for phone-team contacts ONLY.
+  // A 1 Leg contact with no tag, and a lead who says the spouse is away, keep the
+  // normal offer. The phone-team check applies only when PHONE_PRESENTATION_CALENDAR_ID is set.
+  one_leg_phone_presentation: { title: '1 Leg, no phone-team tag: a reschedule ask keeps the normal offer (2026-10-22)', family: 'booking', persona: ONE_LEG_LEAD, channels: ['sms'], turns: ['Can we reschedule? My husband had to work when the rep came.'] },
   // 2026-10-21 (the user): a contact GHL tagged phone-team (an RFED lead our
   // partner sync gave Ross) is offered the same phone presentation call.
   phone_team_books_call: { title: 'phone-team (Ross) lead: a time ask gets the phone presentation, not a visit', family: 'booking', persona: PHONE_TEAM_LEAD, channels: ['sms'], turns: ['Hi, I got your text. When can we talk about the windows?'] },
