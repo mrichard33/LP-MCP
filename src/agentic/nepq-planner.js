@@ -2552,6 +2552,28 @@ export function checkAgainstReference(draft, line, slots = [], plan = null) {
 // ask would make it two questions and the first reads as a dangling line.
 const TAG_STATEMENT_RX = /,\s*(?:right|correct|yeah|yes|no|is\s+that\s+(?:right|correct))\s*[.!]?$/i;
 
+/**
+ * A reply that names the same two or more clock times in two sentences: the
+ * reply without the later copy, then without the earlier one. null when no
+ * pair repeats. Pure.
+ * @returns {string[]|null}
+ */
+export function repeatedTimeCopies(text) {
+  const parts = splitSentences(text);
+  const keys = parts.map(s => {
+    const mins = [...new Set(clockMinutes(s))].sort((a, b) => a - b);
+    return mins.length >= 2 ? mins.join(',') : null;
+  });
+  for (let j = 1; j < parts.length; j++) {
+    const i = keys[j] ? keys.indexOf(keys[j]) : -1;
+    if (i >= 0 && i < j) {
+      const without = (k) => parts.filter((_, n) => n !== k).join(' ').trim();
+      return [without(j), without(i)];
+    }
+  }
+  return null;
+}
+
 export function appendReferenceAsk(draft, refLine, failed = []) {
   let body = String(draft || '').trim();
   if (!body || body.includes('?') || /\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)/i.test(body)) return null;
@@ -3077,6 +3099,21 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     // your home to see what's letting that cold in." and nothing to answer).
     body = `${body.replace(/[.!\s]+$/, '')}. Would that help?`;
     changes.push('bridge_question_added');
+  }
+  // 2026-10-22 (first live sim after the rehash switches went on): the model
+  // wrote the pair twice ("I have tomorrow at 9:30 AM ET or tomorrow at 3:30 PM
+  // ET. Does either work? I have 9:30 AM ET or 3:30 PM ET, and we can go over
+  // … a better price. Which works better?"), the one-ask trim (step 5) took the
+  // middle question out, and the same two times went out back to back. One copy
+  // stays: the version that still does the reference's job, else the reference
+  // line itself. Rehash only (REHASH_BOOKING_FIX_ENABLED); the pre-demo bot is frozen.
+  if (plan.rehash_fix && body) {
+    const copies = repeatedTimeCopies(body);
+    if (copies) {
+      const pick = referenceMove && refLine ? copies.find(t => !checkAgainstReference(t, refLine, refSlots, plan).length) : copies[0];
+      body = pick || refLine;
+      changes.push('repeated_times_dropped');
+    }
   }
   if (referenceMove) {
     let failed = checkAgainstReference(body, refLine, refSlots, plan);

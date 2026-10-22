@@ -295,3 +295,28 @@ test('Jim, live conditions: 10am tomorrow not open → offer tomorrow, never boo
   assert.notEqual(none.step, 'rehash_confirm', 'never books today');
   assert.match(none.fixed_line || '', /^10 AM tomorrow isn't open/);
 });
+
+// 2026-10-22, the first live sim after the switches went on: the model wrote the
+// pair twice with "Does either work?" between, the one-ask trim took that out,
+// and "I have tomorrow at 9:30 AM ET or tomorrow at 10:30 AM ET. I have 9:30 AM
+// ET or 10:30 AM ET, and …" went out.
+test('a time pair written twice goes out once', async () => {
+  const { repeatedTimeCopies } = await import('../src/agentic/nepq-planner.js');
+  const { hasBetterPrice } = await import('../src/agentic/rehash-nepq.js');
+  const p = plan('Can you call me?', []);
+  assert.equal(p.step, 'rehash_offer');
+  const draft = "Sure thing, Pat. I have tomorrow at 9:30 AM ET or tomorrow at 10:30 AM ET. Does either work? I have 9:30 AM ET or 10:30 AM ET, and we can go over whether there's room to get you a better price. Which works better?";
+  const r = enforceNepqPlan(draft, p);
+  assert.ok(r.changes.includes('repeated_times_dropped'), r.changes.join(','));
+  assert.equal((r.text.match(/9:30/g) || []).length, 1, r.text);
+  assert.ok(hasBetterPrice(r.text), r.text);
+  assert.equal((r.text.match(/\?/g) || []).length, 1, r.text);
+  // A draft that names the pair once is left alone.
+  const once = "Happy to, Pat. I may be able to get you a better price on a quick call. I have tomorrow at 9:30 AM ET or tomorrow at 10:30 AM ET. Which works better?";
+  assert.ok(!enforceNepqPlan(once, p).changes.includes('repeated_times_dropped'));
+  assert.equal(repeatedTimeCopies(once), null);
+  assert.deepEqual(repeatedTimeCopies('I have 9:30 AM or 10:30 AM. I have 9:30 AM or 10:30 AM, sure. Which?'),
+    ['I have 9:30 AM or 10:30 AM. Which?', 'I have 9:30 AM or 10:30 AM, sure. Which?']);
+  // Off: the old behaviour, byte for byte.
+  assert.ok(!off(() => enforceNepqPlan(draft, off(() => plan('Can you call me?', [])))).changes.includes('repeated_times_dropped'));
+});
