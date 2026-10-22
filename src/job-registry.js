@@ -628,6 +628,19 @@ export const JOBS = Object.freeze([
       && Number.isFinite(Date.parse(env.PARTNER_GO_LIVE_AT || '')),
   },
   {
+    // 2026-10-22 (handoff Build 1): a contact a partner owns in GHL (our sync or
+    // GHL's own S5.2 "I. 1 Leg") comes off every Reece Five9 list, again after
+    // each 6 AM LP load. Mirrors partnerFive9Mode() in src/partners/five9-removal.js
+    // (only 'off' stops it); the scheduler also stays down while the partner sync is off.
+    id: 'partner-five9-sweep',
+    label: 'Partner-owned contacts (Ross Erstling) off every Reece Five9 list; the "set by GHL" card; released on return',
+    group: 'five9',
+    cadence: 'every 30 min',
+    enabledEnv: 'PARTNER_FIVE9_REMOVAL_MODE',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.PARTNER_FIVE9_REMOVAL_MODE || 'log').toLowerCase().trim() !== 'off',
+  },
+  {
     id: 'post-issue-rebook-retry',
     label: 'Post-issue LP rebooks: retry a failed read or send before #contact-center is asked',
     group: 'lp-intake',

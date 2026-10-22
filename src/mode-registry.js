@@ -498,6 +498,14 @@ export const MODES = Object.freeze([
     goLive: '2-3 shadow runs in five9_call_journey_runs with status ok, rows_returned > 0 and rows_rejected = 0 (the user\'s Call Journey handoff, 2026-10-15)',
     note: 'Pulls the Five9 "Call Journey" report every 15 min into five9_call_journey (shadow: pull + parse + log, no rows).',
   }),
+  // 2026-10-22 (handoff): partner-owned contacts leave every Reece Five9 list.
+  m('PARTNER_FIVE9_REMOVAL_MODE', 'dialer', 'enum', ['off', 'log', 'enforce'], 'log',
+    { live: ['enforce'], shadow: ['log'], off: ['off'] }, {
+      since: '2026-10-22', decider: 'Mark',
+      evidence: { table: 'partner_five9_removals', ...job('partner-five9-sweep') },
+      goLive: 'the handoff: run in log, review which lists each Ross contact would leave (partner_five9_removals mode log), then enforce',
+      note: 'A contact a partner owns in GHL (our sync or GHL S5.2 "I. 1 Leg") comes off every Reece outbound list (not Sale / Rehash / Inbound Queue), again after each 6 AM LP load; never the Five9 DNC. log records only.',
+    }),
   m('CANCEL_RESET_ROUTING_MODE', 'dialer', 'enum', OSL, 'live', OSL_S, {
     since: '2026-10-15', decider: 'the user', evidence: job('cancel-reset-routing'),
     goLive: 'ruled live by the user on 2026-10-15: every cancelled lead goes to Resets-Hot',

@@ -9,6 +9,10 @@
 //   enabled, last tick, cursor, average lag (LP change → GHL write) over 24 h, the
 //   last 20 log rows, and the contacts THIS code assigned and has not handed back
 //   (partner_owner_assignments, handoff v3: only those are ever returned).
+// POST /n8n/admin/partner-owner/five9-sweep    { dry_run = true }
+//   2026-10-22: one partner Five9 sweep now (src/jobs/partner-five9-sweep.js). A dry
+//   run lists every partner-owned contact and the lists it would leave, writing and
+//   posting nothing; dry_run false is the backfill (log or enforce, per the mode).
 //
 // These write GHL owners, so they take a STRICT operator check (no soft launch):
 // production runs AUTH_SOFT_LAUNCH=true, which would let a token-less request in.
@@ -17,6 +21,7 @@ import { syncPartnerOwner, partnerSyncConfig } from './owner-sync.js';
 import { loadPartnerMap } from './owner-resolver.js';
 import { CURSOR_ID, runPartnerFastPollTick, tickState, pollIntervalMs } from '../jobs/partner-fast-poll.js';
 import { denyAll } from '../auth.js';
+import { runPartnerFive9Sweep, runPartnerFive9SweepTick } from '../jobs/partner-five9-sweep.js';
 
 const LEAD_COLUMNS = 'lp_lead_id, lp_prospect_id, lp_branch_id, rep_name, ghl_contact_id, created_at_lp, updated_at_lp';
 
@@ -47,6 +52,16 @@ export function registerPartnerOwnerRoutes(app, { authenticate = denyAll, deps =
       if (!lead) return res.status(404).json({ ok: false, error: `no lp_leads row ${leadId}` });
       const result = await syncPartnerOwner(lead, { dryRun, deps });
       return res.json({ ok: true, dry_run: dryRun, lead: { lp_branch_id: lead.lp_branch_id, rep_name: lead.rep_name, ghl_contact_id: lead.ghl_contact_id }, result });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/n8n/admin/partner-owner/five9-sweep', authenticate, async (req, res) => {
+    const dryRun = (req.body || {}).dry_run !== false;
+    try {
+      const result = dryRun ? await runPartnerFive9Sweep(deps, { dryRun: true }) : await runPartnerFive9SweepTick();
+      return res.json({ ok: true, dry_run: dryRun, result });
     } catch (err) {
       return res.status(500).json({ ok: false, error: err.message });
     }

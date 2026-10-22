@@ -356,6 +356,7 @@ import { startCapacityGateJobs } from './jobs/capacity-gate-jobs.js';  // 2026-1
 import { startIdentityFillScheduler } from './jobs/lp-identity-fill-sweep.js';  // 2026-10-11
 import { registerLpIdentityFillRoutes } from './admin/lp-identity-fill.js';  // 2026-10-11
 import { startPartnerFastPollScheduler } from './jobs/partner-fast-poll.js';  // 2026-10-20 partner lead ownership
+import { startPartnerFive9SweepScheduler } from './jobs/partner-five9-sweep.js';  // 2026-10-22 partner leads off the Reece Five9 lists
 import { registerPartnerOwnerRoutes } from './partners/routes.js';  // 2026-10-20
 import { startPostIssueRetryScheduler } from './jobs/post-issue-rebook-retry.js';  // 2026-10-09
 import { registerLeadLeakRoutes, startLeadLeakScheduler, startLeadUncalledScheduler } from './jobs/lead-leak-monitor.js';  // 2026-09-26
@@ -1060,6 +1061,7 @@ const server = app.listen(PORT, async () => {
   startCapacityGateJobs();
   startIdentityFillScheduler();
   startPartnerFastPollScheduler();  // 2026-10-20 — partner owner fast lane (every PARTNER_POLL_MS)
+  startPartnerFive9SweepScheduler();  // 2026-10-22 — partner-owned contacts off the Reece Five9 lists (every 30 min)
   startPostIssueRetryScheduler();
   startLeadLeakScheduler();
   startLeadUncalledScheduler();

@@ -34,6 +34,14 @@
 //   4. A dispositioned or cancelled lead that stays in RFED keeps the partner (rule
 //      4): the branch decides, never the disposition.
 //
+// 2026-10-22 (handoff, Builds 1 and 2): a partner owner, however it got there, means
+// Reece stops dialing the lead. Every path that ends with a partner owning the contact
+// (assigned, reassigned, a noop, skipped_not_ours) calls ensurePartnerFive9Removal
+// (src/partners/five9-removal.js), and a return calls releasePartnerFive9. A partner
+// GHL put there (rule 3b) still is never moved, but now posts ONE card per lead,
+// "🤝 PARTNER LEAD ASSIGNED → <partner> (set by GHL)" (reason assigned_by_ghl), so the
+// 1 Leg hand-offs are seen. The Five9 step runs after the owner write and never fails it.
+//
 // Cost: the 15-minute sync calls this for EVERY lead it writes. A lead that is not
 // partner-relevant (not matching, previous branch not a partner branch, no recent
 // failed decision) returns after the cached map alone, with no read. A relevant lead
@@ -56,7 +64,7 @@ const MEMO_MS = 24 * 60 * 60 * 1000;
 const RECENT_FAILED_MS = 24 * 60 * 60 * 1000;
 const RECENT_CACHE_MS = 60_000;
 const WRITE_REASONS = new Set(['assigned', 'reassigned', 'returned']);
-const CARD_REASONS = new Set(['assigned', 'reassigned', 'returned', 'failed']);
+const CARD_REASONS = new Set(['assigned', 'reassigned', 'returned', 'failed', 'assigned_by_ghl']);
 // A non-write reason identical to the lead's last one is not logged again (an old
 // RFED lead LP touches every day must not grow one skipped_pre_golive row a pass).
 const QUIET_REPEAT = new Set(['noop', 'skipped_pre_golive', 'skipped_not_ours', 'no_ghl_contact']);
@@ -98,6 +106,10 @@ async function defaultDeps(deps) {
   if (!out.addNote) out.addNote = (await import('../ghl.js')).addGHLNote;
   if (!out.postToSlack) out.postToSlack = (await import('../slack.js')).postToSlack;
   if (!out.alertPosted) out.alertPosted = await import('../alert-posted.js');
+  // The Five9 removal (2026-10-22). Production passes no ghlFetch, so it gets the real
+  // module; a test that injects GHL gets none unless it injects partnerFive9 too, so no
+  // test ever reaches Five9.
+  if (!('partnerFive9' in out)) out.partnerFive9 = deps.ghlFetch ? null : await import('./five9-removal.js');
   out.env = out.env || process.env;
   out.now = out.now || Date.now;
   out.log = out.log || console.log;
@@ -218,12 +230,15 @@ export function buildPartnerCard({ reason, contact, lead, partnerName, toLabel, 
     reassigned: `🔁 PARTNER LEAD REASSIGNED → ${toLabel}`,
     returned: `↩️ PARTNER LEAD RETURNED → ${toLabel}`,
     failed: `⚠️ PARTNER OWNER UPDATE FAILED (wanted ${toLabel})`,
+    assigned_by_ghl: `🤝 PARTNER LEAD ASSIGNED → ${toLabel} (set by GHL)`,
   }[reason];
   const lines = [
     `*${head}*`,
     `${name} · ${prospectLabel(lead?.lp_prospect_id)}`,
     `Partner: ${partnerName || '—'} · LP branch ${lead?.lp_branch_id || '—'} · rep ${lead?.rep_name || '—'}`,
-    `Owner was: ${fromLabel}`,
+    reason === 'assigned_by_ghl'
+      ? 'GHL made the partner the owner (S5.2 "I. 1 Leg" or U.RFED), not LP-MCP. LP-MCP leaves this owner as it is.'
+      : `Owner was: ${fromLabel}`,
     `Contact ID: ${contact?.id || lead?.ghl_contact_id || 'unknown'}`,
   ];
   if (error) lines.push(`Error: ${String(error).slice(0, 300)}`);
@@ -250,6 +265,17 @@ async function postCard(d, { reason, lead, target, contact, partnerName, toLabel
   }
   console.warn(`[PartnerOwner] Slack post failed for contact ${lead.ghl_contact_id}: ${res?.error || 'unknown'}`);
   return { posted: false, why: res?.error || 'post_failed' };
+}
+
+/**
+ * The rule 3b card for a contact the sweep found (src/jobs/partner-five9-sweep.js):
+ * the same card, key and dedupe as the sync's own, so the two never post it twice.
+ */
+export async function postGhlSetCard({ contact, lead, partnerName, partnerUserId, deps = {} }) {
+  if (!lead?.lp_lead_id) return { posted: false, why: 'no_lead' };
+  const d = await defaultDeps(deps);
+  return postCard(d, { reason: 'assigned_by_ghl', lead, target: partnerUserId, contact, partnerName,
+    toLabel: partnerName || partnerUserId, fromLabel: '—' });
 }
 
 /** Live owner of the contact, or throws. */
@@ -458,11 +484,36 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
   // GHL (the S5.2 "I. 1 Leg" path) or by a person, never by us.
   const partnerNotOurs = Boolean(from && partnerIds.has(from)
     && (!assignment || String(assignment.ghl_user_id) !== from));
+  // Builds 1 and 2 (2026-10-22). Never throws, never blocks the owner write.
+  const five9 = async (trigger, contactNow, partnerName) => {
+    if (dryRun || !d.partnerFive9) return null;
+    const fdeps = { supabase: d.supabase, ghlFetch: d.ghlFetch, postToSlack: d.postToSlack, alertPosted: d.alertPosted, env: d.env, now: d.now, log: d.log };
+    try {
+      const r = trigger === 'returned'
+        ? await d.partnerFive9.releasePartnerFive9({ contactId: lead.ghl_contact_id, trigger, deps: fdeps })
+        : await d.partnerFive9.ensurePartnerFive9Removal({
+          contactId: lead.ghl_contact_id, contact: contactNow, partnerUserIds: partnerIds, partnerName, trigger, deps: fdeps,
+        });
+      return r && { outcome: r.outcome, ...(r.mode ? { mode: r.mode } : {}), ...(r.rows_queued ? { rows_queued: r.rows_queued } : {}),
+        ...(r.lists ? { list_count: r.lists.length } : {}), ...(r.error ? { error: r.error } : {}) };
+    } catch (err) {
+      return { outcome: 'error', error: err.message };
+    }
+  };
+  // Rule 3b, seen: a partner GHL put on the contact gets one card per lead + partner.
+  const ghlSetCard = async (partnerName) => {
+    if (dryRun) return null;
+    return postCard(d, { reason: 'assigned_by_ghl', lead: deciding, target: from, contact, partnerName,
+      toLabel: partnerName || from, fromLabel: '—' });
+  };
   const notOurs = async () => {
     const out = { ok: true, reason: 'skipped_not_ours', from, would_target: match ? String(match.ghl_user_id) : cfg.defaultOwner };
+    const partnerName = await partnerNameForUser(from, d);
+    out.card = await ghlSetCard(partnerName);
+    out.five9 = await five9('ghl_set', contact, partnerName);
     if (!dryRun && !quiet('skipped_not_ours')) {
-      await writeLog(d, { ...base, reason: 'skipped_not_ours', from_owner: from, partner_name: await partnerNameForUser(from, d),
-        detail: { would_target: out.would_target } });
+      await writeLog(d, { ...base, reason: 'skipped_not_ours', from_owner: from, partner_name: partnerName,
+        detail: { would_target: out.would_target, ghl_set: true, ...(out.five9 ? { five9: out.five9 } : {}) } });
     }
     return out;
   };
@@ -491,15 +542,23 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
     && decidingHistory[0]?.reason === 'failed');
   if (from === target && !finishOurs) {
     const out = { ok: true, reason: 'noop', from, target, eligibility };
+    // A partner owner with no assignment of ours: GHL set it (rule 3b, Build 2).
+    const ghlSet = Boolean(match && partnerNotOurs);
+    if (match && !dryRun) {
+      if (ghlSet) out.card = await ghlSetCard(partnerName);
+      out.five9 = await five9(ghlSet ? 'ghl_set' : 'owner_sync', contact, partnerName);
+    }
+    const extra = { ...(ghlSet ? { ghl_set: true } : {}), ...(out.five9 ? { five9: out.five9 } : {}) };
     if (match?.ghl_tag && !hasTag(contact, match.ghl_tag)) {
       if (dryRun) return { ...out, would_tag: match.ghl_tag };
       out.tag = await ensurePartnerTag(d, lead.ghl_contact_id, match.ghl_tag, contact);
-      await writeLog(d, { ...base, reason: 'noop', from_owner: from, to_owner: target, partner_name: partnerName, detail: { tag: out.tag, eligibility } });
+      await writeLog(d, { ...base, reason: 'noop', from_owner: from, to_owner: target, partner_name: partnerName, detail: { tag: out.tag, eligibility, ...extra } });
       return out;
     }
     if (!dryRun && !quiet('noop')) {
+      const detail = { ...(match?.ghl_tag ? { tag: { tag: match.ghl_tag, present: true, added: false } } : {}), ...extra };
       await writeLog(d, { ...base, reason: 'noop', from_owner: from, to_owner: target, partner_name: partnerName,
-        ...(match?.ghl_tag ? { detail: { tag: { tag: match.ghl_tag, present: true, added: false } } } : {}) });
+        ...(Object.keys(detail).length ? { detail } : {}) });
     }
     return out;
   }
@@ -540,6 +599,8 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
     await releaseAssignment(d, lead.ghl_contact_id);
   }
   if (tag?.error) console.warn(`[PartnerOwner] tag ${tag.tag} on ${lead.ghl_contact_id}: ${tag.error} (owner already set; retried next pass)`);
+  // Build 1: a partner owner leaves the Reece Five9 lists; a return stops that.
+  const five9Result = await five9(match ? 'owner_sync' : 'returned', applied.contact || contact, partnerName);
   const stamp = formatEt(new Date(d.now()));
   const note = `Owner → ${toLabel} · LP branch ${deciding.lp_branch_id || '—'} · rep ${deciding.rep_name || '—'} · ${stamp}`;
   try {
@@ -553,9 +614,10 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
       opportunities: applied.opportunities, eligibility, deciding_lead: String(deciding.lp_lead_id),
       ...(applied.opportunities_skipped.length ? { opportunities_skipped_no_pipeline_access: applied.opportunities_skipped } : {}),
       ...(tag ? { tag } : {}),
+      ...(five9Result ? { five9: five9Result } : {}),
     },
   });
   const card = await postCard(d, { reason, lead: deciding, target, contact: applied.contact || contact, partnerName, toLabel, fromLabel });
   d.log(`[PartnerOwner] ${reason}: contact ${lead.ghl_contact_id} ${from || 'none'} → ${target} (${applied.opportunities.length} open opportunit${applied.opportunities.length === 1 ? 'y' : 'ies'})`);
-  return { ok: true, reason, from, target, opportunities: applied.opportunities, card, ...(tag ? { tag } : {}) };
+  return { ok: true, reason, from, target, opportunities: applied.opportunities, card, ...(tag ? { tag } : {}), ...(five9Result ? { five9: five9Result } : {}) };
 }

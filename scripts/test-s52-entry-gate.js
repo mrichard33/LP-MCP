@@ -148,6 +148,63 @@ test('gate: an old entry:canvassing / source:canvass marker alone does not block
   }
 });
 
+// 2026-10-21 (Mark): a canvass lead whose current lead is 1Leg may enter S5.2 for the
+// one_leg state (its "I. 1 Leg" branch hands the lead to Ross). Nothing else changes.
+test('gate: canvass + current lead 1Leg + one_leg state → allowed', () => {
+  const leads = [row('1', '1Leg', '2026-10-01T14:00:00+00:00', '2026-09-25T10:00:00+00:00')];
+  const v = gate.evaluateS52Entry({ leads, tags: ['active-entry:canvassing'], nowMs: NOW, stateCode: 'APPOINTMENT_DISRUPTION.one_leg' });
+  assert.equal(v.allow, true);
+  assert.equal(v.detail.canvass_one_leg, true);
+});
+
+test('gate: canvass stays blocked for a cancel, a no-show, NoHome, or a 1Leg lead in any other state', () => {
+  const tags = ['active-entry:canvassing'];
+  const cases = [
+    ['CXL', 'APPOINTMENT_DISRUPTION.cancelled'],
+    ['NoHome', 'APPOINTMENT_DISRUPTION.no_show'],
+    ['NoHome', 'APPOINTMENT_DISRUPTION.one_leg'], // the state alone is not enough: the lead must be 1Leg
+    ['1Leg', 'APPOINTMENT_DISRUPTION.cancelled'],
+    ['1Leg', null],
+  ];
+  for (const [disp, stateCode] of cases) {
+    const leads = [row('1', disp, '2026-10-01T14:00:00+00:00', '2026-09-25T10:00:00+00:00')];
+    assert.equal(gate.evaluateS52Entry({ leads, tags, nowMs: NOW, stateCode }).reason, 'canvassing', `${disp} / ${stateCode}`);
+  }
+});
+
+test('gate: canvass 1Leg still meets every other rule, on ALL leads (demo, live appointment, No Demo)', () => {
+  const tags = ['active-entry:canvassing'];
+  const stateCode = 'APPOINTMENT_DISRUPTION.one_leg';
+  // A demo on an older lead.
+  let leads = [
+    row('2', '1Leg', '2026-10-01T14:00:00+00:00', '2026-09-25T10:00:00+00:00'),
+    row('1', 'OPPFDN', '2026-05-01T14:00:00+00:00', '2026-04-20T10:00:00+00:00'),
+  ];
+  assert.equal(gate.evaluateS52Entry({ leads, tags, nowMs: NOW, stateCode }).reason, 'demo_on_any_lead');
+  // A live appointment on another lead.
+  leads = [
+    row('2', '1Leg', '2026-10-01T14:00:00+00:00', '2026-09-25T10:00:00+00:00'),
+    row('3', 'Set', '2026-10-05T14:00:00+00:00', '2026-09-20T10:00:00+00:00'),
+  ];
+  assert.equal(gate.evaluateS52Entry({ leads, tags, nowMs: NOW, stateCode }).reason, 'live_appointment');
+});
+
+test('gate: a non-canvass 1Leg lead is unchanged (allowed, with or without the state)', () => {
+  const leads = [row('1', '1Leg', '2026-10-01T14:00:00+00:00', '2026-09-25T10:00:00+00:00')];
+  assert.equal(gate.evaluateS52Entry({ leads, tags: [], nowMs: NOW }).allow, true);
+  assert.equal(gate.evaluateS52Entry({ leads, tags: [], nowMs: NOW, stateCode: 'APPOINTMENT_DISRUPTION.one_leg' }).detail.canvass_one_leg, undefined);
+});
+
+test('gate end to end: the enrollment\'s state_code reaches the canvass 1Leg exception', async () => {
+  const cache = [row('1', '1Leg', '2026-10-01T14:00:00+00:00', '2026-09-20T10:00:00+00:00')];
+  const prospects = { P1: { cst_id: 'P1', leads: [{ id: '1', disposition: '1Leg', apptdate: '2026-10-01T14:00:00', dateentered: '2026-09-20T10:00:00' }] } };
+  const a = liveDeps({ cache, tags: ['active-entry:canvassing'], prospects });
+  assert.equal(await gate.gateS52Enrollment(gatedAction('APPOINTMENT_DISRUPTION.one_leg'), a.deps), null);
+  const b = liveDeps({ cache, tags: ['active-entry:canvassing'], prospects });
+  const blocked = await gate.gateS52Enrollment(gatedAction('APPOINTMENT_DISRUPTION.cancelled'), b.deps);
+  assert.equal(blocked.reason, 's52_gate:canvassing');
+});
+
 test('gate: blocks current lead No Demo / ND / NOC (NOC is not a demo, but still never enters)', () => {
   // 2026-10-16: ND and No Demo are disqualified and refused up front
   // (current_lead_disqualified); NOC keeps the late no-demo reason.

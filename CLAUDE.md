@@ -1334,6 +1334,30 @@ and `executeAddToWorkflow` refuses any code enrollment but S5.2 for it (`skipped
 `phone-team` like 1 Leg (same calendar, same hold, same both-decision-makers question), and the booking guard reads the
 tag live. Gate scenario `phone_team_books_call`.
 
+**A partner-owned lead leaves every Reece Five9 list, and GHL's hand-off is seen (handoff, 2026-10-22).** Micaella
+dialed Ross's 1 Leg leads after GHL had handed them over. `ensurePartnerFive9Removal` (`src/partners/five9-removal.js`)
+takes every phone on a contact a partner owns (GHL phone + additional phones + lp_leads phone / phone_alt) off every list
+in Five9's LIVE inventory but Sale / Rehash / Inbound Queue (`disqualifiedTargetLists`), as unarmed
+`five9_delete_record_from_list` rows (rule `PARTNER_FIVE9_REMOVAL`, number1, 10 lists a row, `skip_missing_lists`). The
+owner sync calls it on assigned / reassigned / noop / skipped_not_ours, and job `partner-five9-sweep` (30 min) on every
+contact that may be partner-owned (open assignments, partner_owner_log, our removals, HL-mirror `phone-team` and
+`sent:s5.2-1leg-*` tags), read live: a 1 Leg lead sits on its ORIGINAL market's lead, which the sync never sees. LP's own
+Five9 export refills the lists at 6 AM ET (nothing in LP-MCP or n8n loads them, so code cannot filter it): the removal
+is claimed once per "removal day" (ET date of now − 6h20m) per mode in `partner_five9_removals`, so the first pass after
+each load removes again. Never the Five9 DNC (it collides with the DNC Lift); a return (`returned`, or the sweep finding
+the owner back with Reece) writes a release row, marks queued rows skipped, and LP's next load restores the lists. The
+sweep reads back enforce groups (`detail.five9.removed_from`) and posts ONE ⚠️ card per failed group or failed
+inventory read. A partner GHL put there (rule 3b) is still never moved, but posts ONE "🤝 PARTNER LEAD ASSIGNED →
+<partner> (set by GHL)" card per lead (reason `assigned_by_ghl`, same key as the sync's cards). `PARTNER_FIVE9_REMOVAL_MODE`
+off | log (default: records `mode='log'` rows only) | enforce; the executor runs the rows unarmed only while it is still
+enforce. `POST /n8n/admin/partner-owner/five9-sweep {dry_run}` lists every partner-owned contact and the lists it would
+leave (dry run default). The real fix is LP excluding partner-owned leads from its export (ask LP).
+**A canvass 1 Leg lead may enter S5.2 (Mark, 2026-10-21).** `evaluateS52Entry({ stateCode })` lets `active-entry:canvassing`
+through ONLY for state `APPOINTMENT_DISRUPTION.one_leg` with a current lead in 1Leg; every other rule still runs on all
+leads (no demo, no live appointment, Issue waits, ND / No Demo / NOC never), and a canvass cancel or no-show is still
+refused. No agent_rules change: rule 231 `LP_DISP_1LEG_TO_ONELEG` never excluded canvassing (the gate did), and 171 /
+227 / 271 / 295 are the cancel and no-show rules, which keep `active-entry:canvassing`.
+
 **A 1 Leg contact is offered a phone presentation, both decision makers on the call (Mark, handoff v3, 2026-10-20).**
 Only a contact whose OPEN objection state is `APPOINTMENT_DISRUPTION.one_leg` (rule `LP_DISP_1LEG_TO_ONELEG`) gets it:
 `phonePresentationActive` (`src/agentic/one-leg-presentation.js`; SMS, not post-demo, not rehash) passes the real

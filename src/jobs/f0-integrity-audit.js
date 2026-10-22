@@ -387,12 +387,13 @@ async function auditS52(deps, nowMs, sinceMs, names) {
     for (const id of ids) {
       const state = states.get(id)?.state_code;
       if (state && !isGatedState(state)) continue; // pre-demo friction: not the gate's business
-      const verdict = evaluateS52Entry({ leads: leads.get(id) || [], tags: tags.get(id) || [], nowMs });
+      // stateCode: a canvass 1 Leg lead in S5.2 for one_leg is allowed (Mark, 2026-10-21).
+      const verdict = evaluateS52Entry({ leads: leads.get(id) || [], tags: tags.get(id) || [], nowMs, stateCode: state });
       if (verdict.allow) continue;
       // Confirm against LP / GHL live before listing it (cache can lag).
       if (liveChecks < LIVE_CONFIRM_CAP && deps.checkS52Entry) {
         liveChecks++;
-        const live = await deps.checkS52Entry(id, { nowMs });
+        const live = await deps.checkS52Entry(id, { nowMs }, { stateCode: state });
         if (live.allow) continue;
         if (!String(live.reason).startsWith('read_failed')) { flagged.push({ contact_id: id, reason: live.reason, confirmed: true }); continue; }
         flagged.push({ contact_id: id, reason: verdict.reason, confirmed: false });
