@@ -624,3 +624,15 @@ test('hand-off card: no name and no phone after the lookup → no card, one ops 
   assert.match(ops[0], /^HAND-OFF CARD SKIPPED: no name or phone for wq7 \(callback_request\)\nGHL: .*contacts\/detail\/wq7/);
   assert.deepEqual(seen, { tags: 1, notes: 1, events: 1 });
 });
+
+test('a landlord is stated as the owner in the plan block (landlord_lead, live chat, 2026-10-22)', () => {
+  const landlord = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, nowMs: OPEN_MS, channel: 'livechat', trigger: 'Hi, I need new windows on a house I rent out to tenants', conversation: [] });
+  assert.equal(landlord.rental_owner, true);
+  assert.match(renderPlanBlock(landlord).join('\n'), /they OWN this home and rent it out/);
+  // A renter, or a lead who said nothing about owning, gets no such line.
+  for (const trigger of ['I rent this place and my landlord will not fix the windows', 'they are drafty']) {
+    const p = planNepqTurn({ knownOpenings: true, knownDecisionMakers: true, nowMs: OPEN_MS, channel: 'livechat', trigger, conversation: [] });
+    assert.ok(!p.rental_owner, trigger);
+    assert.doesNotMatch(renderPlanBlock(p).join('\n'), /OWN this home/, trigger);
+  }
+});

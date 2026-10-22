@@ -2089,8 +2089,11 @@ owner", "own another home", "their own properties") runs only when the lead said
 2026-10-22.3). **The cause was old `kb_embeddings` text (2026-10-22).** Each wording was a copy of a vector excerpt the
 2026-10-20 seed never touched (3275 renter script with "landlord" as a trigger, 3276 HDL-DQ-INVESTMENT-01, 3254/3255
 "primary residence"); `sql/seeds/2026-10-22_kb_embeddings_owners_of_rentals.sql` rewrote them, and `owner_redirected`
-also reads "our estimates are for homeowners" / "if you own a home in the future". A rule about who we serve is
-changed in `kb_embeddings` too, not only in `kb_faqs` / `kb_proof_points` / `kb_intent_handlers`.
+also reads "our estimates are for homeowners" / "if you own a home in the future" / "check with the owner". The model
+still read the renter excerpt as being about this lead, so ownership is code's: `ownsRentalFromThread` (`homeowner.js`)
+sets `plan.rental_owner` in `planNepqTurn`, and `renderPlanBlock` states "they OWN this home and rent it out" (v2.16.1).
+A rule about who we serve is changed in `kb_embeddings` too, not only in `kb_faqs` / `kb_proof_points` /
+`kb_intent_handlers`.
 
 **No rentals, no commercial, a three-opening minimum, impact only (the user, 2026-10-13; rentals and investments
 superseded 2026-10-20, above).** A landlord was booked like

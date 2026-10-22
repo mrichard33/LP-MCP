@@ -397,7 +397,7 @@ const CLAIMS = [
     // renter script still in kb_embeddings 3275: "Our estimates are for homeowners since the work involves permanent
     // improvements ... If you own a home in the future, feel free to reach back out." That text is fixed at the source
     // (sql/seeds/2026-10-22_kb_embeddings_owners_of_rentals.sql); these two shapes are the backstop.
-    rx: /\b(?:have|get|ask)\s+the\s+(?:home\s*|property\s*)?owners?\b|\bown\s+another\s+(?:home|house|property)\b|\b(?:their|your)\s+own\s+(?:propert(?:y|ies)|homes?|houses?)\b|\bif\s+you\s+(?:ever\s+)?(?:purchase|buy|own)\s+a\s+(?:home|house)\b|\b(?:estimates?|visits?|assessments?|services?)\s+(?:are|is)\s+(?:designed\s+|only\s+|meant\s+|built\s+)?for\s+(?:homeowners|owner[\s-]occupied)\b/i,
+    rx: /\b(?:have|get|ask|check\s+with)\s+the\s+(?:home\s*|property\s*)?owners?\b|\bown\s+another\s+(?:home|house|property)\b|\b(?:their|your)\s+own\s+(?:propert(?:y|ies)|homes?|houses?)\b|\bif\s+you\s+(?:ever\s+)?(?:purchase|buy|own)\s+a\s+(?:home|house)\b|\b(?:estimates?|visits?|assessments?|services?)\s+(?:are|is)\s+(?:designed\s+|only\s+|meant\s+|built\s+)?for\s+(?:homeowners|owner[\s-]occupied)\b/i,
     line: 'We work with homeowners, and that includes homes you rent out.',
     negated: true,
     ownerOnly: true,

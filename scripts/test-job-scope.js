@@ -361,6 +361,10 @@ test('an owner never gets the old renter script (landlord_lead, live chat, after
   assert.equal(J.enforceJobScope(LIVE, { thread: [], inbound: 'I rent this place from my landlord' }).changed, false);
   assert.equal(J.enforceJobScope(LIVE, {}).changed, false);
   assert.equal(J.enforceJobScope(TENANT_LINE, { inbound: landlord }).changed, false);
+  // The next wording once the data was fixed: "you'd need to check with the owner".
+  const NEXT = "Got it. Since you're renting the property out, you'd need to check with the owner to see if they're open to upgrades. What's bothering you most about your windows or doors right now?";
+  assert.equal(J.enforceJobScope(NEXT, { thread: [], inbound: landlord }).text, "Got it. We work with homeowners, and that includes homes you rent out. What's bothering you most about your windows or doors right now?");
+  assert.equal(J.enforceJobScope(NEXT, { thread: [], inbound: 'I rent this place from my landlord' }).changed, false);
 });
 
 test('an owner is never sent to "the owner" (landlord_lead, live chat, after #1426, 2026-10-22)', async () => {

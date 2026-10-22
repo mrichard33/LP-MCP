@@ -7,6 +7,12 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-10-22
 
+- **A landlord is never turned away.** "I need new windows on a house I rent
+  out to tenants" got three different "homeowners only" replies in the website
+  chat. The old knowledge-base text behind them (a renter script that counted
+  "landlord" as a renter, and an "investment property" decline) now says an
+  owner who rents the home out is a normal lead, and the bot is told plainly
+  that this person owns the home.
 - **A rehash call time on a named day is never booked on another day.** "10am
   tomorrow" with tomorrow's 10:00 taken booked today's 10:00 (Jim Anderson,
   2026-10-21, on the live build). Now the bot offers the openings that day and

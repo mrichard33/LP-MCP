@@ -18,6 +18,9 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.16.1 — 2026-10-22. A LANDLORD IS AN OWNER. When the lead's own words say they own the home and rent it out
+ *   ("a house I rent out to tenants"), the plan block states it as a fact (plan.rental_owner), so the reply never
+ *   treats them as a renter. Only that plan's block changes.
  * v2.16.0 — 2026-10-21. THE GATE'S LAST FAILURES. A post-demo lead who is "still thinking it
  *   over" is asked back about the hesitation the visit recorded (POST_DEMO_VISIT_ASK: "Are you
  *   still weighing the budget?"; with the better-price framing on, its better-price line); a burst of texts is one inbound to the planner; "more quotes
@@ -502,11 +505,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.16.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.16.1 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.16.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.16.1';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
