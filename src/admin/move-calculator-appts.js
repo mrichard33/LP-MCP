@@ -14,7 +14,9 @@
  * PUT (calendarId → MV, same start, end and status, toNotify false). Never a
  * cancel and rebook: a cancel fires the GHL→LP sync and the rebook / S5.2 rescue
  * rules, and can text the customer. markRescheduleInflight runs first so the
- * echo webhook is suppressed. Each move is read back (calendar MV, start
+ * echo webhook is suppressed. The title is the one a new MV visit gets (with
+ * APPT_FORMAT_ENABLED, "Joie Ritger - Window Measurement Verification", so the
+ * name live titles carry is kept). Each move is read back (calendar MV, start
  * unchanged); the run stops at the first failure.
  *
  * A contact that already has an active MV visit is an anomaly, listed for a
@@ -25,6 +27,7 @@ import { BOOKING_CALENDARS, calendarNameForKey } from '../knowledge/booking-cale
 import {
   NON_ACTIVE_APPOINTMENT_STATUSES, DEFAULT_ASSIGNED_USER_ID, normalizeGhlStartTime, sameStartTime,
 } from '../services/lp-ghl-appointment-reconciler.js';
+import { buildAppointmentTitle, isFormatEnabled } from '../appointments/format.js';
 
 export const CALCULATOR_TAGS = ['active-entry:estimate-calculator', 'active-entry:calculator'];
 const MV = BOOKING_CALENDARS.MEASUREMENT_VERIFICATION;
@@ -128,7 +131,7 @@ export async function runCalculatorApptMove({ dryRun = true, contactIds = [] } =
         startTime: live.startTime,
         endTime: live.endTime,
         appointmentStatus: status,
-        title: MV_TITLE,
+        title: (isFormatEnabled() && buildAppointmentTitle({ firstName: contact.firstName, lastName: contact.lastName, calendarId: MV })) || MV_TITLE,
         assignedUserId: DEFAULT_ASSIGNED_USER_ID,
         ignoreFreeSlotValidation: true,
         toNotify: false,

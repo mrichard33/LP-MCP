@@ -14,6 +14,8 @@ import assert from 'node:assert/strict';
 delete process.env.SUPABASE_URL;
 delete process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+delete process.env.APPT_FORMAT_ENABLED;
+
 const { runCalculatorApptMove, classifyContact } = await import('../src/admin/move-calculator-appts.js');
 const { BOOKING_CALENDARS } = await import('../src/knowledge/booking-calendar-router.js');
 
@@ -95,6 +97,18 @@ test('apply: one PUT to MV, same time and status, no notification, read back', a
   assert.deepEqual(f.inflight, ['joie']);
   // Never a cancel.
   assert.ok(!f.calls.some((c) => c.body?.appointmentStatus === 'cancelled'));
+});
+
+test('with title formatting on, the moved visit keeps the name (as a new MV visit would)', async () => {
+  process.env.APPT_FORMAT_ENABLED = 'true';
+  try {
+    const f = fakeDeps(joie);
+    await runCalculatorApptMove({ dryRun: false, contactIds: ['joie'] }, f.deps);
+    const put = f.calls.find((c) => c.method === 'PUT');
+    assert.equal(put.body.title, 'Joie Ritger - Window Measurement Verification');
+  } finally {
+    delete process.env.APPT_FORMAT_ENABLED;
+  }
 });
 
 test('a contact that already has an active MV visit is listed and never touched', async () => {
