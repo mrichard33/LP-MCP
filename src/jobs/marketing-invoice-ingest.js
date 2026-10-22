@@ -157,23 +157,66 @@ export function bodyShaText(text) {
  * rejected document is not a copy: the person may be sending a corrected one.
  */
 export function findDuplicateInvoice(docs = [], { documentId, facts = {}, vendorId = null, vendorHint = null } = {}) {
+  if (facts.total == null) return null;
+  return (docs || []).find((d) => sameInvoiceNumber(d, { documentId, facts, vendorId, vendorHint })
+    && d.analysis?.facts?.total != null && cents(d.analysis.facts.total) === cents(facts.total)) || null;
+}
+
+const cents = (n) => Math.round(Number(n) * 100);
+
+/** Same vendor and invoice number, not this document, not rejected. */
+function sameInvoiceNumber(d, { documentId, facts = {}, vendorId = null, vendorHint = null }) {
   const num = String(facts.invoice_number || '').trim().toLowerCase();
-  if (!num || facts.total == null) return null;
-  const cents = (n) => Math.round(Number(n) * 100);
+  if (!num || !d || d.id === documentId || d.status === 'rejected') return false;
+  const f = d.analysis?.facts || {};
+  if (String(f.invoice_number || '').trim().toLowerCase() !== num) return false;
+  // The vendor only rules a match OUT when both sides know it and it differs:
+  // a forwarded body read by rules alone often has no vendor name at all.
+  const otherVendor = d.analysis?.vendor_id || null;
+  if (vendorId && otherVendor) return vendorId === otherVendor;
   const hint = normalizeName(vendorHint || '');
-  return (docs || []).find((d) => {
-    if (!d || d.id === documentId || d.status === 'rejected') return false;
-    const f = d.analysis?.facts || {};
-    if (String(f.invoice_number || '').trim().toLowerCase() !== num) return false;
-    if (f.total == null || cents(f.total) !== cents(facts.total)) return false;
-    // The vendor only rules a copy OUT when both sides know it and it differs:
-    // a forwarded body read by rules alone often has no vendor name at all.
-    const otherVendor = d.analysis?.vendor_id || null;
-    if (vendorId && otherVendor) return vendorId === otherVendor;
-    const otherHint = normalizeName(f.vendor_name_hint || '');
-    if (hint && otherHint) return hint === otherHint;
-    return true;
-  }) || null;
+  const otherHint = normalizeName(f.vendor_name_hint || '');
+  if (hint && otherHint) return hint === otherHint;
+  return true;
+}
+
+/**
+ * The earlier version this invoice revises, or null (the user, 2026-10-22: "if
+ * our system receives a new invoice that is different then the original we
+ * should replace with the newer version and update the amount. This should only
+ * occur if the numbers are different", with a Slack question first). Same vendor
+ * and number as findDuplicateInvoice, a DIFFERENT total, and not already
+ * replaced; the newest one when there are several. The same total is a copy and
+ * never gets here.
+ */
+export function findEarlierVersion(docs = [], { documentId, facts = {}, vendorId = null, vendorHint = null } = {}) {
+  if (facts.total == null) return null;
+  const found = (docs || []).filter((d) => sameInvoiceNumber(d, { documentId, facts, vendorId, vendorHint })
+    && !d.analysis?.replaced_by
+    && d.analysis?.facts?.total != null && cents(d.analysis.facts.total) !== cents(facts.total));
+  found.sort((x, y) => String(y.created_at || '').localeCompare(String(x.created_at || '')));
+  return found[0] || null;
+}
+
+const rowsTotal = (rows) => Math.round((rows || []).reduce((acc, r) => acc + Number(r.amount || 0), 0) * 100) / 100;
+const usd2 = (n) => `$${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+/** The reply under the ORIGINAL card when a newer version arrives. */
+export function newerVersionThreadNote({ invoiceNumber, was, now }) {
+  return `🔁 A newer version of invoice #${invoiceNumber} arrived: ${usd2(now)} (this one is ${usd2(was)}). It has its own card below. Approve that one to replace this invoice and update the amount; reject it to keep this one.`;
+}
+
+/** What the new card says about the version it would replace. */
+export function revisionOfFor(earlier) {
+  if (!earlier) return null;
+  const f = earlier.analysis?.facts || {};
+  return {
+    document_id: earlier.id,
+    invoice_number: f.invoice_number || null,
+    total: f.total == null ? null : Number(f.total),
+    approved: earlier.status === 'posted',
+    received_at: earlier.created_at || null,
+  };
 }
 
 /** True when an approved line of the same vendor carries this invoice number (or the read failed). */
@@ -375,9 +418,12 @@ export async function ingestInvoice(body, deps = {}) {
   } catch (err) { return fail('analyze', err); }
 
   // 5b. the same invoice already in the ledger (forwarded twice, or re-sent by
-  //     the vendor): no second document, no second card (2026-10-13).
+  //     the vendor): no second document, no second card (2026-10-13). The same
+  //     number with a different total is a newer version (2026-10-22): a card
+  //     that asks whether it should replace the original.
+  let earlier = null;
   {
-    const { data: others } = await supabase.from('marketing_invoice_documents').select('id, status, analysis').neq('id', documentId);
+    const { data: others } = await supabase.from('marketing_invoice_documents').select('id, status, analysis, created_at, slack_ts, slack_channel').neq('id', documentId);
     const dupOf = findDuplicateInvoice(others || [], { documentId, facts: a.facts, vendorId: a.vendor?.id || null, vendorHint: a.ai?.vendor_name || a.facts?.vendor_name_hint || null });
     if (dupOf) {
       await removeDocument(supabase, documentId);
@@ -389,6 +435,7 @@ export async function ingestInvoice(body, deps = {}) {
       console.log(`${LOG} ${label}: invoice ${a.facts.invoice_number} ($${a.facts.total}) is already document ${dupOf.id} — not added again`);
       return { httpStatus: 200, success: true, duplicate: true, skipped: true, reason: SKIP_REASONS.DUPLICATE_INVOICE, document_id: dupOf.id };
     }
+    earlier = findEarlierVersion(others || [], { documentId, facts: a.facts, vendorId: a.vendor?.id || null, vendorHint: a.ai?.vendor_name || a.facts?.vendor_name_hint || null });
   }
 
   // 6. expense rows + flags. The flags are computed on what the invoice SAID
@@ -406,6 +453,8 @@ export async function ingestInvoice(body, deps = {}) {
     vendorMethod: a.vendorMethod,
   });
   if (a.guard && a.guard.verdict && a.guard.verdict !== 'clean') flags.push('text_flagged_by_guardrail');
+  const revisionOf = revisionOfFor(earlier);
+  if (revisionOf) flags.push(FLAGS.NEWER_VERSION);
   // A revision of an invoice a person already approved replaces it on approval
   // (replaceEarlierInvoice). That needs a person, never the auto path: a spoofed
   // sender reusing a real invoice number would otherwise rewrite the ledger
@@ -429,6 +478,7 @@ export async function ingestInvoice(body, deps = {}) {
     history: { prior_approvals: history.priorApprovals, trailing_avg: history.trailingAvg },
     assumed: filled.assumed, auto_approved: autoApproved,
     ...(sales.matches.length ? { sale_matches: sales.matches } : {}),
+    ...(revisionOf ? { revision_of: revisionOf } : {}),
   }).value;
   await supabase.from('marketing_invoice_documents').update({ analysis, analyzer: a.analyzer, status: 'analyzed', error: null, updated_at: now().toISOString() }).eq('id', documentId);
 
@@ -436,7 +486,7 @@ export async function ingestInvoice(body, deps = {}) {
   if (insErr) return fail('expenses', insErr);
   const expenseIds = (inserted || []).map((r) => r.id);
 
-  const ctxBase = { document: { id: documentId, ...meta, analyzer: a.analyzer }, vendor: a.vendor, facts: analysis.facts, flags, confidence: a.confidence, extraction: extracted.meta, vendorMethod: a.vendorMethod, disagreements: analysis.disagreements || [] };
+  const ctxBase = { document: { id: documentId, ...meta, analyzer: a.analyzer }, vendor: a.vendor, facts: analysis.facts, flags, confidence: a.confidence, extraction: extracted.meta, vendorMethod: a.vendorMethod, disagreements: analysis.disagreements || [], revisionOf: analysis.revision_of || null };
 
   // 7. auto-approve or review. A line billed for more than we can find
   // (2026-10-19) always goes to a person: its Disputed part needs someone to
@@ -489,6 +539,12 @@ export async function ingestInvoice(body, deps = {}) {
     if (r.ok) {
       await supabase.from('marketing_invoice_documents').update({ status: 'in_review', slack_channel: r.channel, slack_ts: r.ts, updated_at: now().toISOString() }).eq('id', documentId);
       console.log(`${LOG} review card for ${documentId} posted (${a.vendor?.vendor_name || 'unknown vendor'}, ${flags.length} flag(s))`);
+      // The original's card hears about it too, in its own thread, so whoever
+      // looks there sees that a newer version is waiting (2026-10-22).
+      if (earlier?.slack_ts) {
+        const t = await post(newerVersionThreadNote({ invoiceNumber: a.facts.invoice_number, was: revisionOf.total, now: rowsTotal(rows) }), earlier.slack_channel || r.channel, { threadTs: earlier.slack_ts });
+        if (!t?.ok) console.warn(`${LOG} newer-version note on ${earlier.id} not posted: ${t?.error}`);
+      }
     } else {
       console.error(`${LOG} review card for ${documentId} NOT posted: ${r.error}`);
     }

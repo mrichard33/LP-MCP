@@ -96,7 +96,11 @@ export async function loadReviewContext(documentId, { supabase = supabaseDefault
     vendor = data || null;
   }
   const analysis = document.analysis || {};
-  return { document, rows: rows || [], vendor, facts: analysis.facts || {}, flags: analysis.flags || [], confidence: analysis.confidence ?? null, extraction: document.extraction_meta || null, vendorMethod: analysis.vendor_method || null, disagreements: analysis.disagreements || [] };
+  return {
+    document, rows: rows || [], vendor, facts: analysis.facts || {}, flags: analysis.flags || [], confidence: analysis.confidence ?? null, extraction: document.extraction_meta || null, vendorMethod: analysis.vendor_method || null, disagreements: analysis.disagreements || [],
+    revisionOf: analysis.revision_of || null,
+    replacedBy: analysis.replaced_by ? { document_id: analysis.replaced_by, total: analysis.replaced_by_total ?? null, at: analysis.replaced_at || null, by: analysis.replaced_by_who || null } : null,
+  };
 }
 
 /** Preview allocations for every row that can be allocated (eligible markets + period + amount). */
@@ -377,7 +381,7 @@ export async function handleMarketingInvoiceInteraction(parsed, deps = {}) {
   const approvedTotal = fresh.rows.filter((r) => r.status === 'approved').reduce((a, r) => a + Number(r.amount || 0), 0);
   const allocations = await loadAllocations(fresh.rows.map((r) => r.id), { supabase });
   const replacedLine = replaced?.documents?.length
-    ? `\n♻️ Replaces invoice #${replaced.invoice_number} approved earlier (${usdPlain(replaced.amount)}); that one is now marked replaced and out of the market costs.`
+    ? `\n♻️ Replaces the earlier version of invoice #${replaced.invoice_number} (${usdPlain(replaced.amount)} → ${usdPlain(replaced.new_amount)}); the earlier one is marked replaced and no longer counts in the market costs.`
     : '';
   await postDecisionReply(fresh.document, buildDecisionReply({ outcome: 'approved', by: userName, total: approvedTotal, allocation: allocations }) + replacedLine, deps);
   console.log(`${LOG} approved ${documentId} by ${who}: ${pending.length} line(s)${trueUp ? `, true-up ${JSON.stringify(trueUp.months)}` : ''}`);
@@ -535,9 +539,13 @@ export async function replaceEarlierInvoice({ documentId, rows, by, now }, deps 
   const invoiceNumber = rows.find((r) => r.invoice_number)?.invoice_number;
   const vendorId = rows.find((r) => r.vendor_id)?.vendor_id;
   if (!invoiceNumber || !vendorId) return null;
+  const newTotal = Math.round(rows.reduce((a, r) => a + Number(r.amount || 0), 0) * 100) / 100;
   try {
-    const { data: older, error } = await supabase.from('marketing_expenses').select('id, document_id, amount')
-      .eq('vendor_id', vendorId).eq('invoice_number', invoiceNumber).eq('status', 'approved').neq('document_id', documentId);
+    // 2026-10-22 (the user): an original still IN REVIEW is replaced too. Before,
+    // only approved lines were, so approving the newer version left the original's
+    // card open and approving both counted the invoice twice.
+    const { data: older, error } = await supabase.from('marketing_expenses').select('id, document_id, amount, status')
+      .eq('vendor_id', vendorId).eq('invoice_number', invoiceNumber).in('status', ['approved', 'pending_review']).neq('document_id', documentId);
     if (error || !older?.length) return null;
     for (const r of older) await (deps.deleteAllocations || deleteAllocations)(r.id, { supabase });
     const { error: uErr } = await supabase.from('marketing_expenses').update({ status: 'superseded', updated_at: now }).in('id', older.map((r) => r.id));
@@ -545,11 +553,20 @@ export async function replaceEarlierInvoice({ documentId, rows, by, now }, deps 
     const docs = [...new Set(older.map((r) => r.document_id).filter(Boolean))];
     for (const id of docs) {
       const { data: d } = await supabase.from('marketing_invoice_documents').select('analysis').eq('id', id).maybeSingle();
-      await supabase.from('marketing_invoice_documents').update({ analysis: { ...(d?.analysis || {}), replaced_by: documentId, replaced_at: now, replaced_by_who: by }, updated_at: now }).eq('id', id);
+      await supabase.from('marketing_invoice_documents').update({ analysis: { ...(d?.analysis || {}), replaced_by: documentId, replaced_by_total: newTotal, replaced_at: now, replaced_by_who: by }, updated_at: now }).eq('id', id);
     }
     const amount = Math.round(older.reduce((a, r) => a + Number(r.amount || 0), 0) * 100) / 100;
     console.log(`${LOG} invoice #${invoiceNumber}: ${older.length} line(s) of ${docs.length} earlier document(s) replaced by ${documentId}`);
-    return { invoice_number: invoiceNumber, documents: docs, lines: older.length, amount };
+    // The original's card is redrawn as replaced (no buttons) and its thread told.
+    // Best effort, like the rest of this: the replacement itself already stands.
+    for (const id of docs) {
+      try {
+        await (deps.refreshCards || refreshReviewCards)({ ids: [id] }, { ...deps, supabase });
+        const { data: d } = await supabase.from('marketing_invoice_documents').select('id, slack_ts, slack_channel').eq('id', id).maybeSingle();
+        await postDecisionReply(d, `♻️ Replaced by a newer version (${usdPlain(newTotal)}), approved by ${String(by || '').replace(/ \(.*\)$/, '')}. This version no longer counts.`, deps);
+      } catch (err) { console.warn(`${LOG} replaced card ${id} not redrawn: ${err.message}`); }
+    }
+    return { invoice_number: invoiceNumber, documents: docs, lines: older.length, amount, new_amount: newTotal, any_approved: older.some((r) => r.status === 'approved') };
   } catch (err) {
     console.warn(`${LOG} replacing earlier invoice #${invoiceNumber} failed: ${err.message}`);
     return null;
@@ -585,6 +602,9 @@ export async function refreshEstimatesFor(rows, deps = {}) {
 /** Pure: the header a decided card is redrawn with, from what the ledger holds (null = still in review). */
 export function decisionFor(ctx) {
   const rows = ctx.rows || [];
+  if (ctx.replacedBy && rows.length && rows.every((r) => r.status === 'superseded')) {
+    return { outcome: 'replaced', by: String(ctx.replacedBy.by || '').replace(/ \(.*\)$/, ''), at: String(ctx.replacedBy.at || '').slice(0, 16).replace('T', ' ') };
+  }
   const approved = rows.find((r) => r.status === 'approved');
   if (ctx.document?.status === 'posted' && approved) {
     return { outcome: 'approved', by: String(approved.approved_by || '').replace(/ \(.*\)$/, ''), at: String(approved.approved_at || ctx.document.updated_at || '').slice(0, 16).replace('T', ' ') };
