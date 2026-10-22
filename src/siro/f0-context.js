@@ -30,7 +30,7 @@ import { REHASH_REP_CUSTOM_VALUE } from '../agentic/rehash.js';
 import { rehashRepFor } from '../config/rehash-assignee.js';
 import { rehashTeamUserIds } from '../agentic/rehash-state.js';
 import { rehashRepFirstName, ghlUserFirstName } from '../agentic/rehash-slots.js';
-import { isF0EmailRequest, emailHoldWindow } from './f0-email.js';
+import { isF0EmailRequest, emailHoldWindow, F0_TEAM_CALL_FALLBACK } from './f0-email.js';
 import { testLinkFor } from './f0-test-link.js';
 import { rehashOwned as readRehashOwned, rehashOwnedMode } from '../agentic/rehash-owned.js';
 import { rehashCalendarId } from '../knowledge/booking-calendar-router.js';
@@ -104,9 +104,9 @@ const REP_READ_CAP_MS = 2500;
 const capped = (p) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), REP_READ_CAP_MS))]);
 
 /**
- * The rehash rep's first name, the SAME rule for every F.0 touch, text or
- * email (Mark, 2026-10-21: the email is "written as John, the rehash rep … same
- * voice as the SMS touches"). 2026-10-15 (the user): the rep is the FOLLOWER
+ * The rehash rep's first name for the F.0 texts (and the email in
+ * F0_EMAIL_VOICE=rep; the Reece Team email reads resolveEmailRepFirst, Mark
+ * 2026-10-22). 2026-10-15 (the user): the rep is the FOLLOWER
  * the GHL rehash workflow put on THIS lead (rehashRepFor), named from
  * REHASH_TEAM_USER_NAMES or the GHL user record; else the GHL custom value
  * rehash_rep_name, as before; else "Reece Team". Never guessed. Never throws.
@@ -121,6 +121,30 @@ export async function resolveRehashRepFirst(contactId, { env = process.env, deps
   if (fromFollower) return fromFollower;
   const repRaw = await (deps.getCustomValue || getCustomValue)(REHASH_REP_CUSTOM_VALUE);
   return repFirstName(repRaw) || 'Reece Team';
+}
+
+/**
+ * A rep's first name fit to print, or null: the first word of the value,
+ * letters only. A merge tag ("{{custom_values.rehash_rep_name}}"), a blank or
+ * anything else is no name, so a tag can never reach a draft. Pure.
+ */
+export function cleanRepFirst(raw) {
+  const first = repFirstName(String(raw ?? '').trim());
+  return first && /^\p{L}[\p{L}'’-]*$/u.test(first) ? first : null;
+}
+
+/**
+ * The rehash rep the Reece Team EMAIL invites a call with (Mark, 2026-10-22):
+ * the GHL custom value rehash_rep_name FIRST, then the follower on the lead
+ * (resolveRehashRepFirst), else null and the invite is a call "with our team".
+ * Never guessed, never "Reece Team" as a person's name. Never throws.
+ */
+export async function resolveEmailRepFirst(contactId, { env = process.env, deps = {} } = {}) {
+  const raw = await Promise.resolve().then(() => (deps.getCustomValue || getCustomValue)(REHASH_REP_CUSTOM_VALUE)).catch(() => null);
+  const fromValue = cleanRepFirst(raw);
+  if (fromValue) return fromValue;
+  const follower = await resolveRehashRepFirst(contactId, { env, deps }).catch(() => null);
+  return follower && follower !== 'Reece Team' ? cleanRepFirst(follower) : null;
 }
 
 /**
@@ -224,16 +248,23 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   const sold = testLink ? tags.includes('deal-won') : (lpSold(lp) || isCustomerP2(context) || tags.includes('deal-won'));
   const postAppointment = isPostDemoLead({ lp, tags, stageTag: lead.current_stage_tag || null });
 
-  // The rehash rep's first name: the follower on the lead, else the GHL
-  // custom value rehash_rep_name; never guessed: "Reece Team" when none.
-  const rehashRepFirst = await resolveRehashRepFirst(request.contact_id, { env, deps });
-
   const age = testLink ? 2 : demoAgeHours({ facts, lp, nowMs });
   const modes = siroModes(env);
+  // 2026-10-22 (Mark): the email is the Reece Team's; its call invite names
+  // the rep from the custom value first ('' when none: "a quick call with
+  // our team"). The texts, and the email in rep voice, keep the follower
+  // first, else the custom value, never guessed: "Reece Team" when none.
+  const emailVoice = email ? modes.f0EmailVoice : null;
+  const teamEmail = emailVoice === 'team';
+  const rehashRepFirst = teamEmail
+    ? (await resolveEmailRepFirst(request.contact_id, { env, deps })) || ''
+    : await resolveRehashRepFirst(request.contact_id, { env, deps });
   const followupTextLive = modes.followupText === 'live';
   const vars = {
     ...presentationTemplateVars(facts, { followupTextLive }),
     rehash_rep_first_name: rehashRepFirst,
+    ...(email ? { email_voice: emailVoice } : {}),
+    ...(teamEmail ? { call_with: rehashRepFirst || F0_TEAM_CALL_FALLBACK } : {}),
     days_since_demo: Number.isFinite(age) ? String(Math.floor(age / 24)) : '',
     recording_id: facts?.recording_id || '',
     presentation: facts,

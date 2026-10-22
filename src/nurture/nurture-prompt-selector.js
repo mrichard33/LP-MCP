@@ -15,6 +15,7 @@
  */
 
 import supabase from '../supabase.js';
+import { F0_EMAIL_PROMPT_VERSION } from '../siro/f0-email.js';
 
 /**
  * Select the best prompt for a given (workflow, channel, context).
@@ -33,7 +34,14 @@ export function f0FormulaAllows(p, request, context) {
   if (request?.workflow_code !== 'F.0') return true;
   // 2026-10-21 (Mark): the position-0 email has ONE prompt row that serves
   // both text formulas; the formula only picks among the SMS rows.
-  if (p?.channel === 'email') return true;
+  // 2026-10-22 (Mark): the email's voice picks its row: team = version 2
+  // (F.0-P0-email-V2), rep = version 1. loadF0Context sets email_voice; a
+  // caller that did not (none today) gets any row, the newest version first.
+  if (p?.channel === 'email') {
+    const voice = context?.siro?.email_voice;
+    if (!voice) return true;
+    return Number(p?.version ?? 1) === F0_EMAIL_PROMPT_VERSION[voice];
+  }
   const fourStep = context?.siro?.formula === 'four_step';
   return fourStep ? Number(p?.version) === 2 : Number(p?.version ?? 1) !== 2;
 }

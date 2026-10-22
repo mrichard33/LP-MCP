@@ -29,6 +29,7 @@ function num(value, fallback, { min = -Infinity, max = Infinity } = {}) {
 const OSL = ['off', 'shadow', 'live'];
 const OL = ['off', 'live'];
 export const F0_FORMULAS = ['v1', 'four_step'];
+export const F0_EMAIL_VOICES = ['team', 'rep'];
 
 // 2026-10-19: a bot-gate run may try SIRO_CONTEXT_MODE, SIRO_FOLLOWUP_TEXT_MODE
 // and F0_FORMULA_MODE without Railway (src/simulator/sim-overrides.js). Outside
@@ -53,6 +54,11 @@ export function siroModes(env = process.env) {
     // shadow drafts it for approval, live sends it. It decides the email alone
     // (src/siro/f0-email.js); F0_V2_MODE=off still stops every F.0 touch.
     f0Email: pick(env.F0_EMAIL_MODE, OSL, 'shadow'),
+    // The email's voice (Mark, 2026-10-22): team = written and signed as the
+    // Reece Team, the call with the rep named by the custom value
+    // rehash_rep_name (prompt F.0-P0-email-V2); rep = the 2026-10-21 email
+    // written as the rehash rep (F.0-P0-email-V1). A typo is team.
+    f0EmailVoice: pick(env.F0_EMAIL_VOICE, F0_EMAIL_VOICES, 'team'),
   };
 }
 

@@ -27,7 +27,7 @@ import { hasSensitiveDetail } from './text-guards.js';
 import { copiesSiroDraft, repQuoteRx } from './presentation-guard.js';
 import { groundingSources, FOUR_STEP_SLOTS } from './f0-four-step.js';
 import { findExclamations } from '../agentic/discovery-discipline.js';
-import { F0_EMAIL_SUBJECT_MAX, F0_EMAIL_PREHEADER_MAX, F0_EMAIL_BODY_WORDS } from './f0-email.js';
+import { F0_EMAIL_SUBJECT_MAX, F0_EMAIL_PREHEADER_MAX, F0_EMAIL_BODY_WORDS, F0_TEAM_SIGNATURE, F0_TEAM_CALL_FALLBACK } from './f0-email.js';
 
 export const F0_SMS_MAX = 300;
 // 2026-10-20 (the first Four-Step previews): name + four parts + the call
@@ -120,11 +120,12 @@ function startsWithName(body, firstName) {
 }
 
 /** The Four-Step checks (formula 'four_step'). Pure. */
-function fourStepFailures(body, { facts, position, repFirstName, slots, firstName }) {
+function fourStepFailures(body, { facts, position, repFirstName, slots, firstName, team = false }) {
   const fail = [];
   if (!startsWithName(body, firstName)) fail.push('first_name_not_first');
   if (position < CLOSE_POSITION) {
-    if (!/\bif\s+i\s+could\b/i.test(body)) fail.push('no_if_i_could');
+    // The Reece Team email (Mark, 2026-10-22) asks "If we could …".
+    if (team ? !/\bif\s+we\s+could\b/i.test(body) : !/\bif\s+i\s+could\b/i.test(body)) fail.push(team ? 'no_if_we_could' : 'no_if_i_could');
     const last = (body.match(/[^.!?]*\?\s*$/) || [''])[0];
     if (!last || !repFirstName || !new RegExp(`\\b${String(repFirstName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(last) || !/\bcall\b/i.test(last)) fail.push('no_call_question');
   }
@@ -191,18 +192,70 @@ function emailFailures(body, { subject = '', preheader = '', ps = '', salesRepFi
   return fail;
 }
 
+// The Reece Team email (Mark, 2026-10-22): signed "The Reece Team" on the line
+// after the call invite, written as "we", never "I", and the invite names the
+// resolved rehash rep (or "our team" when no name was found).
+const TEAM_SIGNATURE_RX = new RegExp(`^${escRx(F0_TEAM_SIGNATURE)}\\.?$`, 'i');
+const FIRST_PERSON_I_RX = /\bI(?:['’](?:m|ve|d|ll))?\b/;
+const FIRST_PERSON_OBJ_RX = /\b(?:me|my|mine|myself)\b/i;
+const SIGN_OFF_WORD_RX = /\b(?:best|thanks|thank\s+you|regards|sincerely|warmly|cheers|talk\s+soon|all\s+the\s+best)\b/i;
+const PERSON_LINE_RX = /^[-–—]?\s*\p{Lu}[\p{L}'’-]*(?:\s+\p{Lu}[\p{L}'’-]*)?\.?$/u;
+
+/**
+ * The body before its sign-off and the sign-off itself: everything after the
+ * last "?" (the call invite) is the sign-off. Pure.
+ */
+export function splitTeamSignature(body) {
+  const text = String(body || '').trim();
+  const q = text.lastIndexOf('?');
+  if (q < 0) return { content: text, signature: '' };
+  return { content: text.slice(0, q + 1).trim(), signature: text.slice(q + 1).trim() };
+}
+
+/** The Reece Team email's own checks (voice 'team'). Pure. */
+function teamVoiceFailures(body, { subject = '', preheader = '', ps = '', callWith = null, salesRepFirstName = null } = {}) {
+  const fail = [];
+  const { content, signature } = splitTeamSignature(body);
+  if (!TEAM_SIGNATURE_RX.test(signature)) {
+    const person = signature && !/\breece\b/i.test(signature)
+      && (SIGN_OFF_WORD_RX.test(signature) || signature.split(/\n/).some(l => PERSON_LINE_RX.test(l.trim())));
+    fail.push(person ? 'signed_as_person' : 'missing_signature');
+  }
+  const all = [subject, preheader, content, ps].filter(Boolean).join('\n');
+  if (FIRST_PERSON_I_RX.test(all) || FIRST_PERSON_OBJ_RX.test(all)) fail.push('first_person');
+  // The invite names the resolved rehash rep and nobody else.
+  const want = String(callWith || F0_TEAM_CALL_FALLBACK).trim();
+  const named = (content.match(/\bcall\s+with\s+([^?]{1,60})\?\s*$/i) || [])[1];
+  if (named) {
+    const words = named.trim().split(/\s+/);
+    const wantWords = new Set(want.toLowerCase().split(/\s+/));
+    const hasWant = new RegExp(`\\b${escRx(want)}\\b`, 'i').test(named);
+    const other = words.some(w => /^\p{Lu}/u.test(w) && !wantWords.has(w.toLowerCase().replace(/[^\p{L}'’-]/gu, '')) && !/^reece$/i.test(w))
+      || (salesRepFirstName && new RegExp(`\\b${escRx(salesRepFirstName)}\\b`, 'i').test(named) && salesRepFirstName.toLowerCase() !== want.toLowerCase());
+    if (!hasWant || other) fail.push('call_names_other');
+  }
+  return { fail, content };
+}
+
 /**
  * @param {string} text
  * @param {{facts?: object|null, position: number, repFirstName?: string,
- *   formula?: 'v1'|'four_step'|'email', slots?: object|null, firstName?: string|null,
+ *   formula?: 'v1'|'four_step'|'email', voice?: 'rep'|'team', callWith?: string|null, slots?: object|null, firstName?: string|null,
  *   followupText?: string|null, subject?: string, preheader?: string, ps?: string}} o
  * @returns {string[]} failure codes (empty = pass)
  */
-export function checkF0Copy(text, { facts = null, position = 1, repFirstName = null, formula = 'v1', slots = null, firstName = null, followupText = null, subject = '', preheader = '', ps = '' } = {}) {
-  const body = String(text || '').trim();
+export function checkF0Copy(text, { facts = null, position = 1, repFirstName = null, formula = 'v1', slots = null, firstName = null, followupText = null, subject = '', preheader = '', ps = '', voice = 'rep', callWith = null } = {}) {
+  let body = String(text || '').trim();
   const fail = [];
   if (!body) return ['empty'];
   const email = formula === 'email';
+  // The Reece Team email (Mark, 2026-10-22): the sign-off and voice are
+  // checked here; every other check reads the body without its sign-off.
+  if (email && voice === 'team') {
+    const team = teamVoiceFailures(body, { subject, preheader, ps, callWith, salesRepFirstName: facts?.rep_first_name || null });
+    fail.push(...team.fail);
+    body = team.content;
+  }
   const fourStep = formula === 'four_step';
   if (!email && body.length > (fourStep ? F0_FOUR_STEP_SMS_MAX : F0_SMS_MAX)) fail.push('too_long');
 
@@ -250,7 +303,8 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
     // "If I could" and the call invite naming the rehash rep, both slots
     // required and grounded in the visit. A recording is required (no facts =
     // no email), so the grounding always runs.
-    fail.push(...fourStepFailures(body, { facts, position: 1, repFirstName, slots, firstName }));
+    const team = voice === 'team';
+    fail.push(...fourStepFailures(body, { facts, position: 1, repFirstName: team ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName, team }));
     if (!facts) fail.push('no_visit_facts');
   } else if (fourStep) {
     fail.push(...fourStepFailures(body, { facts, position, repFirstName, slots, firstName }));
@@ -263,8 +317,9 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
 }
 
 /** One line per failure for the re-write note. Pure. */
-export function f0RetryNote(failures, { position, formula = 'v1' }) {
+export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' }) {
   const email = formula === 'email';
+  const teamEmail = email && voice === 'team';
   const why = {
     too_long: `Keep it under ${formula === 'four_step' ? F0_FOUR_STEP_SMS_MAX : F0_SMS_MAX} characters.`,
     question_count: email ? 'Ask exactly one question in the whole email (subject, preheader, body and P.S.): the call invite at the end of the body.'
@@ -284,7 +339,7 @@ export function f0RetryNote(failures, { position, formula = 'v1' }) {
     emoji: 'No emoji.',
     em_dash: 'No dashes like — or –.',
     generic_opener: 'Do not open with "thanks for having us" or "just checking in".',
-    missing_signature: 'Sign with the rep first name at the very end.',
+    missing_signature: teamEmail ? 'End the body with the line "The Reece Team" on its own, after the call invite, and nothing else.' : 'Sign with the rep first name at the very end.',
     not_personalized: 'Name one specific thing from their visit.',
     empty: 'Write the message.',
     rep_quoted: 'Never quote the rep ("your rep said").',
@@ -293,7 +348,7 @@ export function f0RetryNote(failures, { position, formula = 'v1' }) {
     four_step_output: 'Answer as JSON: {"slots": {"hesitation", "affirm", "reframe", "if_i_could"}, "text"}.',
     first_name_not_first: 'Start the text with their first name.',
     no_if_i_could: 'Use "If I could …, would you …?" for the close.',
-    no_call_question: 'End with the question "would you be open to a quick call with <rep first name>?"',
+    no_call_question: teamEmail ? 'End the email on the question "would you be open to a quick call with <CALL WITH>?", then the line "The Reece Team".' : 'End with the question "would you be open to a quick call with <rep first name>?"',
     'slot_missing:hesitation': 'Fill the hesitation slot from <visit_facts>.',
     'slot_missing:reframe': 'Fill the reframe slot from <visit_facts>.',
     'slot_ungrounded:hesitation': position === 3 ? 'Slot 1 must come from what the home means to them in <visit_facts>.' : 'The hesitation slot must restate their hesitation from <visit_facts>, in their words.',
@@ -309,6 +364,10 @@ export function f0RetryNote(failures, { position, formula = 'v1' }) {
     your_rep: 'Never say "your rep"; name the person who visited at most once, as the one who came out.',
     sales_rep_named_twice: 'Name the person who visited at most once.',
     no_visit_facts: 'There is no visit on file.',
+    no_if_we_could: 'Use "If we could …, would you …?" for the close.',
+    first_person: 'Write as the Reece Team: "we", "us", "our". Never "I", "me" or "my".',
+    signed_as_person: 'Sign as the Reece Team, never as a person: the last line is exactly "The Reece Team".',
+    call_names_other: 'The call invite names only the rep given in CALL WITH.',
     email_output: 'Answer as JSON: {"subject", "preheader", "body", "ps", "slots": {"hesitation", "affirm", "reframe", "if_i_could"}}.',
   };
   const line = (f) => why[f] || (f.startsWith('slot_not_in_text:') ? `Use the ${f.split(':')[1]} slot's words in the text.` : f);

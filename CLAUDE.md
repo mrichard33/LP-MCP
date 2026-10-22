@@ -922,8 +922,8 @@ one variable each: `SIRO_FOLLOWUP_TEXT_MODE=off`, `REHASH_DEAL_HINT_MODE=once`, 
 
 ## F.0 v2 position 0: the post-demo email (Mark, 2026-10-21)
 
-The evening of an unsold demo, F.0 v2 sends ONE email written from the Siro recording as the rehash rep, before the
-texts, through the same `/api/agentic/nurture/generate` call (`workflow_code F.0`, `channel email`, internal position 0,
+The evening of an unsold demo, F.0 v2 sends ONE email written from the Siro recording (as the Reece Team since
+2026-10-22, below), before the texts, through the same `/api/agentic/nurture/generate` call (`workflow_code F.0`, `channel email`, internal position 0,
 which the workflow sends as 1 since 2026-10-21, below). It replaces the old static F.0 email ("What we saw at your home"); only its job carries over. One rule, one
 home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy checks are `checkF0Copy` formula `email`.
 - **Position 0 is F.0 by email only.** The route answers any other caller `200 { error: 'unsupported_position' }`
@@ -944,16 +944,25 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   ONE question of the whole email (subject, preheader, body, P.S.), hesitation and reframe slots required and grounded,
   subject ≤ 60, preheader ≤ 90 and not the first sentence, body 120–180 words; never money, offer talk or the word
   "deal" (not even the hint), an exclamation, "founder", "your rep", the sales rep named twice or following up, a
-  footer / address / unsubscribe line, a sensitive detail, a quote of the rep or Siro's draft copied. No signature (the
-  template signs) and the thank-you opener is allowed. One re-write, then `suppressed_low_conf`: a quiet exit to
+  footer / address / unsubscribe line, a sensitive detail, a quote of the rep or Siro's draft copied. The thank-you
+  opener is allowed. Signed "The Reece Team" since 2026-10-22 (V1, `F0_EMAIL_VOICE=rep`, carries no signature). One re-write, then `suppressed_low_conf`: a quiet exit to
   position 1, never a fixed email.
 - **The greeting name is cleaned, never the raw field (2026-10-22).** The live preview opened "Hi A," because GHL's
   first name was "a" (LP: "AJ / Anita") and any non-empty GHL name won. `greetingName` (`f0-context.js`): a couple's first
   person, a first word under two letters is no name (then LP's lead, then none), two or three typed capitals stay ("AJ");
   `applyGreetingName` puts the result (even '') in `{{lead.first_name}}` for the email and Four-Step texts, in the
   orchestrator and the preview alike. A misspelled GHL name ("gorge") is a data fix in GHL, not a guess in code.
-- **The rehash rep is the follower, for every F.0 touch**: `resolveRehashRepFirst` (`f0-context.js`): `rehashRepFor`
+- **The rehash rep is the follower for the texts**: `resolveRehashRepFirst` (`f0-context.js`): `rehashRepFor`
   (2026-10-15) → `REHASH_TEAM_USER_NAMES` / the GHL user, else the `rehash_rep_name` custom value, else "Reece Team".
+- **The email is the Reece Team's; the call is with the rehash rep (Mark, 2026-10-22; replaces "written as John, the
+  rehash rep", 2026-10-21).** Written and signed as the Reece Team ("we", never "I"); the body ends on the call invite
+  ("If we could …, would you be open to a quick call with John?") and the line "The Reece Team". The rep is the GHL
+  custom value `rehash_rep_name` FIRST (`resolveEmailRepFirst`; a blank, a failed read or a merge tag is no name), then
+  the follower, else the invite is "a quick call with our team" (`{{siro.call_with}}`); never guessed. Prompt
+  `F.0-P0-email-V2` (`sql/seeds/2026-10-22_f0_v2_email_prompt_team_voice.sql`, run after the deploy); `checkF0Copy`
+  voice 'team' fails `first_person`, `signed_as_person`, `missing_signature`, `call_names_other`, `no_if_we_could`.
+  `F0_EMAIL_VOICE` team (default) | rep: rep reads V1 (left active for this one-variable rollback) and its checks. GHL
+  step 0f From Name = Reece Team. The five texts keep their voice.
 - **`F0_EMAIL_MODE` off|shadow|live, default shadow, decides the email ALONE** (the user, 2026-10-21: the email and the
   texts go live independently): `F0_V2_MODE=off` and the global `NURTURE_SHADOW_MODE` still stop it, but the `F.0`
   entry in `NURTURE_SHADOW_WORKFLOWS` governs the texts only. Shadow: drafts + an email card in #contact-rehash (all
