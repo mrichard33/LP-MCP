@@ -1369,7 +1369,8 @@ enforce. `POST /n8n/admin/partner-owner/five9-sweep {dry_run}` lists every partn
 leave (dry run default). The real fix is LP excluding partner-owned leads from its export (ask LP).
 **One-Leg → RFED: a NEW RFED lead in LP is the only way a lead reaches Ross (Mark, 2026-10-22).** No automatic day-3
 hand-off (`src/one-leg/day3.js`, job `one-leg-day3`, `one_leg_handoffs`, `ONE_LEG_RFED_MODE` were NOT approved; see
-`docs/ghl-one-leg-day3.md`). Mark turned off S5.2 "I. 1 Leg"'s `phone-team` step. The one trigger stays: a new LP lead on
+`docs/ghl-one-leg-day3.md`). Mark turned off S5.2 "I. 1 Leg"'s `phone-team` step (verified live 2026-10-22: disabled, and no
+step in that branch assigns an owner). The one trigger stays: a new LP lead on
 RFED → the partner sync makes Ross the owner and adds `phone-team` → U.RFED + the Five9 removal. **The promoter rule
 (replaces the 2026-10-21 "Promoter blank for canvass"):** an RFED lead copies Source, Sub-Source AND Promoter from the
 original lead, canvass included; Promoter is blank only when the original had none; a promoter name that does not match
@@ -1390,7 +1391,8 @@ branch only, since a lead LP moved to RFED is its own original). A failed read o
 ONE card per contact + mismatch set to `PARTNER_ALERT_SLACK_CHANNEL` (audit `partner_rfed_integrity`, permanent), never
 a fix. `PARTNER_RFED_INTEGRITY_MODE` off | log (default: `job_runs.detail.integrity` / `integrity_hits`) | alert; the
 scheduled pass needs `PARTNER_FIVE9_REMOVAL_MODE` on, and `POST /n8n/admin/partner-owner/rfed-integrity {dry_run}` runs it
-alone.
+alone. A chat session has no operator token, so the same runs are MCP tools: `partner_five9_sweep_run`,
+`partner_rfed_integrity_run`, `rfed_batch_run` (`src/tools/partner-tools.js`, dry run / read-only by default).
 **A phone-team contact is offered a phone presentation, both decision makers on the call (Mark, handoff v3, 2026-10-20;
 phone-team ONLY since 2026-10-22).** Only a contact tagged `phone-team` gets it (an open `APPOINTMENT_DISRUPTION.one_leg`
 state alone no longer does: a 1 Leg lead reaches Ross through a new RFED lead, above):

@@ -56,9 +56,13 @@ branch; if it does, the batch can run through it with the same rules.
 5. `verify` the batch: the RFED lead in LP with the same fields → Ross the owner → `phone-team` → a Five9 removal row.
    Stop on the first batch with a failure.
 
-## GHL S5.2 v2 "I. 1 Leg": what to check
+## GHL S5.2 v2 "I. 1 Leg": verified 2026-10-22
 
-The June 2026 export of S5.2 v2 (`GHL-Workflows/S5.2-appointment-rescue-policy-executor-v2.json`) shows, in the
-1 Leg branch, an **assign-user step "Assign to Mark from Reece"** (user `gPyvoLiFTEPRN6pkz8kC`,
-`only_unassigned_contact = false`) on day 4. It changes the contact owner. Confirm in GHL whether it is still live.
+Read from GHL's internal workflow API (HL mirror refreshed 2026-10-22 19:04 UTC, version 142):
+
+- The branch's **"Add Tag: phone-team"** step is **disabled** (`isDisabled: true`). Mark's change is live.
+- **No step in "I. 1 Leg" assigns an owner.** The June export's "Assign to Mark from Reece" step is gone.
+- The workflow's other assign steps sit in other branches ("Inbound Agentic Trigger", C. Trust Hesitation,
+  G. Cancelled, H. No Show) and assign the Reece Team user or Randy Reece. None assigns Ross.
+
 If an owner is ever set to a partner without an RFED lead, the integrity guard reports it.

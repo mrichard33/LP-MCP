@@ -14,6 +14,7 @@ import { registerAdminTools } from './admin/index.js';
 import { registerFive9Tools } from './five9-tools.js';
 import { registerMemoryTools } from './memory-tools.js';
 import { registerSalesBoardTools } from './sales-board-tools.js';
+import { registerPartnerTools } from './partner-tools.js';
 import { registerPayrollTools } from './payroll/index.js';
 import { registerSimulatorTools } from './simulator-tools.js';
 import { registerAiOsTools } from './ai-os-tools.js';
@@ -94,6 +95,10 @@ export function registerAllTools(rawServer) {
   //   For a board or a sale that fell outside the automatic windows (the 9/25
   //   8 PM board lost to the switchover, lead 577880 outside the 48h lookback).
   registerSalesBoardTools(server);
+  // Partner (Ross / RFED) tools (3) — 2026-10-22
+  //   partner_five9_sweep_run, partner_rfed_integrity_run, rfed_batch_run. Dry run /
+  //   read-only by default; the admin routes need the operator token no chat session holds.
+  registerPartnerTools(server);
   // Bot simulator (2) — 2026-10-02
   //   simulate_bot_conversation, get_bot_simulation. Real bots, nothing sent
   //   or written (src/simulator/bot-simulator.js).
