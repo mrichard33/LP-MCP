@@ -49,6 +49,7 @@ import { callCenterLineKind } from '../marketing/allocation.js';
 import { previewRows, reviewChannelId, replaceEarlierInvoice, refreshEstimatesFor } from '../marketing/review-actions.js';
 import { matchCommissionInvoiceRows } from '../marketing/commission-invoice.js';
 import { redactBankDetails, redactBankDeep, redactBankText, removedCount } from '../security/bank-redact.js';
+import { sendAlertMessage } from '../alert-state.js';
 
 const LOG = '[MktInvoice]';
 export const INVOICES_BUCKET = 'marketing-invoices';
@@ -583,6 +584,43 @@ export function registerMarketingInvoiceRoutes(app, deps = {}) {
     } catch (err) {
       console.error(`${LOG} ingest error: ${err.message}`);
       res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // n8n I.MCIN reports back after every invoice (2026-10-22). These two addresses
+  // never existed here, so its report-back step answered 404 on every email since
+  // the workflow was built: the invoice itself was fine, but the run showed red and
+  // a transport failure only n8n saw reached nobody. Same contract as the LP report
+  // pair (lp-report-ingest.js): the intake password, and 200 on every handled
+  // error, because a reporting path must never fail its caller.
+  const small = express.json({ limit: '256kb' });
+  const alert = deps.sendAlert || sendAlertMessage;
+
+  app.post('/events/marketing_invoice_ingest_succeeded', small, (req, res) => {
+    if (refuseIntake(req, res)) return;
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const what = b.duplicate === true ? 'duplicate'
+      : b.skipped === true ? `skipped ${String(b.reason || '').slice(0, 60)}`
+        : `document ${String(b.document_id || '?').slice(0, 60)}`;
+    console.log(`${LOG} n8n reported ok: ${what}`);
+    res.json({ success: true });
+  });
+
+  app.post('/events/marketing_invoice_ingest_failed', small, async (req, res) => {
+    if (refuseIntake(req, res)) return;
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const reason = redactBankText(String(b.failure_reason || 'unknown')).slice(0, 300);
+    try {
+      console.warn(`${LOG} n8n reported a failure (${b.document_id ? `document ${b.document_id}` : 'no document'}): ${reason}`);
+      // With a document id we already posted our own failure line for it. Without one
+      // the invoice never reached us, so only n8n knows: one #ops-alerts line.
+      if (!b.document_id) {
+        await alert(`⚠️ A marketing invoice email did not reach LP-MCP (n8n I.MCIN): ${reason}. Check the I.MCIN run in n8n and resend the invoice.`, { channel: 'ops' });
+      }
+      res.json({ success: true });
+    } catch (err) {
+      console.error(`${LOG} failure report not alerted: ${err.message}`);
+      res.json({ success: true, alerted: false });
     }
   });
 
