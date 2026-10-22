@@ -5,6 +5,13 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-10-22
+
+- **F.0 never greets anyone by a single letter.** A lead whose first name in GHL
+  is just an initial ("a") got an email that opened "Hi A,". Now a lone initial
+  counts as no name: the name on the LP lead is used ("AJ"), and when there is
+  none the email or text simply opens without a name.
+
 ## 2026-10-21
 
 - **John owns a rehash lead once a call or a visit is set.** A rehash or post-demo

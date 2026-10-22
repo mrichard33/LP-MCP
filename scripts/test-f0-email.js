@@ -23,7 +23,7 @@ const { buildVisitFacts } = await import('../src/siro/f0-four-step.js');
 const { coerceSeqPos } = await import('../src/nurture/nurture-sequence-resolver.js');
 const { f0FormulaAllows } = await import('../src/nurture/nurture-prompt-selector.js');
 const { buildF0ApprovalCard } = await import('../src/nurture/nurture-orchestrator.js');
-const { loadF0Context, resolveRehashRepFirst } = await import('../src/siro/f0-context.js');
+const { loadF0Context, resolveRehashRepFirst, greetingName, applyGreetingName } = await import('../src/siro/f0-context.js');
 const { previewF0Generation } = await import('../src/siro/f0-preview.js');
 
 const FACTS = {
@@ -274,6 +274,38 @@ test('loadF0Context for the email: <visit_facts> with visited_by in v1 too, and 
   // The texts keep their own window.
   const sms = await loadF0Context(CONTEXT, { ...req, sequence_position: 1, channel: 'sms' }, { env: {}, nowMs: NOW, deps: deps([]) });
   assert.equal(sms.interruptInput.waitMaxH, 24);
+});
+
+// 2026-10-22, the live preview: GHL's first name "a" (LP: "AJ / Anita") opened the email
+// "Hi A," and its subject "…, A". A lone initial is no name; LP's lead is read instead.
+test('the greeting name: no lone initial, a couple\'s first person, typed capitals kept', () => {
+  const cases = [['a', ''], ['A.', ''], ['a j', ''], ['', ''], [null, ''], ['AJ / Anita', 'AJ'], ['George/Paula', 'George'],
+    ['mark', 'Mark'], ['Dana', 'Dana'], ['Mary Ann', 'Mary Ann'], ['TJ', 'TJ']];
+  for (const [raw, want] of cases) assert.equal(greetingName(raw), want, JSON.stringify(raw));
+});
+
+test('an initial in GHL: LP\'s name greets, and the prompt and the checks read it', async () => {
+  const req = { contact_id: 'c1', workflow_code: 'F.0', sequence_position: 0, channel: 'email' };
+  const ctx = { ...CONTEXT, lead: { ...CONTEXT.lead, first_name: 'a' } };
+  const lpRow = (first_name) => ({ lp_lead_id: ROW.lp_lead_id, lp_prospect_id: '470111', created_at_lp: '2026-10-01', first_name });
+  const withLp = (first_name) => ({ ...deps([ROW]), supabase: fakeSupabase({ rehash_stage: [], lp_leads: [lpRow(first_name)], agentic_messages: [] }) });
+  const out = await loadF0Context(ctx, req, { env: {}, nowMs: NOW, deps: withLp('AJ / Anita') });
+  assert.equal(out.vars.first_name, 'AJ');
+  const context = { lead: { ...ctx.lead } };
+  applyGreetingName(context, out, { email: true });
+  assert.equal(context.lead.first_name, 'AJ', '{{lead.first_name}} is the cleaned name');
+  // LP has no usable name either: the email opens with no name, never "A".
+  const none = await loadF0Context(ctx, req, { env: {}, nowMs: NOW, deps: withLp('j') });
+  assert.equal(none.vars.first_name, '');
+  const blank = { lead: { ...ctx.lead } };
+  applyGreetingName(blank, none, { email: true });
+  assert.equal(blank.lead.first_name, '');
+  // A real GHL name is kept as it is; v1 texts are never touched.
+  const real = await loadF0Context(CONTEXT, req, { env: {}, nowMs: NOW, deps: withLp('Someone Else') });
+  assert.equal(real.vars.first_name, 'James');
+  const v1 = { lead: { first_name: 'a' } };
+  applyGreetingName(v1, { vars: {} }, {});
+  assert.equal(v1.lead.first_name, 'a');
 });
 
 test('preview: the email is drafted from the inactive row and checked; no recording never calls the model', async () => {
