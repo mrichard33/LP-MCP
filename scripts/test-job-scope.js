@@ -349,3 +349,19 @@ test('an owner who rents the home out is never turned away (landlord_lead, live 
     assert.equal(J.enforceJobScope(l, {}).changed, false, l);
   }
 });
+
+test('an owner is never sent to "the owner" (landlord_lead, live chat, after #1426, 2026-10-22)', async () => {
+  const { TENANT_LINE, NON_OWNER_LINE } = await import('../src/agentic/non-owner.js');
+  const LIVE = "Got it. We work with homeowners on their own properties. Since you're renting this out to tenants, you'd need to have the owner reach out to us directly. If that changes or you own another home, feel free to come back. What's bothering you most about your windows or doors right now?";
+  const landlord = 'Hi, I need new windows on a house I rent out to tenants';
+  const r = J.enforceJobScope(LIVE, { thread: [], inbound: landlord });
+  assert.equal(r.text, "Got it. We work with homeowners, and that includes homes you rent out. What's bothering you most about your windows or doors right now?");
+  assert.match(r.reason, /owner_redirected/);
+  // Only for a lead who said they own it: with no ownership known, or a tenant, the rule stays off.
+  assert.equal(J.enforceJobScope("You'd need to have the owner reach out to us directly.", {}).changed, false);
+  assert.equal(J.enforceJobScope("You'd need to have the owner reach out to us directly.", { inbound: 'I rent this place from my landlord' }).changed, false);
+  // Our own lines stay as they are, even for an owner.
+  for (const l of [TENANT_LINE, NON_OWNER_LINE, J.COMMERCIAL_LINE, J.BELOW_MINIMUM_LINE, 'Do you own the home?']) {
+    assert.equal(J.enforceJobScope(l, { inbound: landlord }).changed, false, l);
+  }
+});

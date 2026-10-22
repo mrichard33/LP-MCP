@@ -2082,8 +2082,11 @@ points, the RENTER handler's keywords, which matched a landlord's "rent" / "land
 live chat told `landlord_lead` "We work with homeowners on their primary residences … it wouldn't be the right fit for
 us"; no prompt said it. `fixClaims` rule `owner_rental_declined` (`job-scope.js`: "primary residence", "a home you live
 in", or a rental word with a turn-away in one sentence) becomes "We work with homeowners, and that includes homes you rent
-out."; it is skipped when the lead rents (`homeownerFromThread` 'no'), so `TENANT_LINE` stands. The scorer's
-`owner_declined` reads the same words (`SCORING_VERSION` 2026-10-22.1).
+out."; it is skipped when the lead rents (`homeownerFromThread` 'no'), so `TENANT_LINE` stands. Once that was live the chat
+said "you'd need to have the owner reach out to us … if you own another home": rule `owner_redirected` ("have the
+owner", "own another home", "their own properties") runs only when the lead said they own it (`homeownerFromThread`
+'yes'), so `NON_OWNER_LINE` to a real non-owner stands. The scorer's `owner_declined` reads both (`SCORING_VERSION`
+2026-10-22.2).
 
 **No rentals, no commercial, a three-opening minimum, impact only (the user, 2026-10-13; rentals and investments
 superseded 2026-10-20, above).** A landlord was booked like
