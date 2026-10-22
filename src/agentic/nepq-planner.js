@@ -1321,6 +1321,7 @@ function planNepqTurnCore({
     // lead was "so confused" and opted out. Now: a time they name is taken when
     // the rep's calendar has it; otherwise the two closest that day, said plainly;
     // and our open pair is offered again instead of a fresh one.
+    let dayBlindTimeOff = false;
     if (bookingFix) {
       const open = rehashOpenOffer();
       // A named time is read exactly (pickSlot's hour test let "2pm" match 2:30 PM);
@@ -1333,7 +1334,18 @@ function planNepqTurnCore({
         || REHASH_TIME_ASK_RX.test(lastOut) || now.trim().split(/\s+/).length <= 8 || /\b(?:can\s+do|works?|available|free|call\s+me)\b/i.test(now);
       const named = timeTalk && all.length ? rehashTimeSlots(now, all, { offered: open, nowMs }) : null;
       if (named?.exact) return confirmPlan(named.exact);
-      if (named?.near?.length === 2) return offerPlan(named.near, LINES.not_open(clockLabel(named.time.minutes), named.near));
+      // 2026-10-22 (Jim Anderson, 5Cp5CiWtQ2zSRlxb2XPL): "10am tomorrow" with
+      // tomorrow's 10:00 taken found ONE opening that day, fell through to the
+      // day-blind typed-clock pick below and booked TODAY at 10:00 ("You're all
+      // set for today at 10:00 AM ET"). A time on a day they named is never booked
+      // on another day: the line names that day, and one opening is offered alone.
+      const namedDay = named?.time?.day || null;
+      const notOpenLabel = named ? `${clockLabel(named.time.minutes)}${namedDay ? ` ${namedDay === 'today' || namedDay === 'tomorrow' ? namedDay : namedDay.charAt(0).toUpperCase() + namedDay.slice(1)}` : ''}` : null;
+      if (named?.near?.length === 2) return offerPlan(named.near, LINES.not_open(namedDay ? notOpenLabel : clockLabel(named.time.minutes), named.near));
+      if (namedDay && named.near?.length === 1) {
+        return offerPlan(named.near, `${notOpenLabel} isn't open, but I have ${slotPair(named.near)}. Does that work?`);
+      }
+      if (namedDay) dayBlindTimeOff = true;
       // 2026-10-21 (first live-build sim): "Can you call me tomorrow?" got today's
       // times. A day named with no clock time, on a call ask, a schedule ask, a yes
       // or an answer to our times, gets two openings that day (the open pair when
@@ -1377,7 +1389,7 @@ function planNepqTurnCore({
     // A time they typed: the one opening it names is the pick; otherwise the
     // two openings nearest it. Never a time the calendar does not show.
     const typed = typedClock(now);
-    if (typed != null && all.length) {
+    if (typed != null && all.length && !dayBlindTimeOff) {
       const exact = exactSlotFor(now, all);
       if (exact) return confirmPlan(exact);
       const near = nearestToClock(all, typed, now, nowMs);

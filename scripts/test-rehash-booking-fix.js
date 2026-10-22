@@ -243,8 +243,9 @@ test('a booked call\'s confirm is never glued after the model\'s own words (firs
 // 2026-10-21 (Jim Anderson, 5Cp5CiWtQ2zSRlxb2XPL): "We have an opportunity to
 // talk with you at 10am tomorrow. Does that work for you?" at 8:42 ET was booked
 // on Rehash Call for TODAY 10:00 ("You're all set for today at 10:00 AM ET. I'll
-// give you a call then."). That reply came from a build without 69f926c (it
-// reached main at 15:53Z); on this code the day the lead named is the day booked.
+// give you a call then."), by the live build 1434733. With tomorrow's 10:00 open,
+// the day the lead named is the day booked (this test); the bug was tomorrow's
+// 10:00 being taken (the test after this one).
 test('Jim: "10am tomorrow. Does that work?" books tomorrow 10:00, never today', () => {
   const now = Date.parse('2026-10-21T12:48:30Z');
   const D10 = S('2026-10-21T14:00:00Z', 'Wed, Oct 21', '10:00 AM', 'today', 'Wednesday');
@@ -264,4 +265,33 @@ test('Jim: "10am tomorrow. Does that work?" books tomorrow 10:00, never today', 
   // Without a booking, "I'll call you at 10 AM" is a claim on the rehash line.
   assert.ok(findUnbackedBookingClaim("I'll call you at 10:00 AM tomorrow.", { booked: false, rehash: true }));
   assert.ok(checkReply("You're all set for today at 10:00 AM ET. I'll give you a call then.", { booked: false, rehash: true }).violations.some((v) => v.code === 'unbacked_booking_claim'));
+});
+
+// 2026-10-22: the conditions Jim's booking really had. Tomorrow's 10:00 was not
+// open, rehashTimeSlots found ONE opening that day, and the day-blind typed-clock
+// pick under it booked today's 10:00. A time on a named day is never booked on
+// another day: the one opening that day is offered, and the line names the day.
+test('Jim, live conditions: 10am tomorrow not open → offer tomorrow, never book today', () => {
+  const now = Date.parse('2026-10-21T12:48:30Z');
+  const D10 = S('2026-10-21T14:00:00Z', 'Wed, Oct 21', '10:00 AM', 'today', 'Wednesday');
+  const D11 = S('2026-10-21T15:00:00Z', 'Wed, Oct 21', '11:00 AM', 'today', 'Wednesday');
+  const M11 = S('2026-10-22T15:00:00Z', 'Thu, Oct 22', '11:00 AM', 'tomorrow', 'Thursday');
+  const M2 = S('2026-10-22T18:00:00Z', 'Thu, Oct 22', '2:00 PM', 'tomorrow', 'Thursday');
+  const run = (all) => planNepqTurn({
+    channel: 'sms', trigger: 'We have an opportunity to talk with you at 10am tomorrow. Does that work for you?',
+    conversation: [out('yes call 7275579775')], slots: [], tzLabel: 'ET', firstName: 'Jim',
+    discipline: { booking: { allowed: false, reason: 'x' } }, nowMs: now, postDemo: true, rehashRep: 'John', rehash: true,
+    callSlots: { calendarId: 'cal', rep: 'u1', repName: 'John', offer: [D10, D11], all },
+  });
+  const one = run([D10, D11, M11]);
+  assert.equal(one.step, 'rehash_offer');
+  assert.deepEqual(one.slots_to_offer.map(x => x.iso), [M11.iso]);
+  assert.equal(one.fixed_line, "10 AM tomorrow isn't open, but I have tomorrow at 11:00 AM ET. Does that work?");
+  const two = run([D10, D11, M11, M2]);
+  assert.equal(two.step, 'rehash_offer');
+  assert.deepEqual(two.slots_to_offer.map(x => x.iso), [M11.iso, M2.iso]);
+  assert.match(two.fixed_line, /^10 AM tomorrow isn't open, but I have tomorrow at 11:00 AM ET or tomorrow at 2:00 PM ET\./);
+  const none = run([D10, D11]);
+  assert.notEqual(none.step, 'rehash_confirm', 'never books today');
+  assert.match(none.fixed_line || '', /^10 AM tomorrow isn't open/);
 });
