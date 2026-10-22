@@ -2073,7 +2073,12 @@ rent my rent is $589" read as nothing). A renter or a commercial block plans `no
 `no_question` on EVERY turn (`openingsGate`, and `gateForStage` before its time-offer check), so `discovery_question_added`
 never glues a question after the no. Data: `sql/seeds/2026-10-20_owners_of_rentals_welcome.sql` (LIB-P16, the scope proof
 points, the RENTER handler's keywords, which matched a landlord's "rent" / "landlord"). Gate scenarios `landlord_lead` and
-`investment_owner` replace `landlord`.
+`investment_owner` replace `landlord`. **The model's own turn-away of an owner is corrected in code (2026-10-22).** The
+live chat told `landlord_lead` "We work with homeowners on their primary residences … it wouldn't be the right fit for
+us"; no prompt said it. `fixClaims` rule `owner_rental_declined` (`job-scope.js`: "primary residence", "a home you live
+in", or a rental word with a turn-away in one sentence) becomes "We work with homeowners, and that includes homes you rent
+out."; it is skipped when the lead rents (`homeownerFromThread` 'no'), so `TENANT_LINE` stands. The scorer's
+`owner_declined` reads the same words (`SCORING_VERSION` 2026-10-22.1).
 
 **No rentals, no commercial, a three-opening minimum, impact only (the user, 2026-10-13; rentals and investments
 superseded 2026-10-20, above).** A landlord was booked like

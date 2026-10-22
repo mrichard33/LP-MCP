@@ -42,6 +42,7 @@
 // PURE. No I/O. The callers drop the book_appointment companion when it blocks.
 
 import { findBookingAsks } from './discovery-discipline.js';
+import { homeownerFromThread } from './homeowner.js';
 
 export const COMMERCIAL_LINE = 'Thanks for asking. We only work on homes, not commercial properties, so this one is outside what we do. Sorry about that.';
 // The user's wording (2026-10-13). The doors version is for a lead who named a door.
@@ -350,6 +351,10 @@ export function jobScopeBlocks(thread = [], inbound = '') {
 // ── claims in our own draft ───────────────────────────────────────────────
 
 const NEGATION_RX = /\b(?:no(?!\s+(?:problem|worries|worry))|not(?!\s+(?:just|only))|don'?t|do\s+not|doesn'?t|can'?t|cannot|won'?t|isn'?t|aren'?t|never|only|outside|unfortunately)\b|n['’]t\b/i;
+// The owner-rental decline (2026-10-22): a rental word and a turn-away in one sentence. A decline needs a verb we
+// would refuse with ("we don't work on"), so "we don't need the landlord there" is not one.
+const RENTAL_WORDS_SRC = String.raw`\brent(?:s|ed|ing)?\s+(?:(?:it|this|that|them|the\s+\w+|your\s+\w+)\s+)?out\b|\brentals?\b|\binvestments?\b|\bflip(?:s|ping|pers?)?\b|\blandlords?\b|\bairbnbs?\b|\bvrbos?\b`;
+const DECLINE_SRC = String.raw`(?:\bnot|n['’]t)\s+(?:be\s+)?(?:a\s+|the\s+)?(?:right|good)\s+fit\b|\b(?:don['’]?t|do\s+not|can['’]?t|cannot|unable\s+to|won['’]?t)\s+(?:\w+\s+)?(?:work|do|take|service|handle|help|install|quote|cover)\b|\bonly\s+work\b`;
 const CLAIMS = [
   {
     key: 'commercial_claim',
@@ -370,13 +375,25 @@ const CLAIMS = [
     line: 'Every window and door we sell is hurricane impact-rated.',
     negated: true,
   },
+  {
+    key: 'owner_rental_declined',
+    // 2026-10-22 (landlord_lead, live chat): the model turned an owner away with "We work with homeowners on their
+    // primary residences. Since you're renting this out, it wouldn't be the right fit for us. If you own a home you
+    // live in, we'd be happy to help." Nothing we wrote says that: an owner who rents the home out, or owns it as an
+    // investment or a flip, is a lead (the user, 2026-10-20). A tenant's turn-away (TENANT_LINE) is never touched:
+    // the rule is skipped when the lead rents (`tenant`).
+    rx: new RegExp(String.raw`\bprimary\s+(?:residences?|homes?)\b|\bhomes?\s+you\s+(?:actually\s+)?live\s+in\b|\bowner[\s-]occupied\b|(?:${RENTAL_WORDS_SRC})[^.!?]*(?:${DECLINE_SRC})|(?:${DECLINE_SRC})[^.!?]*(?:${RENTAL_WORDS_SRC})`, 'i'),
+    line: 'We work with homeowners, and that includes homes you rent out.',
+    negated: true,
+    skipForTenant: true,
+  },
 ];
 
-function fixClaims(text) {
+function fixClaims(text, { tenant = false } = {}) {
   const reasons = [];
   const parts = String(text || '').match(/[^.!?]+(?:[.!?]+|$)\s*/g) || [];
   const fixed = parts.map(s => {
-    const rule = CLAIMS.find(r => r.rx.test(s) && (r.negated || !NEGATION_RX.test(s)));
+    const rule = CLAIMS.find(r => !(tenant && r.skipForTenant) && r.rx.test(s) && (r.negated || !NEGATION_RX.test(s)));
     if (!rule) return s;
     reasons.push(rule.key);
     return rule.line + (/\s$/.test(s) ? ' ' : '');
@@ -398,6 +415,7 @@ const VISIT_OFFER_RX = /\b(?:I\s+have\b[^.?!]*\bor\b|hold(?:ing)?\s+(?:a\s+time|
 export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
   const original = String(draft || '');
   const scope = jobScopeFromThread(thread, inbound);
+  const tenant = homeownerFromThread([...(Array.isArray(thread) ? thread : []), { direction: 'inbound', text: inbound }]) === 'no';
 
   if (scope.block) {
     const line = LINE_FOR[scope.block];
@@ -405,7 +423,7 @@ export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
     if (scope.now) return { text: line, changed: true, reason: `${scope.block}:said_now`, block: scope.block };
     const asks = new Set(findBookingAsks(original));
     const kept = sentences(original).filter(s => !asks.has(s) && !CLOCK_RX.test(s) && !VISIT_OFFER_RX.test(s)).join(' ').trim();
-    const claims = fixClaims(kept);
+    const claims = fixClaims(kept, { tenant });
     const out = claims.text;
     if (out === original.trim()) return { text: original, changed: false, reason: null, block: scope.block };
     return { text: out || line, changed: true, reason: out ? `${scope.block}:visit_offer_dropped` : `${scope.block}:said_earlier`, block: scope.block };
@@ -417,7 +435,7 @@ export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
     return { text: scope.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE, changed: true, reason: 'minimum_check', block: 'minimum_check' };
   }
 
-  const claims = fixClaims(original);
+  const claims = fixClaims(original, { tenant });
   if (claims.reasons.length) return { text: claims.text, changed: true, reason: claims.reasons.join(','), block: null };
   return { text: original, changed: false, reason: null, block: null };
 }

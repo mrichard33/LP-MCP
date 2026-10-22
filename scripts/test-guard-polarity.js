@@ -182,6 +182,12 @@ export const CASES = [
     mustPass: () => enforceJobScope("We don't work on commercial properties.", {}).changed === false,
   },
   {
+    guard: 'enforceJobScope',
+    // 2026-10-22: an owner who rents the home out is a lead; a tenant's turn-away stands.
+    mustChange: () => enforceJobScope("Since you're renting this out, it wouldn't be the right fit for us.", { inbound: 'a house I rent out' }).changed === true,
+    mustPass: () => enforceJobScope("Since you're renting this out, it wouldn't be the right fit for us.", { inbound: 'I rent this place from my landlord' }).changed === false,
+  },
+  {
     guard: 'enforceNonOwner',
     mustChange: () => enforceNonOwner(OFFER, { thread: [], inbound: "I'm renting, my landlord would have to okay it" }).changed === true,
     mustPass: () => enforceNonOwner(OFFER, { thread: [], inbound: 'hi' }).changed === false,
