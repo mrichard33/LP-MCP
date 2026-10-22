@@ -13,6 +13,11 @@
  * Run: node --test scripts/test-post-issue-rebook.js
  */
 import test from 'node:test';
+// These cases exercise the guards AROUND resolveLPLeadId (injected below). The
+// 15-day lead rule (services/lp-appointment-target.js) would answer first and
+// read LP / Supabase, so it is pinned off here; its own cases live in
+// scripts/test-lp-appointment-target.js (2026-10-22).
+process.env.LP_APPT_TARGET_RULE_MODE = 'off';
 import assert from 'node:assert/strict';
 import {
   isPostIssueLead, POST_ISSUE_DISPOSITIONS, PRE_ISSUE_DISPOSITIONS, postIssueMode, appointmentOnLead,

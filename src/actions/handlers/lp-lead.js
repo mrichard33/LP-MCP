@@ -118,6 +118,7 @@ import {
   flattenLpLeads, pickNewestLead, formatGuardDecisionLine, buildGuardCheck,
   calculatorLeadGuardMode, calcDedupeKey, pickNewestCalculatorLead,
 } from '../../services/lp-existing-lead-guard.js';
+import { earlierCreateInFlight } from '../../services/lp-appointment-target.js';
 import { needsNameRecovery, recoverPlaceholderName } from '../../services/placeholder-name-recovery.js';
 import { NAME_PLACEHOLDER_TAG, isPlaceholderSurname } from '../../services/identity-extraction.js';
 // v1.2 — the deterministic call-center brief. Pure builder + a fetch
@@ -522,8 +523,25 @@ export async function executeCreateLPLead(action) {
   // to be in) LP. Never re-post. (Skipped for the calculator lane — its
   // gate above already decided, and these fields may hold another
   // source's old lead.)
-  const existingInbound = isCalcLane ? '' : readCF(ghlContact, FIELD_LP_INBOUND_LEAD_ID);
-  const existingLeadId  = isCalcLane ? '' : readCF(ghlContact, FIELD_LP_LEAD_ID);
+  // 2026-10-22 — the 15-day lead rule (services/lp-appointment-target.js) sent
+  // this row because the person's newest LP lead is older than 15 days (or
+  // there is none). The stored LP Lead ID is that old lead, a cache and not an
+  // authority, so it is ignored and cleared: kept, it would make this action
+  // answer already_in_lp, and GHL's I.LP-A fallback would SetAppointment onto
+  // it from {{contact.lp_lead_id}} (prospect 119890). The existing-lead guard
+  // below still runs, so a lead entered in the last 15 days is reused.
+  const targetRuleNewLead = payload.target_rule === 'create_new';
+  if (targetRuleNewLead && !isCalcLane && readCF(ghlContact, FIELD_LP_LEAD_ID)) {
+    const old = readCF(ghlContact, FIELD_LP_LEAD_ID);
+    await updateGHLContactFields(contactId, [{ id: FIELD_LP_LEAD_ID, field_value: '' }])
+      .then(() => console.log(`[LP-CREATE] 15-day rule: cleared the stored LP Lead ID of ${contactId} (an older lead) before creating a new one`))
+      .catch((err) => console.warn(`[LP-CREATE] 15-day rule: could not clear the stored LP Lead ID of ${contactId}: ${err.message}`));
+    await addGHLNote(contactId,
+      `[LP CREATE] 15-day lead rule: the stored LP Lead ID (${old}) is an older lead, so it was cleared and a NEW LP lead is being created for this appointment.`
+    ).catch(() => {});
+  }
+  const existingInbound = (isCalcLane || targetRuleNewLead) ? '' : readCF(ghlContact, FIELD_LP_INBOUND_LEAD_ID);
+  const existingLeadId  = (isCalcLane || targetRuleNewLead) ? '' : readCF(ghlContact, FIELD_LP_LEAD_ID);
   // 2026-10-06 — an inquiry id with NO lead id is not "already in LP": the
   // inquiry may still be waiting in LP's inbound queue (Shelley, in1 428940).
   // Look it up; write back an issued lds and set the appointment on it, or say
@@ -590,6 +608,28 @@ export async function executeCreateLPLead(action) {
     const appt = await resolveLpAppointment(payload, eventPayload, ghlContact, payload.include_appt !== false, contactId);
     const reused = await reuseExistingLpLead(action, contactId, guard.existing, appt);
     return { ...reused, existing_lead_check: existingLeadCheck };
+  }
+
+  // ─── One create per booking (2026-10-22) ──────────────────────────
+  // The 15-day lead rule (services/lp-appointment-target.js) queues its own
+  // create_lp_lead next to the booking rule's; an earlier one that already sent
+  // a lead (or is sending it now) wins. Fails open: a duplicate is repairable,
+  // a lost lead is not.
+  if (!isCalcLane && action.id != null) {
+    try {
+      const since = new Date(Date.now() - 2 * 3600_000).toISOString();
+      const { data } = await supabase.from('agent_actions')
+        .select('id, status, execution_result')
+        .eq('action_type', 'create_lp_lead').eq('target_id', contactId)
+        .gte('created_at', since).limit(10);
+      const earlier = earlierCreateInFlight(data || [], action.id);
+      if (earlier) {
+        console.log(`[LP-CREATE] ⏭️ ${contactId}: create_lp_lead ${earlier.id} already ${earlier.result || earlier.status} — not sending a second lead`);
+        return { action: 'skipped_create_in_flight', contact_id: contactId, earlier_action_id: earlier.id, earlier_result: earlier.result || earlier.status, existing_lead_check: existingLeadCheck };
+      }
+    } catch (err) {
+      console.warn(`[LP-CREATE] in-flight create check failed for ${contactId} (proceeding): ${err.message}`);
+    }
   }
 
   // ─── Placeholder-name recovery (2026-09-28) ───────────────────────

@@ -391,6 +391,14 @@ export const MODES = Object.freeze([
     since: '2026-09-28',
     note: 'Stops create_lp_lead making a duplicate of an existing LP lead.',
   }),
+  m('LP_APPT_TARGET_RULE_MODE', 'lp', 'enum', OSL, 'live', OSL_S, {
+    since: '2026-10-22', goLive: LIVE_BY_DEFAULT, decider: 'Mark',
+    note: 'One 15-day rule for every LP appointment write: newest lead within 15 days takes it, else a new lead (prospect 119890).',
+  }),
+  m('LP_APPT_LEAD_AGE_GUARD_MODE', 'lp', 'enum', OSL, 'live', OSL_S, {
+    since: '2026-10-22', goLive: LIVE_BY_DEFAULT, decider: 'Mark', evidence: { events: ['lp.appointment_age_guard'] },
+    note: 'lp-client last line: SetAppointment refused on a lead entered over 15 days ago or for a past date.',
+  }),
   m('LP_CALC_LEAD_GUARD_MODE', 'lp', 'enum', OSL, 'live', OSL_S, {
     since: '2026-10-08', goLive: LIVE_BY_DEFAULT,
     note: 'The same duplicate guard for calculator leads.',

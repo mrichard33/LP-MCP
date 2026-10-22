@@ -468,6 +468,30 @@ pre-demo questions on a post-demo plan and never appends a question after a sign
 date is filed after the send (`src/services/post-demo-followup-io.js`: GHL task for the first `REHASH_TEAM_USER_IDS` id,
 `followup-requested`, a note; once per date). `POST_DEMO_PLANNER_MODE` off|shadow|live, default shadow (`[PostDemo] shadow`).
 
+**One 15-day lead rule governs EVERY LP appointment write (Mark, 2026-10-22; supersedes the 90-day rule #492 /
+#673).** Prospect 119890 (Sherry Despota): the chatbot booked her, create_lp_lead queued inbound 432237, then GHL's
+I.LP-A fallback wrote a 2022 date onto her 2024 lead 324521 (the contact's stored LP Lead ID) and the parity watchdog
+"fixed" it to 10/23 on the same old lead, so LP had two Set leads. `resolveAppointmentTarget`
+(`src/services/lp-appointment-target.js`) reads the person's NEWEST LP lead (every prospect on the phone + lp_leads
+linked to the contact; never the stored LP Lead ID, a cache) with `existingLeadWindowDays()` (the same 15 days as
+create_lp_lead's guard): within 15 days → `use_lead` (that lead, its source kept); older or none → `create_new` (a
+`create_lp_lead` row, rule `LP_APPT_TARGET_RULE`, `target_rule: 'create_new'`, which ignores and clears the stored LP
+Lead ID; Reece ChatBot 830 / 5574 when a `book_appointment` with source live_chat / sms_bot booked it); a create in
+flight (an unissued, unkilled `lp_inbound_queue` row, or a create_lp_lead in 2h) or a failed read →
+`wait_pending_create`, nothing written. An aged lead still holding a live (today or later) appointment is
+`manual_review` (`lp-appt-conflict` + a note; a new lead would make two Set leads): Mark to confirm. Both writers
+(`executeSetLPAppointment`, `syncAppointmentToLP`) ask before any resolver; the parity watchdog never creates and
+never writes to an aged lead (`skipped_stale_lead` / `skipped_pending_create`). The date and time come from the GHL
+booking (the event, else the contact's GHL appointment), never the LP-mirrored fields. `lp-client.setAppointment`
+is the last line (`runLeadAgeGuard`): a lead entered over 15 days ago or a date before today ET throws
+`LP_APPT_REFUSED` (reason `lead_older_than_15_days` / `appointment_date_in_past`) before LP is called, with an
+`lp.appointment_age_guard` event; any refusal names a writer that bypassed the rule. Every hold tags
+`lp-appt-deferred` so I.LP-A exits; its own direct SetAppointment step is a GHL edit (`docs/ghl-ilpa-fallback-fix.md`).
+A create_lp_lead stands down when an EARLIER one for the contact already sent a lead or is executing
+(`earlierCreateInFlight`, `skipped_create_in_flight`): the rule's row and the booking rule's row never both addLead.
+`LP_APPT_TARGET_RULE_MODE` / `LP_APPT_LEAD_AGE_GUARD_MODE` live (default) | shadow | off. Tests:
+`scripts/test-lp-appointment-target.js`. A new SetAppointment caller goes through one of the two writers.
+
 **LP's SetAppointment says Result 0 for success, 1 for a refusal (2026-10-12).** The opposite of UpdateDNCStatus.
 All 87 stored replies: 48 × `0 "Appointment set successfully."`; 39 × `1` ("record has future appt date…", "market is
 OOA.", "dispo is Issue, DNC or Sale.", "lds_id does not exist."). `inspectAppointmentResponse`

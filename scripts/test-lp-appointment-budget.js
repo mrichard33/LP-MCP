@@ -28,6 +28,9 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// The cases inject resolveLPLeadId; the 15-day lead rule would answer first
+// and read LP / Supabase, so it is off here (its cases: test-lp-appointment-target.js).
+process.env.LP_APPT_TARGET_RULE_MODE = 'off';
 process.env.SUPABASE_URL = 'https://stub.supabase.co';
 process.env.SUPABASE_SERVICE_ROLE_KEY = 'stub-key';
 
