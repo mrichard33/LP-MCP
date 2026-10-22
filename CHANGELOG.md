@@ -5,6 +5,14 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-10-22
+
+- **A rehash call time on a named day is never booked on another day.** "10am
+  tomorrow" with tomorrow's 10:00 taken booked today's 10:00 (Jim Anderson,
+  2026-10-21, on the live build). Now the bot offers the openings that day and
+  names the day: "10 AM tomorrow isn't open, but I have tomorrow at 11:00 AM ET.
+  Does that work?".
+
 ## 2026-10-21
 
 - **John owns a rehash lead once a call or a visit is set.** A rehash or post-demo

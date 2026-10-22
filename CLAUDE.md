@@ -988,7 +988,8 @@ queued a send after John set DND; every bot text was credited in GHL to John. Ma
   Events `rehash.pause_started` / `_restarted` / `_fired` / `_would_hold`. The reads and the verdict are ONE function,
   `runRehashGate` (`src/services/rehash-gate-io.js`).
 - **Scope:** the reply writer's rehash test OR any contact tagged past its demo (`isPostDemoLead` tags), never a sold
-  lead. Jim had no `rehash` tag and his newest lead was already Issue / Cnf, so "OPPFDN in the window" read false.
+  lead. Jim's newest lead was already Issue / Cnf, so "OPPFDN in the window" read false; his `rehash` / `active-f.0`
+  tags (on the 8:49 reply's snapshot) are what put him in.
 - **Bot messages show as the bot.** `REHASH_VOICE_MODE` rep (default, the 2026-10-01 voice) | team: the reply writer
   keeps the rep as `callRepName` (third person, "John will call you"), signs "— Reece Team" and `enforceTeamVoice({
   forbidNames })` rewrites "I'm John" / "— John". GHL's attribution is still open: on 2026-10-21 GHL kept the AI
@@ -999,9 +1000,13 @@ queued a send after John set DND; every bot text was credited in GHL to John. Ma
 - **No comparison question on the rehash track** (ruling 4). With `REHASH_BETTER_PRICE_FRAMING_ENABLED` on the ladder
   already gives the better-price invite; `enforceNepqPlan` now drops any comparison question (`isComparisonQuestion`,
   `REHASH_COMPARISON_RX` in `rehash-nepq.js`) and puts `betterPriceInvite('compare')` in its place; checkReply
-  `rehash_comparison_question`. Jim's 8:49 and 8:55 replies came from a build without 69f926c / 1434733 (they reached
-  main at 15:53Z); `scripts/test-rehash-booking-fix.js` holds his "10am tomorrow" → tomorrow 10:00. checkReply now reads
-  "I'll call you at <time>" as a claim on the rehash line (`rehash: ctx.rehash`).
+  `rehash_comparison_question`. checkReply now reads "I'll call you at <time>" as a claim on the rehash line
+  (`rehash: ctx.rehash`).
+- **A time on a named day is never booked on another day (2026-10-22).** Jim's 8:49 booking came from the live build
+  (1434733): tomorrow's 10:00 was taken, `rehashTimeSlots` found one opening that day, and the day-blind typed-clock pick
+  under it booked TODAY at 10:00. Now a named day turns that pick off (`dayBlindTimeOff` in `planNepqTurn`), one opening
+  that day is offered alone ("10 AM tomorrow isn't open, but I have tomorrow at 11:00 AM ET. Does that work?"), and the
+  not-open line names the day. Tests: `scripts/test-rehash-booking-fix.js` (both Jim tests).
 - **Rules:** the 13 post-demo objection rules are split: `<KEY>` keeps tags + notification, `<KEY>_ROUTE` carries the
   workflow moves (plus F.0 v2's removal) with `not_has_any_tag ["rehash","active-f.0","rehash-owned"]`
   (`sql/seeds/2026-10-21_rehash_no_o0_routing.sql`). LOOP_ESCALATION_UNCLEAR enrolls in nothing, so it is unchanged.
