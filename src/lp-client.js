@@ -48,6 +48,9 @@ import {
 import { LP_EMP } from './lp-source-ids.js';
 import { inspectAppointmentResponse, assertAppointmentAccepted } from './lp-appointment-guards.js';
 import { checkDuplicateAppointment, formatDuplicateBlock, lpApptDateToDay } from './services/lp-duplicate-appointment-guard.js';
+import { leadAgeGuardMode, leadAgeGuardDecision, leadAgeGuardError } from './services/lp-appointment-target.js';
+import { flattenLpLeads } from './services/lp-existing-lead-guard.js';
+import { extractArray } from './sync-utils.js';
 
 const LP_BASE = () => (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
 
@@ -791,10 +794,73 @@ export async function listInboundLeads({ startdate, enddate, page = 1, pageSize 
  * @param {string} apptTime — Time in HH:MM 24-hour format
  * @returns {Object} LP API response
  */
-export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, apptDate, apptTime }) {
+/**
+ * The last line of the 15-day lead rule (Mark, 2026-10-22;
+ * services/lp-appointment-target.js). Every writer should already have picked
+ * its lead through resolveAppointmentTarget; this refuses, BEFORE LP is called,
+ * a SetAppointment onto a lead entered more than 15 days ago or for a date
+ * before today ET, so a writer that bypassed the rule is caught here and named
+ * by an lp.appointment_age_guard event. LP_APPT_LEAD_AGE_GUARD_MODE live
+ * (default) | shadow (event + log, the write goes ahead) | off.
+ *
+ * A lead LP cannot be read for is not verified: in live that throws an
+ * ordinary (retryable) error. A lead with no entry time is brand new. The
+ * refusal carries code LP_APPT_REFUSED, so both orchestrators return it as a
+ * final lp_appointment_refused answer and nothing re-sends it.
+ *
+ * deps (tests): { mode, readEnteredAt(ldsId), emit(event), now }.
+ */
+export async function runLeadAgeGuard({ ldsId, apptDate, apptTime, allowAgedLead = false }, deps = {}) {
+  const mode = deps.mode || leadAgeGuardMode();
+  if (mode === 'off') return { checked: false, mode };
+  let enteredAt;
+  try {
+    enteredAt = await (deps.readEnteredAt || readLeadEnteredAt)(ldsId);
+  } catch (err) {
+    if (mode === 'live') throw new Error(`setAppointment: could not verify the age of the LP lead (${err.message}) — not written`);
+    console.warn(`[LP] lead-age guard (shadow) could not read lead ${ldsId}: ${err.message}`);
+    return { checked: false, mode, error: err.message };
+  }
+  const verdict = leadAgeGuardDecision({ enteredAt, apptDate, now: deps.now || new Date(), allowAgedLead });
+  if (!verdict.refuse) return { checked: true, mode, verdict };
+  const emit = deps.emit || ((e) => import('./event-emitter.js').then((m) => m.emitEvent(e)));
+  Promise.resolve().then(() => emit({
+    event_type: 'lp.appointment_age_guard',
+    event_subtype: mode === 'live' ? 'refused' : 'would_refuse',
+    source: 'lp_mcp', entity_type: 'lp_lead', entity_id: String(ldsId),
+    payload: { lp_lead_id: String(ldsId), appt_date: apptDate, appt_time: apptTime, entered_at: enteredAt || null, ...verdict, mode },
+    priority: 'normal', bypass_filter: true,
+  })).catch(() => {});
+  console.warn(`[LP] ⛔ lead-age guard ${mode === 'live' ? 'REFUSED' : 'would refuse (shadow)'} SetAppointment lds_id=${ldsId} ${apptDate} ${apptTime}: ${verdict.reason}${verdict.ageDays != null ? ` (${verdict.ageDays} days old)` : ''}`);
+  if (mode === 'live') throw leadAgeGuardError({ ldsId, apptDate, apptTime, verdict });
+  return { checked: true, mode, verdict };
+}
+
+/** LP's entry time for one lead (LP live; our lp_leads copy when LP gives none). Throws when LP cannot be read or has no such lead. */
+async function readLeadEnteredAt(ldsId) {
+  const resp = await getLeadByLdsId(ldsId, { fast: true });
+  const lead = flattenLpLeads(extractArray(resp))
+    .find((l) => String(l.id ?? l.LeadID ?? l.lds_id ?? '') === String(ldsId));
+  if (!lead) throw new Error('LP returned no such lead');
+  const entered = lead.dateentered || lead.DateEntered || null;
+  if (entered) return entered;
+  try {
+    const { default: supabase } = await import('./supabase.js');
+    const { data } = await supabase.from('lp_leads').select('created_at_lp').eq('lp_lead_id', String(ldsId)).maybeSingle();
+    return data?.created_at_lp || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, apptDate, apptTime, allowAgedLead = false, _ageGuardDeps = null }) {
   if (!ldsId) throw new Error('setAppointment: ldsId (LP lead ID) is required');
   if (!apptDate) throw new Error('setAppointment: apptDate is required (MM/DD/YYYY)');
   if (!apptTime) throw new Error('setAppointment: apptTime is required (HH:MM 24h)');
+
+  // 15-day lead rule, last line (2026-10-22). Before the log line and the POST.
+  await runLeadAgeGuard({ ldsId, apptDate, apptTime, allowAgedLead }, _ageGuardDeps || {});
+  if (_ageGuardDeps?.stopAfterGuard) return { _guard_passed: true };
 
   console.log(`[LP] SetAppointment: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, set_by=${setBy}`);
 

@@ -177,6 +177,10 @@ import { LP_EMP } from '../../lp-source-ids.js';
 import { buildLpAppointmentCard, hasMeaningfulCalendar } from '../../services/appointment-card.js';
 import { claimAppointmentAuthority, isAuthorityEnforced }
   from '../../services/contact-appointment-authority.js';
+import {
+  appointmentTargetRuleMode, resolveAppointmentTarget, actOnTarget, formatTargetLine,
+  productionTargetDeps, bookingFromAppointments,
+} from '../../services/lp-appointment-target.js';
 
 // GHL custom field IDs used by the writeback path. Keep in sync with
 // ghl-field-map.js.
@@ -421,6 +425,30 @@ export async function executeSetLPAppointment(action, context = {}) {
 
     const phone = (ghlContact?.phone || '').replace(/\D/g, '').slice(-10);
     const email = ghlContact?.email || '';
+    // ─── 15-day lead rule (Mark, 2026-10-22) — services/lp-appointment-target.js.
+    // The person's NEWEST LP lead decides, never the contact's stored LP Lead
+    // ID: within 15 days → that lead; older or none → a NEW lead carries the
+    // appointment (create_lp_lead), or we wait for one already on its way.
+    // Live: anything but use_lead returns here, before any LP write.
+    const targetMode = appointmentTargetRuleMode();
+    let ruleTarget = null;
+    if (targetMode !== 'off') {
+      const tdeps = context?.deps?.appointmentTargetDeps || productionTargetDeps();
+      ruleTarget = await (context?.deps?.resolveAppointmentTarget || resolveAppointmentTarget)({ contactId, phone }, tdeps);
+      console.log(formatTargetLine({ contactId, caller: 'set_lp_appointment', mode: targetMode, target: ruleTarget }));
+      if (targetMode === 'live' && ruleTarget.decision !== 'use_lead') {
+        const requestedRaw = payload.appt_date || payload.appointment_date || eventPayload.appt_date
+          || eventPayload.appointment_date || eventPayload.startDate || eventPayload.start_date || eventPayload.start_time || null;
+        return actOnTarget({
+          target: ruleTarget, contactId, caller: action.rule_applied ? `set_lp_appointment:${action.rule_applied}` : 'set_lp_appointment',
+          allowCreate: true,
+          requested: { date: requestedRaw ? normalizeDateForComparison(requestedRaw) : null },
+          eventId: action.event_id || null,
+          payloadSource: payload.source || eventPayload.source || null,
+        }, tdeps, { isGhlOnlyCalendarId });
+      }
+    }
+
     // 2026-08-03 — prefer the contact's appointment-authority owner, but only
     // as a REORDERING of resolveLPLeadId's Step-0 candidates. The owner won an
     // arbitration; it has not been validated against LP. Deliberately NOT a
@@ -435,8 +463,13 @@ export async function executeSetLPAppointment(action, context = {}) {
     const authorityOwnerId = isAuthorityEnforced()
       ? await getAppointmentAuthorityOwner(contactId)
       : null;
-    const resolution = await resolveLPLeadId(contactId, { phone, email },
-      authorityOwnerId ? { preferLeadId: authorityOwnerId } : {});
+    const resolution = (targetMode === 'live' && ruleTarget?.decision === 'use_lead')
+      ? {
+          ldsId: ruleTarget.ldsId, prospectId: ruleTarget.prospectId, source: 'appointment_target_rule',
+          lpSource: ruleTarget.lpSource, lpSourceDetail: ruleTarget.lpSourceDetail, disp: ruleTarget.disposition,
+        }
+      : await resolveLPLeadId(contactId, { phone, email },
+        authorityOwnerId ? { preferLeadId: authorityOwnerId } : {});
 
     if (!resolution) {
       const { name } = await resolveContactInfo(contactId, eventPayload);
@@ -501,12 +534,22 @@ export async function executeSetLPAppointment(action, context = {}) {
   if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) {
     rawDate = eventPayload.start_time;
   }
-  if (!rawDate && contactId && !isLPLeadId(contactId)) {
+  // 2026-10-22: with no date in the payload or the event, the GHL BOOKING
+  // decides (the contact's appointment object), never the LP-mirrored contact
+  // fields: those carry whatever LP last held (prospect 119890 got a 2022 date
+  // from them). Read once, used for the time below too.
+  let ghlBooking;
+  const readGhlBooking = async () => {
+    if (ghlBooking !== undefined) return ghlBooking;
+    ghlBooking = null;
+    if (!contactId || isLPLeadId(contactId)) return null;
     try {
-      const c = await getContactCached(contactId, cache);
-      rawDate = c?.last_appointment_start_date || c?.lastAppointmentStartDate || null;
+      const appts = await (context?.deps?.readGhlAppointments || productionTargetDeps().readGhlAppointments)(contactId);
+      ghlBooking = bookingFromAppointments(appts, { isGhlOnlyCalendarId });
     } catch {}
-  }
+    return ghlBooking;
+  };
+  if (!rawDate) rawDate = (await readGhlBooking())?.date || null;
   if (!rawDate) throw new Error('Cannot resolve appointment date');
 
   // Validate/normalize to LP's required MM/DD/YYYY. Throw (loud, labeled in
@@ -521,11 +564,10 @@ export async function executeSetLPAppointment(action, context = {}) {
     const st = String(eventPayload.start_time);
     rawTime = st.includes('T') ? st.split('T')[1]?.slice(0, 5) : st;
   }
-  if (!rawTime && contactId && !isLPLeadId(contactId)) {
-    try {
-      const c = await getContactCached(contactId, cache);
-      rawTime = c?.last_appointment_start_time || c?.lastAppointmentStartTime || null;
-    } catch {}
+  if (!rawTime) {
+    const b = await readGhlBooking();
+    // Only the booking whose day we are writing supplies its time.
+    if (b && normalizeDateForComparison(rawDate) === b.date) rawTime = b.time24;
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 

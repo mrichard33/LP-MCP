@@ -260,6 +260,9 @@ import { LP_EMP } from './lp-source-ids.js';
 import { buildLpAppointmentCard } from './services/appointment-card.js';
 import { trackBackground } from './graceful-shutdown.js';
 import { lpSyncHeldForDispatch } from './services/lp-sync-hold.js';
+import {
+  appointmentTargetRuleMode, resolveAppointmentTarget, actOnTarget, formatTargetLine, productionTargetDeps,
+} from './services/lp-appointment-target.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 // GHL_LOCATION_ID removed 2026-07-28: its only consumer was the locationId
@@ -2059,13 +2062,41 @@ async function syncAppointmentToLPInner({
     };
   }
 
-  const resolution = await _resolveLPLeadId(contactId, {
-    phone: contactPhone,
-    email: contactEmail,
-    address1,
-    postalCode,
-    prospectId: webhookProspectId,
-  }, FAST);
+  // ── 15-day lead rule (Mark, 2026-10-22) — services/lp-appointment-target.js.
+  // The person's NEWEST LP lead decides, never the contact's stored LP Lead ID:
+  // within 15 days → that lead; older or none → a NEW lead carries the
+  // appointment (create_lp_lead), or nothing is written while one is on its
+  // way. The parity watchdog (requireBookable) never creates a lead and never
+  // "fixes" a mismatch on an older lead: it answers skipped_stale_lead /
+  // skipped_pending_create. Live: anything but use_lead returns here.
+  const targetMode = appointmentTargetRuleMode();
+  let ruleTarget = null;
+  if (targetMode !== 'off') {
+    const tdeps = deps.appointmentTargetDeps || productionTargetDeps();
+    ruleTarget = await (deps.resolveAppointmentTarget || resolveAppointmentTarget)({ contactId, phone: contactPhone }, tdeps);
+    const caller = requireBookable ? 'parity_watchdog' : 'sync_appointment_to_lp';
+    console.log(formatTargetLine({ contactId, caller, mode: targetMode, target: ruleTarget }));
+    if (targetMode === 'live' && ruleTarget.decision !== 'use_lead') {
+      return actOnTarget({
+        target: ruleTarget, contactId, caller,
+        allowCreate: !requireBookable,
+        requested: { date: incomingDateNorm, time: incomingTimeNorm },
+      }, tdeps, { isGhlOnlyCalendarId });
+    }
+  }
+
+  const resolution = (targetMode === 'live' && ruleTarget?.decision === 'use_lead')
+    ? {
+        ldsId: ruleTarget.ldsId, prospectId: ruleTarget.prospectId, source: 'appointment_target_rule', step: 'target',
+        lpSource: ruleTarget.lpSource, lpSourceDetail: ruleTarget.lpSourceDetail, disp: ruleTarget.disposition,
+      }
+    : await _resolveLPLeadId(contactId, {
+      phone: contactPhone,
+      email: contactEmail,
+      address1,
+      postalCode,
+      prospectId: webhookProspectId,
+    }, FAST);
 
   // LP was too slow to confirm — do NOT enroll (would duplicate a real,
   // slow-to-read lead). Return a distinct status the caller/sweep can retry.

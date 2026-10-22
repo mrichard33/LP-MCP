@@ -91,6 +91,9 @@ export function pickNewestLead(leads) {
     // Eastern wall clock, like createdAtLp. Inbound capture reads it to tell an
     // old lead an agent just worked for the call (2026-10-19).
     lastChangedOn: best.lastchangedon || best.LastChangedOn || null,
+    // The 15-day appointment rule reads it: an aged lead that still holds a
+    // live appointment is a reschedule, not a new lead (2026-10-22).
+    apptDate: best.apptdate || best.ApptDate || null,
   };
 }
 

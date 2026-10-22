@@ -6,6 +6,9 @@
  * Run: node --test scripts/test-lp-post-demo-lock.js
  */
 import test from 'node:test';
+// The cases inject resolveLPLeadId; the 15-day lead rule would answer first
+// and read LP / Supabase, so it is off here (its cases: test-lp-appointment-target.js).
+process.env.LP_APPT_TARGET_RULE_MODE = 'off';
 import assert from 'node:assert/strict';
 import { postDemoLock } from '../src/lp-post-demo-lock.js';
 import { syncAppointmentToLP } from '../src/lp-appointment-sync.js';

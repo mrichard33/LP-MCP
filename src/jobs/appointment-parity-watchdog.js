@@ -411,7 +411,22 @@ function classifyHealResult(result) {
     case 'newer_lead_pending_in_inbound_queue':
     case 'post_issue_send_failed':
     case 'post_issue_rebook_duplicate':
+    // 2026-10-22 — the 15-day lead rule (services/lp-appointment-target.js).
+    // The watchdog never "fixes" a mismatch by writing to a lead older than 15
+    // days and never creates one: skipped_stale_lead. A new lead already on its
+    // way (or an unreadable lookup): skipped_pending_create. An aged lead that
+    // still holds a live appointment is a person's move in LP.
+    case 'skipped_stale_lead':
+    case 'skipped_pending_create':
+    case 'skipped_aged_lead_live_appointment':
+    case 'waiting_for_new_lead':
+    case 'skipped_no_ghl_booking':
+    case 'new_lead_queue_failed':
       return 'not_attempted';
+    // Not reachable from the watchdog (it never creates), listed so a future
+    // caller change surfaces as heal_enrolled rather than unknown_result.
+    case 'routed_to_new_lead':
+      return 'heal_enrolled';
     case 'lp_lead_creation_enrolled':
     case 'create_lead_already_enrolled':
     case 'enrolled_lead_creation_workflow':

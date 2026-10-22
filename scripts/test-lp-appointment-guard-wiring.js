@@ -25,6 +25,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+// The 15-day lead-age guard (2026-10-22) reads the lead from LP before every
+// SetAppointment; these cases pin LP's REFUSAL guard alone against a stub that
+// answers only SetAppointment, so the age guard is off here. Its own cases are
+// in scripts/test-lp-appointment-target.js.
+process.env.LP_APPT_LEAD_AGE_GUARD_MODE = 'off';
 process.env.LP_API_BASE_URL = 'https://lp.stub.local';
 process.env.LP_USERNAME = 'u';
 process.env.LP_PASSWORD = 'p';
