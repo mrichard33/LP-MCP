@@ -311,6 +311,8 @@ export const SCENARIOS = Object.freeze({
   // ── 2026-10-13 (Erica Hilts): a price ask, then a goodbye, twice ──
   price_then_goodbye: { title: 'Price ask, then "have a good day" (Erica Hilts)', family: 'objection', expect: { 3: { question_allowed: false, no_clock: true }, 4: { question_allowed: false, no_clock: true } }, persona: DANA, turns: ["Hi, I'm looking to get a bay window. The area is about 6ft wide", "Ok I see. What's an average price including installation?", 'Thank you for your time, just needing an average estimation, not exact pricing. Have a good day.', 'I can call back when I have more time. Ty'] },
   slider_only: { title: 'One sliding glass door (meets the minimum)', family: 'booking', persona: DANA, autoAnswer: true, turns: ['I need to replace our sliding glass door', 'Yes, please set up a visit'] },
+  // 2026-10-22 (Mark; Chris Kendig): any job with a slider meets the minimum, whatever comes with it.
+  door_plus_slider: { title: 'A front door and a sliding door (meets the minimum, Kendig)', family: 'booking', persona: DANA, autoAnswer: true, turns: ['I need a quote on 1 front door and 1 sliding door', 'Strictly the door and slider, nothing fancy', 'Yes, please set up a visit'] },
   // ── 2026-10-20 (handoff v3): the 1 Leg phone presentation ──
   // 2026-10-22 (Mark): the phone presentation is for phone-team contacts ONLY.
   // A 1 Leg contact with no tag, and a lead who says the spouse is away, keep the

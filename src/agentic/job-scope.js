@@ -20,8 +20,9 @@
 //     office or apartment building, a church, an HOA or condo association
 //     buying for the building). A single condo owner is a homeowner.
 //   - MINIMUM: three openings in any mix of windows and doors (3 windows,
-//     2 windows and a door, a window and 2 doors, 3 doors), OR one sliding
-//     glass door on its own.
+//     2 windows and a door, a window and 2 doors, 3 doors), OR any job that
+//     includes at least one sliding glass door (Mark, 2026-10-22: a slider
+//     alone, or a slider plus anything else, always qualifies).
 //
 //   How each one is said (both bots, every mode, like the renter guard):
 //   - commercial said THIS turn → the whole reply is the decline line.
@@ -49,7 +50,7 @@ export const COMMERCIAL_LINE = 'Thanks for asking. We only work on homes, not co
 export const MINIMUM_CHECK_LINE = 'Of course, I can help with that. Are all the other windows in your home already hurricane impact?';
 export const MINIMUM_CHECK_DOORS_LINE = 'Of course, I can help with that. Are all the other windows and doors in your home already hurricane impact?';
 // "3-opening minimum" is the user's wording (2026-10-13: "we should say there is a 3 open minimum").
-export const BELOW_MINIMUM_LINE = "Thanks for letting me know. We have a 3-opening minimum, any mix of windows and doors, or one sliding glass door on its own, so we can't set up a visit for this one. If anything else comes up, we'd be glad to help.";
+export const BELOW_MINIMUM_LINE = "Thanks for letting me know. We have a 3-opening minimum, any mix of windows and doors, or any job with a sliding glass door, so we can't set up a visit for this one. If anything else comes up, we'd be glad to help.";
 
 const LINE_FOR = { commercial: COMMERCIAL_LINE, below_minimum: BELOW_MINIMUM_LINE };
 
@@ -252,7 +253,9 @@ export function meetsMinimum(o) {
 //   "Any other windows or doors you'd want looked at?" / "our minimum is …?"
 //   → a NO means this is the whole job.
 const YES_MEANS_UNDER_ASK_RX = /\bother\s+windows?(?:\s+(?:and|or)\s+doors?)?\b[^?]*\bimpact\b[^?]*\?|\bonly\s+(?:have|has)\s+(?:1|one|2|two|a\s+couple(?:\s+of)?)\s+(?:windows?|doors?)\b[^?]*\?/i;
-const NO_MEANS_UNDER_ASK_RX = /\bminimum\b[^?]*\?|\bany\s+other\s+windows?\s+(?:or|and)\s+doors?\b[^?]*\?/i;
+// 2026-10-22 (Kendig): one sentence only. "[^?]*" ran across the model's own decline ("…a 3-opening
+// minimum … That puts this outside what we can take on right now. Which works better?") and read it as an ask.
+const NO_MEANS_UNDER_ASK_RX = /\bminimum\b[^?.!]*\?|\bany\s+other\s+windows?\s+(?:or|and)\s+doors?\b[^?]*\?/i;
 export const MINIMUM_ASK_RX = new RegExp(`${YES_MEANS_UNDER_ASK_RX.source}|${NO_MEANS_UNDER_ASK_RX.source}`, 'i');
 // Wherever it is in the reply: they want only this one done.
 const ONLY_THIS_ONE_RX = /\b(?:only|just)\s+(?:want|need|doing|replacing|looking\s+to\s+(?:do|replace))\s+(?:to\s+(?:do|replace)\s+)?(?:this|that|the|one|1|two|2)\b|\bjust\s+(?:this|that|the)\s+one\b|\b(?:the\s+)?(?:others|rest)\s+(?:are|were)\s+(?:all\s+)?(?:already\s+)?(?:impact|done|replaced)\b|\bthey'?re\s+(?:all\s+)?(?:already\s+)?impact\b/i;
@@ -311,6 +314,12 @@ export function jobScopeFromThread(thread = [], inbound = '') {
   if (asked >= 0) {
     const reply = turns.slice(asked + 1).find(t => t.direction === 'inbound');
     if (!reply) return { block: null, check: false, now: false };
+    // A slider named before the ask, or in the reply ("just the door and the slider"), meets the
+    // minimum (Mark, 2026-10-22): the ask was ours to skip, never a reason to decline. A reply that
+    // says the slider is already impact is about the other openings, so it does not count.
+    const sliderSaid = turns.slice(0, asked).some(t => t.direction === 'inbound' && openingsIn(t.text).slider)
+      || (openingsIn(reply.text).slider && !/\bimpact\b/i.test(reply.text));
+    if (sliderSaid) return { block: null, check: false, now: false };
     if (replyMeansUnder(turns[asked].text, reply.text)) {
       const idx = turns.indexOf(reply);
       return { block: 'below_minimum', check: false, now: idx === lastInboundIdx };
@@ -335,6 +344,75 @@ export function jobScopeFromThread(thread = [], inbound = '') {
   }
   if (!stated || windows + doors >= 3 || windows + doors === 0) return { block: null, check: false, now: false };
   return { block: null, check: true, now: newest === lastInboundIdx, doors: doors > 0 };
+}
+
+/**
+ * Does the lead's job already meet the minimum, by their own words? Pure.
+ * @returns {'slider'|'count'|'open'|null}
+ *   slider: a sliding glass door is in the job; count: 3+ openings stated;
+ *   open: "the whole house", "all the windows" (never a reason to decline);
+ *   null: nothing says so (a small stated count, or no count at all).
+ */
+export function threadMeetsMinimum(thread = [], inbound = '') {
+  const turns = normalize(thread, inbound);
+  let windows = 0, doors = 0, open = false;
+  for (let i = 0; i < turns.length; i++) {
+    if (turns[i].direction !== 'inbound') continue;
+    const o = openingsAt(turns, i);
+    if (o.slider) return 'slider';
+    windows = Math.max(windows, o.windows);
+    doors = Math.max(doors, o.doors);
+    // Only a big scope: a bare "we need windows" says nothing yet (the count question asks it).
+    if (o.big) open = true;
+  }
+  if (windows + doors >= 3) return 'count';
+  return open ? 'open' : null;
+}
+
+// A model-written minimum decline (2026-10-22, Chris Kendig, 6tYdVHQPS4BBzsYsB3Yf): "A front door and a
+// slider together come to 2 openings, and we work on a 3-opening minimum … That puts this outside what we
+// can take on right now." and "For just the door and slider we're under our 3-opening minimum, so we're
+// not a fit for this one." The code said the job qualified; nothing checked the model's words.
+const MINIMUM_WORD_RX = /\bminimum\b/i;
+const TURN_AWAY_RX = /\bnot\s+(?:a\s+|the\s+)?(?:good\s+|right\s+)?fit\b|\boutside\s+(?:of\s+)?what\s+we\b|\b(?:under|below|short\s+of)\s+(?:our|the)\b|\b(?:can['’]?t|cannot|unable\s+to|won['’]?t\s+be\s+able|not\s+able\s+to)\b|\b(?:doesn['’]?t|don['’]?t|does\s+not|do\s+not)\s+meet\b|\btoo\s+small\b/i;
+export const MEETS_MINIMUM_LINE = { slider: 'A sliding door meets our minimum, so this is a job we do.', count: 'That meets our minimum, so this is a job we do.', open: 'This is a job we can help with.' };
+
+/** Replace a minimum decline in a draft whose job meets the minimum. Pure. */
+function fixFalseMinimumDecline(text, meets) {
+  const parts = sentences(text);
+  const minIdx = parts.map((s, i) => (MINIMUM_WORD_RX.test(s) ? i : -1)).filter(i => i >= 0);
+  if (!minIdx.length) return null;
+  // A turn-away in a minimum sentence, or in the sentence right after one.
+  const drop = new Set();
+  for (const i of minIdx) {
+    const next = parts[i + 1];
+    if (TURN_AWAY_RX.test(parts[i])) drop.add(i);
+    else if (next && TURN_AWAY_RX.test(next) && !MINIMUM_WORD_RX.test(next)) { drop.add(i); drop.add(i + 1); }
+  }
+  if (!drop.size) return null;
+  // Once it declines, every minimum sentence goes with it ("…come to 2 openings, and we work on a
+  // 3-opening minimum …"): the job meets it, so the rule has nothing to say.
+  for (const i of minIdx) drop.add(i);
+  const first = Math.min(...drop);
+  const out = [];
+  parts.forEach((s, i) => {
+    if (i === first) out.push(MEETS_MINIMUM_LINE[meets]);
+    else if (!drop.has(i)) out.push(s);
+  });
+  return out.join(' ').trim();
+}
+
+// An orphan choice question (2026-10-22, Kendig): the first decline ended "Which works better?" with no
+// times in it. A bare "Which works better?" / "Which works for you?" stands only beside two clock times.
+const BARE_CHOICE_Q_RX = /^\s*which\s+(?:one\s+)?works\s+(?:better|best|for\s+you)(?:\s+for\s+you)?\s*\?\s*$/i;
+const TIME_MENTION_RX = /\b(?:[1-9]|1[0-2])(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)(?![a-z])|\b(?:at|or)\s+(?:[1-9]|1[0-2])(?::[0-5]\d)?\b/gi;
+
+/** Drop a bare "Which works better?" when the draft names fewer than two times. Pure. */
+export function dropOrphanChoiceQuestion(text) {
+  const parts = sentences(text);
+  if (!parts.some(s => BARE_CHOICE_Q_RX.test(s))) return null;
+  if ((String(text || '').match(TIME_MENTION_RX) || []).length >= 2) return null;
+  return parts.filter(s => !BARE_CHOICE_Q_RX.test(s)).join(' ').trim();
 }
 
 /** The check line for this thread: the doors version when they named a door. Pure. */
@@ -452,7 +530,18 @@ export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
     return { text: scope.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE, changed: true, reason: 'minimum_check', block: 'minimum_check' };
   }
 
-  const claims = fixClaims(original, { tenant, owner });
-  if (claims.reasons.length) return { text: claims.text, changed: true, reason: claims.reasons.join(','), block: null };
+  const reasons = [];
+  let text = original;
+  const claims = fixClaims(text, { tenant, owner });
+  if (claims.reasons.length) { text = claims.text; reasons.push(...claims.reasons); }
+  const meets = threadMeetsMinimum(thread, inbound);
+  // Our own lines are never rewritten (the decline line is said only after the lead confirmed).
+  if (meets && !Object.values(LINE_FOR).includes(text.trim())) {
+    const fixed = fixFalseMinimumDecline(text, meets);
+    if (fixed != null) { text = fixed; reasons.push('false_minimum_decline'); }
+  }
+  const orphan = dropOrphanChoiceQuestion(text);
+  if (orphan != null && orphan) { text = orphan; reasons.push('orphan_choice_question'); }
+  if (reasons.length) return { text, changed: true, reason: reasons.join(','), block: null };
   return { text: original, changed: false, reason: null, block: null };
 }

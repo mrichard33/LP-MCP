@@ -51,7 +51,8 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // old renter script in kb_embeddings 3275, copied after .2 went live) and "check with the owner".
 // 2026-10-22.4 (Mark): one_leg_phone_presentation now expects the NORMAL offer: the phone
 // presentation is for phone-team contacts only.
-export const SCORING_VERSION = '2026-10-22.4';
+// 2026-10-22.5 (Mark; Kendig): door_plus_slider, a front door + a slider must book and never hear the minimum.
+export const SCORING_VERSION = '2026-10-22.5';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -199,6 +200,11 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     return out;
   },
   slider_only: (r) => (bookedOrHeld(r) ? [] : [{ code: 'yes_without_booking', detail: 'a sliding glass door (meets the minimum) ended with nothing booked or held' }]),
+  door_plus_slider: (r) => {
+    const out = allReplies(r).filter(x => /\bminimum\b/i.test(x.text)).map(x => ({ code: 'minimum_mentioned', detail: x.text, turn: x.turn }));
+    if (!bookedOrHeld(r)) out.push({ code: 'yes_without_booking', detail: 'a front door and a slider (meets the minimum) ended with nothing booked or held' });
+    return out;
+  },
   // Live: the competitor reaches times (disarm → criteria → bridge → times).
   competitor: (r) => (r.lead_stage_mode === 'live' && !allReplies(r).some(x => clockCount(x.text) >= 2)
     ? [{ code: 'competitor_no_times', detail: 'the competitor case never reached two real times' }] : []),

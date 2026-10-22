@@ -2164,7 +2164,10 @@ thread: a RENTAL (tenant, landlord, Airbnb/VRBO, property manager) or an INVESTM
 property" with nothing more; `INVESTMENT_LINE`; an owner's un-rented second home is a lead, the user, 2026-10-13)
 or COMMERCIAL property (business, office/apartment building, church, HOA or condo association for the building; a single
 condo owner is a homeowner) said now → the whole reply is `RENTAL_LINE` / `COMMERCIAL_LINE`, said earlier → the time
-offer goes. The MINIMUM is three windows or doors in any mix, or one sliding glass door alone: a stated count under it
+offer goes. The MINIMUM is three windows or doors in any mix, or ANY job that includes a sliding glass door (Mark, 2026-10-22: Chris
+Kendig, a front door + a slider, was declined twice; the rule's one home is `MINIMUM_RULE` in `system-core.js`, read by
+both prompts, and `enforceJobScope` rewrites a model-written minimum decline when the job meets it, `false_minimum_decline`,
+and drops a bare "Which works better?" with no two times, `orphan_choice_question`; gate scenario `door_plus_slider`): a stated count under it
 (not a symptom: "my window is foggy" is never checked) gets ONE friendly check, never the rule first (`MINIMUM_CHECK_LINE`,
 the user's wording: "Of course, I can help with that. Are all the other windows in your home already hurricane
 impact?"; "Does your home only have 1 window?" reads the same). A yes or "just this one" → `BELOW_MINIMUM_LINE`, which

@@ -60,6 +60,7 @@ import { enforcePropertyScope, leadRaisesScope } from '../agentic/property-scope
 import { enforceNonOwner, isNonOwner, nonOwnerLine } from '../agentic/non-owner.js';
 import { enforceSignOff } from '../agentic/sign-off.js';
 import { enforceJobScope, jobScopeFromThread, openingsToSave, COMMERCIAL_LINE, BELOW_MINIMUM_LINE, MINIMUM_CHECK_LINE, MINIMUM_CHECK_DOORS_LINE } from '../agentic/job-scope.js';
+import { MINIMUM_RULE } from '../prompts/response-generator/system-core.js';
 import { scopeDqKind } from '../agentic/scope-dq.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { enforceCallTiming, promisedCallback, isTeamOpen } from '../agentic/team-hours.js';
@@ -379,7 +380,7 @@ You are answering in the website chat, live, with the visitor watching the scree
 - If what they typed looks like an email but is not a valid one (no @, or nothing after the @), say so kindly and ask for it again: "That doesn't look quite right. Could you check the email address?" Never say you do not have enough information. Never dead-end.
 - Never promise to send anything unless an email is on file. No email → ask for the email instead.
 - A large job (eight or more openings in a home) → answer, offer the next step, and a person will follow up; say that plainly.
-- We work only on homes, and only with the homeowner. A renter (someone who rents the home they live in), a commercial property (a business, a church, an HOA or condo association, an apartment or office building), or a job under our minimum (three windows or doors in any mix, or one sliding glass door) gets a kind, plain no and no visit. An owner who rents the home out, or owns it as an investment or a flip, is a normal lead.
+- We work only on homes, and only with the homeowner. A renter (someone who rents the home they live in), a commercial property (a business, a church, an HOA or condo association, an apartment or office building), or a job under our minimum (our minimum is ${MINIMUM_RULE}) gets a kind, plain no and no visit. An owner who rents the home out, or owns it as an investment or a flip, is a normal lead.
 - Everything else in this prompt still binds: the discovery discipline, the decision-maker rules, no insurance predictions, no exclamation marks.
 - A SERVICE AREA instruction in this prompt outranks the collection order above for this reply: when it says ask only for the zip, or stop, do exactly that.
 - Never name a day or a time for a visit or a call yourself: real open times are added to the reply for you when it is time to book (2026-10-02). Never say "a team member will call to set a time": when they want a visit, ask "Would that help?" about a free visit at their home, and the times follow.

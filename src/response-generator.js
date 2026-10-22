@@ -18,6 +18,10 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.16.2 — 2026-10-22. ANY JOB WITH A SLIDER MEETS THE MINIMUM (Mark; Chris Kendig, a front door + a
+ *   sliding door, was declined twice). The minimum rule reads "three windows or doors in any mix, OR any job that
+ *   includes at least one sliding glass door" (MINIMUM_RULE in system-core.js, shared with the live chat), and
+ *   the REPAIRS line no longer implies a slider is under it. Code backstop: enforceJobScope's false_minimum_decline.
  * v2.16.1 — 2026-10-22. A LANDLORD IS AN OWNER. When the lead's own words say they own the home and rent it out
  *   ("a house I rent out to tenants"), the plan block states it as a fact (plan.rental_owner), so the reply never
  *   treats them as a renter. Only that plan's block changes.
@@ -505,11 +509,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.16.1 — the header version above, as a value. Stamped (with the deployed
+ * v2.16.2 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.16.1';
+export const RESPONSE_GENERATOR_VERSION = 'v2.16.2';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy

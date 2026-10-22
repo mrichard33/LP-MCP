@@ -132,7 +132,7 @@ test('"the rest are already impact" means this is the whole job: the minimum, no
     assert.equal(r.text, J.BELOW_MINIMUM_LINE, inbound);
     assert.equal(r.block, 'below_minimum', inbound);
   }
-  assert.match(J.BELOW_MINIMUM_LINE, /3-opening minimum, any mix of windows and doors, or one sliding glass door/);
+  assert.match(J.BELOW_MINIMUM_LINE, /3-opening minimum, any mix of windows and doors, or any job with a sliding glass door/);
 });
 
 test('"the others are old" is a bigger job: the normal flow, never asked twice', () => {
@@ -381,4 +381,56 @@ test('an owner is never sent to "the owner" (landlord_lead, live chat, after #14
   for (const l of [TENANT_LINE, NON_OWNER_LINE, J.COMMERCIAL_LINE, J.BELOW_MINIMUM_LINE, 'Do you own the home?']) {
     assert.equal(J.enforceJobScope(l, { inbound: landlord }).changed, false, l);
   }
+});
+
+// ── any job with a slider meets the minimum (Mark, 2026-10-22; Chris Kendig, 6tYdVHQPS4BBzsYsB3Yf) ──
+
+const KENDIG_DECLINE_1 = "Appreciate you saying that plainly, Chris. A front door and a slider together come to 2 openings, and we work on a 3-opening minimum, windows and doors in any mix, or one sliding door on its own. That puts this outside what we can take on right now. Which works better?";
+const KENDIG_DECLINE_2 = "Understood, Chris. For just the door and slider we're under our 3-opening minimum, so we're not a fit for this one. We can still send over our free Hurricane Preparedness Guide for later, what's the best email for that?";
+
+test('a front door plus a sliding door, or a slider alone, qualifies', () => {
+  for (const t of ['1 front door, 1 sliding door', 'just a slider', 'a front door and a slider, strictly those']) {
+    const s = J.jobScopeFromThread([], t);
+    assert.equal(s.block, null, t);
+    assert.equal(s.check, false, t);
+    assert.equal(J.threadMeetsMinimum([], t), 'slider', t);
+  }
+});
+
+test('a model-written minimum decline is rewritten when the job has a slider (Kendig)', () => {
+  const t = thread(['o', 'How many windows and doors are you looking to get a quote on?'], ['i', '1 front door, 1 sliding door']);
+  const r1 = J.enforceJobScope(KENDIG_DECLINE_1, { thread: t, inbound: 'Spouse but we are just looking for a simple front door and simple slider.' });
+  assert.equal(r1.text, 'Appreciate you saying that plainly, Chris. A sliding door meets our minimum, so this is a job we do.');
+  assert.match(r1.reason, /false_minimum_decline/);
+  assert.match(r1.reason, /orphan_choice_question/);
+  const r2 = J.enforceJobScope(KENDIG_DECLINE_2, { thread: [], inbound: 'a front door and a slider, strictly those' });
+  assert.doesNotMatch(r2.text, /under our|not a fit/);
+  assert.match(r2.text, /^Understood, Chris\. A sliding door meets our minimum, so this is a job we do\./);
+  // 3+ openings meet it too; a plain mention of the minimum that declines nothing stands.
+  assert.equal(J.enforceJobScope('Since that is under our 3-opening minimum, we can\'t set up a visit.', { inbound: 'I need 4 windows replaced' }).text, 'That meets our minimum, so this is a job we do.');
+  assert.equal(J.enforceJobScope('A slider on its own meets our minimum. What day works best?', { inbound: 'just a slider' }).changed, false);
+});
+
+test('a slider before our ask, or in the reply, is never read as under the minimum', () => {
+  const t = thread(['i', '1 front door, 1 sliding door'], ['o', 'Got it. Is it just the door and slider, or anything else? Our minimum is three openings, is that all?']);
+  assert.equal(J.jobScopeFromThread(t, 'just the door and slider').block, null);
+  assert.equal(J.jobScopeFromThread(thread(['i', 'I need one window'], ['o', J.MINIMUM_CHECK_LINE]), 'just the door and slider, nothing else').block, null);
+  // Our decline is not our ask: "[^?]*" no longer runs across sentences into "Which works better?".
+  assert.equal(J.MINIMUM_ASK_RX.test(KENDIG_DECLINE_1), false);
+});
+
+test('one window with the others impact still declines; two windows still get the check', () => {
+  const t = thread(['i', 'I just need one window replaced'], ['o', J.MINIMUM_CHECK_LINE]);
+  const s = J.jobScopeFromThread(t, 'Yes, the others are already impact');
+  assert.equal(s.block, 'below_minimum');
+  assert.equal(J.enforceJobScope('Sure thing.', { thread: t, inbound: 'Yes, the others are already impact' }).text, J.BELOW_MINIMUM_LINE);
+  assert.equal(J.jobScopeFromThread([], 'I need 2 windows replaced').check, true);
+  assert.equal(J.enforceJobScope('Great, I can help.', { inbound: 'I need 2 windows replaced' }).text, J.MINIMUM_CHECK_LINE);
+});
+
+test('a bare "Which works better?" needs two times beside it', () => {
+  assert.equal(J.enforceJobScope(OFFER, { inbound: 'I need 5 windows' }).changed, false);
+  assert.equal(J.enforceJobScope('I have Tuesday at 10 or 2 PM. Which works better?', { inbound: 'I need 5 windows' }).changed, false);
+  assert.equal(J.enforceJobScope('Happy to help with that. Which works better?', { inbound: 'I need 5 windows' }).text, 'Happy to help with that.');
+  assert.equal(J.enforceJobScope('Which works better, mornings or afternoons?', { inbound: 'I need 5 windows' }).changed, false);
 });
