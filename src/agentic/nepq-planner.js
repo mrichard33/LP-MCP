@@ -41,7 +41,7 @@ import { bestDealHintUsed } from './rehash.js';
 import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint, isRehashReady, rehashReadyLine, betterPriceReason, betterPriceInvite, betterPriceKindFor, hasBetterPrice, isItemizedAsk, REHASH_BETTER_PRICE_RX, isComparisonQuestion } from './rehash-nepq.js';
 import { rehashBookingFix, rehashBetterPrice } from './rehash-flags.js';
 import { readRehashTime, pickRehashTime, rehashTimeSlots, clockLabel, rehashDaySlots, slotDayKeys as rehashSlotDayKeys } from './rehash-time.js';
-import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
+import { homeownerFromThread, ownsRentalFromThread, OWNER_ASK_RX } from './homeowner.js';
 import { jobScopeFromThread, openingsKnown, COUNT_ASK_RX } from './job-scope.js';
 import { decisionMakersFromThread, dmSettled } from './qualifying.js';
 import { extractZip } from './service-area-turn.js';
@@ -2119,6 +2119,12 @@ export function planNepqTurn(args = {}) {
   if (plan && (plan.required_move === 'confirm' || plan.required_move === 'collect') && !plan.side_question) {
     const side = sideQuestionOf(args?.trigger || '');
     if (side) Object.assign(plan, { answer_first: true, side_question: side });
+  }
+  // 2026-10-22 (landlord_lead, live chat): "Hi, I need new windows on a house I rent out to tenants" was answered as a
+  // renter three ways in two days ("primary residences", "have the owner reach out", "you'd need to check with the
+  // owner"). Ownership is read by code; the plan block states it so the model never has to guess.
+  if (plan && !plan.post_demo && !args?.postDemoLead && ownsRentalFromThread(normalizeThread(args.conversation, args.trigger))) {
+    plan.rental_owner = true;
   }
   return args?.directiveNoTimes ? withoutTimeOffer(plan) : plan;
 }

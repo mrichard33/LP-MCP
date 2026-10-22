@@ -48,6 +48,17 @@ export function saysOwner(text) {
 }
 
 /**
+ * Did the lead say they own the home and rent it OUT (a landlord), and do they still read as the owner? Pure.
+ * 2026-10-22 (landlord_lead, live chat): the model read "a house I rent out to tenants" as a renter three days
+ * running; the planner now states it as a fact (renderPlanBlock), so the reading is code's, not the model's.
+ */
+export function ownsRentalFromThread(turns = []) {
+  const list = Array.isArray(turns) ? turns : [];
+  const said = list.some(m => String(m?.direction || '').toLowerCase() !== 'outbound' && RENTAL_OWNER_RX.test(String(m?.text ?? m?.body ?? '')));
+  return said && homeownerFromThread(list) === 'yes';
+}
+
+/**
  * 'yes' | 'no' | 'unknown' from the thread (oldest first, {direction, text}).
  * The newest decisive message wins: a renter who then says "actually my wife
  * and I own it" is an owner. A bare yes/no counts only as the reply to our own

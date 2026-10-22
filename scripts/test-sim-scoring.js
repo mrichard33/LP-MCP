@@ -279,6 +279,9 @@ test('2026-10-20: a landlord or an investor is a lead, never turned away', () =>
   // 2026-10-22.2: the wording the live chat used once .1 was live.
   const chat2 = run7('landlord_lead', [['Hi, I need new windows on a house I rent out to tenants', "Got it. We work with homeowners on their own properties. Since you're renting this out to tenants, you'd need to have the owner reach out to us directly."]]);
   assert.ok(codes7(chat2).includes('owner_declined'));
+  // 2026-10-22.3: the old renter script from kb_embeddings, copied once .2 was live.
+  const chat3 = run7('landlord_lead', [['Hi, I need new windows on a house I rent out to tenants', 'Got it. Our estimates are for homeowners since the work involves permanent improvements to the structure. If you own a home in the future, feel free to reach back out.']]);
+  assert.ok(codes7(chat3).includes('owner_declined'));
 });
 
 test('PR 7: slots_without_qualifying and bridge_repeated count only when the stage drives the bot', () => {
@@ -475,7 +478,7 @@ test('Phase 0: the six scenarios carry the spec\'s expectations; every scenario 
 test('Phase 0: the scorecard reports a pass rate per family, and a family that falls is worse', () => {
   const fam = (scenario, family, ok) => ({ ...result(scenario, [turn(1, 'hi', ok ? 'What got you looking?' : null)]), family });
   const card = scoreRun([fam('fam_a', 'new_lead', true), fam('fam_b', 'rehash', false), fam('fam_c', 'booking', true)]);
-  assert.equal(SCORING_VERSION, '2026-10-22.2');
+  assert.equal(SCORING_VERSION, '2026-10-22.3');
   assert.deepEqual(card.pass_rate_by_family.rehash, { conversations: 1, passed: 0, pass_rate: 0 });
   assert.equal(card.pass_rate_by_family.new_lead.pass_rate, 1);
   const text = formatScorecard(card);

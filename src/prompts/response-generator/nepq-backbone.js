@@ -100,6 +100,8 @@ export function renderPlanBlock(plan) {
   if (plan.qualify_item) {
     lines.push(`Before any visit time: ${plan.qualify_item === 'homeowner' ? 'ask whether they own the home (allowed on this turn; it overrides the rule about not probing for disqualifiers)' : plan.qualify_item === 'zip' ? 'ask for the zip code at the home' : plan.qualify_item === 'openings' ? 'ask how many windows and doors they want quoted' : 'ask about the other decision maker as planned'}. Offer no times, no visit and no booking in this reply.${plan.reask_line ? ` End with: "${plan.reask_line}"` : ''}`);
   }
+  // 2026-10-22 (landlord_lead): the lead owns the home and rents it out; code read it from their words.
+  if (plan.rental_owner) lines.push("Fact from the lead's own words: they OWN this home and rent it out to tenants. They are the owner and a normal lead (we work with owners, including owners of rentals). Never treat them as a renter, never send them to \"the owner\", never turn them away.");
   // 2026-10-19 (Mark, ruling 4; REHASH_DEAL_HINT_MODE=every): one hint that
   // we may be able to make it work better, never named.
   if (plan.hint_line) lines.push(`Also say, in your own words, ONE short line hinting that we may be able to make this work better for them (never an amount, a percent, a discount, a promotion, financing or a deadline), e.g. "${plan.hint_line}"`);

@@ -194,6 +194,12 @@ export const CASES = [
     mustPass: () => enforceJobScope("You'd need to have the owner reach out to us directly.", {}).changed === false,
   },
   {
+    guard: 'enforceJobScope',
+    // 2026-10-22: the old renter script ("if you own a home in the future") aimed at an owner; a tenant keeps it.
+    mustChange: () => enforceJobScope('If you own a home in the future, feel free to reach back out.', { inbound: 'a house I rent out to tenants' }).changed === true,
+    mustPass: () => enforceJobScope('If you own a home in the future, feel free to reach back out.', { inbound: 'I rent this place from my landlord' }).changed === false,
+  },
+  {
     guard: 'enforceNonOwner',
     mustChange: () => enforceNonOwner(OFFER, { thread: [], inbound: "I'm renting, my landlord would have to okay it" }).changed === true,
     mustPass: () => enforceNonOwner(OFFER, { thread: [], inbound: 'hi' }).changed === false,
