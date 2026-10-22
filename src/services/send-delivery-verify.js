@@ -39,6 +39,35 @@ import { emitEvent as emitEventDefault } from '../event-emitter.js';
 import { attemptCarrierResend as attemptCarrierResendDefault } from './carrier-resend-runner.js';
 import { senderReadBack } from '../agentic/ai-sender.js';
 
+// 2026-10-21 (Jim Anderson, 5Cp5CiWtQ2zSRlxb2XPL): every bot text that day was
+// recorded by GHL as John Manieri's, and the 18 agentic.ai_sender_ignored
+// events of the 14 days before reached no one. One #ops-alerts line per contact
+// per Eastern day (audit_posted_items), so the fix in GHL can be found from data.
+export const AI_SENDER_IGNORED_AUDIT = 'ai_sender_ignored';
+
+const etDay = (nowMs) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(nowMs));
+
+/** The alert line. Pure. */
+export function formatSenderIgnoredAlert({ contactId, sentAs, ghlUserId, fromNumber = null }) {
+  return [
+    '🪪 Bot text shown as a person in GHL',
+    `Contact ID: ${contactId}`,
+    `We sent as the AI user ${sentAs}; GHL recorded user ${ghlUserId || 'unknown'}${fromNumber ? ` (from ${String(fromNumber).replace(/\D/g, '').slice(-10)})` : ''}.`,
+    'The customer sees this text as that person\'s. Check which user owns the sending number in GHL.',
+  ].join('\n');
+}
+
+async function defaultAlertSenderIgnored({ contactId, sentAs, ghlUserId, fromNumber, nowMs = Date.now() }, { supabase } = {}) {
+  const { filterNew, recordPosted } = await import('../alert-posted.js');
+  const { sendAlertMessage } = await import('../alert-state.js');
+  const item = { key: String(contactId), reason: `day:${etDay(nowMs)}` };
+  const { fresh } = await filterNew({ audit: AI_SENDER_IGNORED_AUDIT, items: [item], ttlDays: 3, nowMs, deps: supabase ? { supabase } : {} });
+  if (!fresh.length) return { sent: false, reason: 'already_posted_today' };
+  const res = await sendAlertMessage(formatSenderIgnoredAlert({ contactId, sentAs, ghlUserId, fromNumber }), { channel: 'ops' });
+  if (res?.sent) await recordPosted({ audit: AI_SENDER_IGNORED_AUDIT, items: [item], nowMs, deps: supabase ? { supabase } : {} });
+  return res;
+}
+
 const MIN_AGE_SEC = Math.max(60, parseInt(process.env.SEND_VERIFY_MIN_AGE_SEC || '120', 10));
 const MAX_AGE_MIN = Math.max(5, parseInt(process.env.SEND_VERIFY_MAX_AGE_MIN || '60', 10));
 const BATCH = Math.max(1, parseInt(process.env.SEND_VERIFY_BATCH || '25', 10));
@@ -53,6 +82,7 @@ export async function verifyRecentSends(deps = {}) {
   const ghlFetch = deps.ghlFetch || ghlFetchDefault;
   const emitEvent = deps.emitEvent || emitEventDefault;
   const attemptCarrierResend = deps.attemptCarrierResend || attemptCarrierResendDefault;
+  const alertSenderIgnored = deps.alertSenderIgnored || ((a) => defaultAlertSenderIgnored(a, { supabase }));
 
   if (process.env.SEND_VERIFY_ENABLED === 'false') {
     return { skipped: true, reason: 'disabled' };
@@ -109,6 +139,12 @@ export async function verifyRecentSends(deps = {}) {
           payload: { action_id: row.id, message_id: messageId, sent_as_user_id: sentAs, ghl_user_id: msg?.message?.userId || msg?.userId || null },
           idempotency_key: `ai_sender_ignored_${row.id}`,
         }).catch(() => {});
+        if (row.target_id) {
+          await Promise.resolve(alertSenderIgnored({
+            contactId: row.target_id, sentAs, ghlUserId: msg?.message?.userId || msg?.userId || null,
+            fromNumber: msg?.message?.from || msg?.from || null,
+          })).catch((err) => console.warn(`[SendVerify] ai_sender_ignored alert failed for ${row.target_id}: ${err.message}`));
+        }
       }
     } catch (err) {
       // Fail-open: a lookup error is not evidence of a failed send.

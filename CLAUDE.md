@@ -962,6 +962,54 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   Nothing is ever written to, sent to, tagged on or carded for the linked lead. Never hand-make a `siro_recordings` or
   `rehash_stage` row for a test again. Tests: `scripts/test-f0-positions.js`, `scripts/test-f0-test-link.js`.
 
+## Rehash pause + ownership (2026-10-21)
+
+Jim Anderson (5Cp5CiWtQ2zSRlxb2XPL, LP prospect 464257): John Manieri texted him by hand from 8:40 ET while the bot
+booked a Rehash Call for the wrong day (8:49), answered John's texts (8:53), asked "How do they stack up?" (8:55) and
+queued a send after John set DND; every bot text was credited in GHL to John. Mark's rulings (with John and Brandon):
+- **John owns the lead once a call or a visit is set (`REHASH_OWNED_MODE` off|shadow|live, default shadow).**
+  `rehashOwned` (`src/agentic/rehash-owned.js`, pure): a) the `rehash-owned` tag (GHL U.RCB adds it on a Rehash Call
+  booking and John adds it as his stop button; code never removes it), b) an upcoming, not-cancelled appointment on
+  `REHASH_CALENDAR_ID`, c) the NEWEST lead (`fetchCurrentLead`, not `context.lp`) Cnf / Issue / Reset dated today or
+  later ET. Unknown is never owned. Live: the send handler skips `rehash_owned` right after the turn claim (before any
+  model call), the live chat's `deliver` too, F.0 v2's `postDemoInterrupt` ends `rehash_owned` (terminal),
+  `routeRehashReply` posts no card, and the promised-callback sweep closes the bot's promise. `rehash_owned` is in
+  `ANSWERED_OUTCOMES` and the SLA watchdog's held reasons. Events `rehash.owned_skip` / `rehash.owned_would_skip`.
+- **A rehash-team manual text or email pauses the bot 15 minutes (`REHASH_PAUSE_MODE` off|shadow|live, default
+  shadow).** `pauseDecision` (`src/agentic/rehash-pause.js`, pure) over `manualOutbounds` (`human-takeover-io.js`, every
+  manual message with its user, since min(our last send, now − 15 min)), only `REHASH_TEAM_USER_IDS`: the reply is
+  DEFERRED (`rehash_paused`, `retry_at` = max(last team message, inbound) + `REHASH_PAUSE_MINUTES`; the pause rides on
+  `action_payload.rehash_pause`); a newer team message re-holds (`REHASH_PAUSE_MAX_RESTARTS` 12, then
+  `rehash_handed_off`, silent); ownership wins on every pass; when it fires, `conversationComplete`
+  (`src/agentic/conversation-complete.js`: deterministic first, one `conversation_complete` model call only when the
+  words decide nothing, low confidence → OPEN, flag `completion_ambiguous`) → `conversation_complete` (no send) or the
+  normal reply. A proactive send while paused is dropped. The watchdog treats `deferred: rehash_paused` as in flight
+  until its retry. Once the pause is live it replaces `HUMAN_TAKEOVER_MODE` on a rehash contact (in its shadow day that contact keeps option B); every pre-demo contact keeps option B.
+  Events `rehash.pause_started` / `_restarted` / `_fired` / `_would_hold`. The reads and the verdict are ONE function,
+  `runRehashGate` (`src/services/rehash-gate-io.js`).
+- **Scope:** the reply writer's rehash test OR any contact tagged past its demo (`isPostDemoLead` tags), never a sold
+  lead. Jim had no `rehash` tag and his newest lead was already Issue / Cnf, so "OPPFDN in the window" read false.
+- **Bot messages show as the bot.** `REHASH_VOICE_MODE` rep (default, the 2026-10-01 voice) | team: the reply writer
+  keeps the rep as `callRepName` (third person, "John will call you"), signs "— Reece Team" and `enforceTeamVoice({
+  forbidNames })` rewrites "I'm John" / "— John". GHL's attribution is still open: on 2026-10-21 GHL kept the AI
+  user on 97 rehash sends and credited 18 to a person, always the same person per contact (Jim → his follower John,
+  Eulalio → the "Assigned To (User ID)" field), never the assigned user; a controlled send (`userId` set, from each
+  number) needs a tool that sets both and is the next step. Each `agentic.ai_sender_ignored` now posts one #ops-alerts
+  line per contact per Eastern day (`send-delivery-verify.js`, audit `ai_sender_ignored`).
+- **No comparison question on the rehash track** (ruling 4). With `REHASH_BETTER_PRICE_FRAMING_ENABLED` on the ladder
+  already gives the better-price invite; `enforceNepqPlan` now drops any comparison question (`isComparisonQuestion`,
+  `REHASH_COMPARISON_RX` in `rehash-nepq.js`) and puts `betterPriceInvite('compare')` in its place; checkReply
+  `rehash_comparison_question`. Jim's 8:49 and 8:55 replies came from a build without 69f926c / 1434733 (they reached
+  main at 15:53Z); `scripts/test-rehash-booking-fix.js` holds his "10am tomorrow" → tomorrow 10:00. checkReply now reads
+  "I'll call you at <time>" as a claim on the rehash line (`rehash: ctx.rehash`).
+- **Rules:** the 13 post-demo objection rules are split: `<KEY>` keeps tags + notification, `<KEY>_ROUTE` carries the
+  workflow moves (plus F.0 v2's removal) with `not_has_any_tag ["rehash","active-f.0","rehash-owned"]`
+  (`sql/seeds/2026-10-21_rehash_no_o0_routing.sql`). LOOP_ESCALATION_UNCLEAR enrolls in nothing, so it is unchanged.
+- Gate: `simulate_bot_conversation` / `run_bot_eval` take `rehash_owned_mode`, `rehash_pause_mode`, `rehash_voice_mode`;
+  scenarios `rehash_paused_after_manual`, `rehash_pause_open_question`, `rehash_owned_after_booking` (a `{ manual, team }`
+  turn), `rehash_price_compare_any_attempt`. Rollback, one variable each: `REHASH_PAUSE_MODE=off`, `REHASH_OWNED_MODE=off`,
+  `REHASH_VOICE_MODE=rep`.
+
 ## Revin: every text it sends or receives, one thread per contact (2026-10-19)
 
 Until now all we kept of Revin AI's texting was its ~160-character LP summary note (`note_origin = 'lp_revin'`, still

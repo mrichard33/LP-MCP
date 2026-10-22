@@ -32,6 +32,8 @@ import { rehashTeamUserIds } from '../agentic/rehash-state.js';
 import { rehashRepFirstName, ghlUserFirstName } from '../agentic/rehash-slots.js';
 import { isF0EmailRequest, emailHoldWindow } from './f0-email.js';
 import { testLinkFor } from './f0-test-link.js';
+import { rehashOwned as readRehashOwned, rehashOwnedMode } from '../agentic/rehash-owned.js';
+import { rehashCalendarId } from '../knowledge/booking-calendar-router.js';
 
 const HOUR_MS = 3_600_000;
 const SENT_STATUSES = ['ghl_sent_confirmed', 'generated_ready'];
@@ -163,6 +165,25 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   const newerLead = !!(newest && demoLeadId && String(newest.lp_lead_id) !== demoLeadId
     && Number(newest.lp_lead_id) > Number(demoLeadId));
 
+  // 2026-10-21 (Mark, rehash ownership): John owns the lead once a Rehash Call
+  // is booked, LP has the visit set, or he tagged the contact rehash-owned.
+  // Live stops the touch (`rehash_owned`); shadow only logs it.
+  let ownedLive = false;
+  const ownedMode = rehashOwnedMode(env);
+  if (!testLink && ownedMode !== 'off') {
+    const calId = rehashCalendarId(env);
+    const appointments = calId ? await safe('appointments', async () => {
+      const fetchAppts = deps.fetchRecentAndUpcomingAppointments
+        || (await import('../knowledge/contact-appointments.js')).fetchRecentAndUpcomingAppointments;
+      return fetchAppts(request.contact_id, { pastHours: 0 });
+    }, null) : [];
+    const owned = readRehashOwned({ tags, appointments, currentLead, rehashCalendarId: calId, nowMs });
+    if (owned.owned === true) {
+      if (ownedMode === 'live') ownedLive = true;
+      else console.log(`[F0] shadow: ${request.contact_id} rehash-owned (${owned.reason}); live would stop this touch`);
+    }
+  }
+
   // The last F.0 touch that went out (or was ready to), for "replied since".
   const lastTouch = await safe('agentic_messages', async () => {
     const { data, error } = await supabase.from('agentic_messages').select('generated_at')
@@ -237,6 +258,7 @@ export async function loadF0Context(context, request, { env = process.env, deps 
       noteDq: testLink ? false : !!context?.lead_facts?.note_dq,
       postDemoStop: postDemoStopFrom({ conversation: context?.conversation_recent || [], tags }),
       repliedSinceLastTouch: repliedSince({ conversation: context?.conversation_recent || [], lastTouchAt: lastTouch }),
+      rehashOwned: ownedLive,
       tags,
       siroFacts: facts,
       demoAgeH: age,

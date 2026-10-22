@@ -32,6 +32,11 @@ export const SIM_MODE_OVERRIDES = Object.freeze({
   // switches (src/agentic/rehash-flags.js), so the gate can compare on and off.
   rehashBookingFix: ['on', 'off'],
   rehashBetterPrice: ['on', 'off'],
+  // 2026-10-21 (rehash pause + ownership): John owns a booked lead, a rehash
+  // rep's manual message pauses the bot 15 minutes, and the rehash reply's voice.
+  rehashOwnedMode: ['off', 'shadow', 'live'],
+  rehashPauseMode: ['off', 'shadow', 'live'],
+  rehashVoiceMode: ['rep', 'team'],
 });
 
 /** Run fn with these overrides in force. Unknown or empty values are ignored. */

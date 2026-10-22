@@ -335,6 +335,8 @@ import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-
 import { findNewerInbound, findAnsweredDuplicateInbound } from './agentic/burst-yield.js';
 import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from './agentic/human-takeover.js';
 import { newestManualOutbound, lastInboundAt } from './services/human-takeover-io.js';
+import { runRehashGate } from './services/rehash-gate-io.js';
+import { rehashPauseMode } from './agentic/rehash-pause.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
 import { fileBotCallback, callbackDecision, schedulingCallbackDecision, isPostDemoForCallback, CALLBACK_MARKER_TAG } from './agentic/bot-callback.js';
@@ -591,6 +593,23 @@ export function emailDelayAnchorIso(sourceEventMeta, newestInboundAt = null) {
     if (v && Number.isFinite(Date.parse(v))) return v;
   }
   return sourceEventMeta?.created_at || newestInboundAt || null;
+}
+
+/** Merge `patch` into this row's action_payload (a held send re-runs with it). */
+async function stampActionPayload(actionId, patch) {
+  if (!actionId || !patch) return false;
+  try {
+    const { data: row } = await supabase.from('agent_actions').select('action_payload').eq('id', actionId).maybeSingle();
+    if (!row) return false;
+    const { error } = await supabase.from('agent_actions')
+      .update({ action_payload: { ...(row.action_payload || {}), ...patch }, updated_at: new Date().toISOString() })
+      .eq('id', actionId);
+    if (error) { console.warn(`[SendMessage] payload stamp failed for action ${actionId}: ${error.message}`); return false; }
+    return true;
+  } catch (err) {
+    console.warn(`[SendMessage] payload stamp threw for action ${actionId}: ${err.message}`);
+    return false;
+  }
 }
 
 /**
@@ -2411,6 +2430,42 @@ const turnLockShadowSkips = new Map();
 // HUMAN_TAKEOVER_MODE=shadow; the reply row says so for the 48-hour check.
 const humanTakeoverShadowSkips = new Map();
 
+// 2026-10-21 (rehash pause + ownership): the rehash gate's shadow marks
+// (rehash_owned_would_skip / rehash_pause_would_hold), merged onto the reply
+// row like the takeover's, for the 24-hour read before live.
+const rehashGateShadowMarks = new Map();
+
+/**
+ * The rehash gate for one send (src/services/rehash-gate-io.js). Returns
+ * { result } to return as-is (a skip, or a 15-minute hold that re-runs this
+ * same row), and `rehash` (true when the contact is in rehash: the pause then
+ * replaces the human-takeover check). Never throws: a gate that fails sends.
+ */
+async function checkRehashGate({ action, payload, contactId, channel, sourceEventMeta, replyContext, proactive }, deps = {}) {
+  try {
+    const tags = await (deps.fetchContactTags || fetchContactTags)(contactId);
+    const p = sourceEventMeta?.payload || {};
+    const inboundAt = proactive ? null
+      : (p.last_inbound_event_created_at || p.inbound_event_created_at || sourceEventMeta?.created_at || replyContext?.newestInboundAt || null);
+    const gate = await (deps.runRehashGate || runRehashGate)({
+      contactId, actionId: action?.id ?? null, channel, tags, fromNumber: replyContext?.fromNumber || null,
+      inboundAt, proactive, priorPause: payload?.rehash_pause || null, messageId: p.message_id || null,
+    });
+    if (gate?.shadow && action?.id != null) rehashGateShadowMarks.set(String(action.id), gate.shadow);
+    if (gate?.verdict === 'skip') {
+      return { rehash: true, result: { skipped: true, reason: gate.reason, contact_id: contactId, channel, rehash_gate: { owned: gate.owned || null, pause: gate.pause || null, completion: gate.completion || null } } };
+    }
+    if (gate?.verdict === 'hold') {
+      await stampActionPayload(action?.id, { rehash_pause: gate.pause });
+      return { rehash: true, result: { deferred: true, reason: gate.reason, retry_at: gate.retryAt, contact_id: contactId, channel, rehash_pause: gate.pause } };
+    }
+    return { rehash: gate?.rehash === true, firedPause: gate?.firedPause || null };
+  } catch (err) {
+    console.warn(`[RehashGate] ${contactId} gate threw (sending): ${String(err?.message || err).slice(0, 160)}`);
+    return { rehash: false };
+  }
+}
+
 /**
  * The human-takeover check for one SMS/email send (human-takeover.js). Returns
  * { skip } to drop the reply in live mode, null otherwise. A read that fails
@@ -2452,7 +2507,10 @@ function fingerprintReply({ action, contactId, message, channel, triggerMessage,
   const takeoverShadow = humanTakeoverShadowSkips.get(String(action.id)) || null;
   if (takeoverShadow) humanTakeoverShadowSkips.delete(String(action.id));
   const baseSnapshot = bot?.input_snapshot || ruleFields?.input_snapshot || null;
-  const snapshot = takeoverShadow ? { ...(baseSnapshot || {}), human_takeover_shadow_would_skip: true, human_takeover: takeoverShadow } : baseSnapshot;
+  const rehashMarks = rehashGateShadowMarks.get(String(action.id)) || null;
+  if (rehashMarks) rehashGateShadowMarks.delete(String(action.id));
+  let snapshot = takeoverShadow ? { ...(baseSnapshot || {}), human_takeover_shadow_would_skip: true, human_takeover: takeoverShadow } : baseSnapshot;
+  if (rehashMarks) snapshot = { ...(snapshot || {}), ...rehashMarks };
   recordMessageContextDetached({
     // 2026-10-18 (Phase 1 item 4): every reply row names its plan step, for the
     // next turn's planner. A rule's own fixed text ran on no plan.
@@ -3112,6 +3170,12 @@ export async function executeSendMessage(action, context) {
     humanTakeoverShadowSkips.delete(String(action.id));
     if (result && typeof result === 'object') result = { ...result, human_takeover_shadow_would_skip: true, human_takeover: takeoverShadow };
   }
+  // 2026-10-21: the rehash gate's shadow marks on a send that ended without a reply.
+  const rehashMarks = action?.id != null ? rehashGateShadowMarks.get(String(action.id)) : null;
+  if (rehashMarks) {
+    rehashGateShadowMarks.delete(String(action.id));
+    if (result && typeof result === 'object') result = { ...result, ...rehashMarks };
+  }
   return result;
 }
 
@@ -3571,6 +3635,16 @@ async function executeSendMessageInner(action, context, turnState = { held: null
   // in shadow it is recorded and the send goes on as before.
   const turnSkip = await claimReplyTurn({ action, context, payload, contactId, channel, sourceEventMeta, turnState });
   if (turnSkip) return turnSkip;
+
+  // ── Rehash: John owns the lead; a rehash rep's message pauses the bot (Mark, 2026-10-21) ──
+  // After the turn claim and before any model call. A rehash lead with a Rehash
+  // Call booked, an LP Cnf / Issue / Reset visit or the rehash-owned tag gets no
+  // bot message (REHASH_OWNED_MODE). A manual text or email from the rehash
+  // team holds this reply 15 minutes, then the thread decides (REHASH_PAUSE_MODE).
+  // Both default to shadow: the reply goes and the row says what live would do.
+  const proactiveSend = !turnClaimScope({ ruleApplied: action.rule_applied || 'manual', sourceEventType: sourceEventMeta?.event_type || null, triggerId: payload.trigger_id || null }).claims;
+  const rehashGate = await checkRehashGate({ action, payload, contactId, channel, sourceEventMeta, replyContext, proactive: proactiveSend });
+  if (rehashGate.result) return rehashGate.result;
 
   // Livechat replies are generated with SMS constraints (short,
   // conversational, one question) — the widget is a chat surface.
@@ -4331,7 +4405,11 @@ async function executeSendMessageInner(action, context, turnState = { held: null
   // send: after the lead's last inbound), this reply is dropped. The lead's
   // next message is a new turn and is answered normally. No tag, no stop-bot.
   // HUMAN_TAKEOVER_MODE shadow (default) sends and marks the reply row.
-  const takeover = await checkHumanTakeover({ action, contactId, channel, sourceEventMeta });
+  // On a rehash contact the 15-minute pause (above) replaces this check once
+  // REHASH_PAUSE_MODE is live (Mark, 2026-10-21); in its shadow day the
+  // contact keeps option B, like every pre-demo contact always does.
+  const takeover = rehashGate.rehash && rehashPauseMode() === 'live' ? null
+    : await checkHumanTakeover({ action, contactId, channel, sourceEventMeta });
   if (takeover?.skip) return takeover.skip;
 
   // ── Book BEFORE we promise (2026-08-13) ────────────────────────

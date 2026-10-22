@@ -20,6 +20,7 @@
 
 import { formatRehashCallCard, rehashCallIdempotencyKey, rehashSlackChannel, ghlContactUrl, formatRehashQuoteCard, formatRehashConcernCard, rehashReplyIdempotencyKey } from '../agentic/rehash.js';
 import { classifyRehashReply, rehashIntentRoutingEnabled } from '../agentic/rehash-intent.js';
+import { rehashOwnedMode } from '../agentic/rehash-owned.js';
 
 async function defaultDeps() {
   const [{ postToSlack }, { emitEvent }, { sendAlertMessage }, supabaseMod, { GHL_LOCATION_ID }] = await Promise.all([
@@ -194,6 +195,16 @@ export async function routeRehashReply({ contactId, text = '', lastOutbound = nu
     return { rehash_card: 'call_request', intent, reason: r.reason };
   };
   try {
+    // 2026-10-21 (Mark): John owns the lead (a Rehash Call booked, LP's visit
+    // set, or the rehash-owned tag): he is already on it, so no card.
+    if (rehashOwnedMode(env) === 'live') {
+      const readOwned = deps?.readOwned || (async (id) => (await import('../services/rehash-gate-io.js')).readRehashOwnership(id));
+      const owned = await readOwned(contactId).catch(() => null);
+      if (owned?.owned === true) {
+        console.log(`[RehashCall] ${contactId}: rehash-owned (${owned.reason}) — no card`);
+        return { rehash_card: 'none', intent: null, reason: 'rehash_owned' };
+      }
+    }
     // The rollback: every rehash requeue posts the call card, as before 2026-10-14.
     if (!rehashIntentRoutingEnabled(env)) return await callCard(null);
     const said = String(text || '').trim();

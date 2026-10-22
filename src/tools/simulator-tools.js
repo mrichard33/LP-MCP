@@ -76,7 +76,8 @@ export const simulatorDeps = {
 /** Validate and normalise a run request. Pure; throws a readable error. */
 export function parseSimRequest({ scenario = null, messages_json = null, channel = 'both', nepq_mode = 'live', persona_json = null, title = null, contact_id = null, lead_stage_mode = null, kb_exemplar_mode = null, include_revin_thread = null, runs = null, turn_lock_mode = null,
   siro_context_mode = null, siro_followup_text_mode = null, rehash_deal_hint_mode = null, human_takeover_mode = null,
-  rehash_booking_fix = null, rehash_better_price = null } = {}) {
+  rehash_booking_fix = null, rehash_better_price = null,
+  rehash_owned_mode = null, rehash_pause_mode = null, rehash_voice_mode = null } = {}) {
   let turns = null;
   if (messages_json) {
     try { turns = JSON.parse(messages_json); } catch { throw new Error('messages_json must be a JSON array of strings'); }
@@ -115,6 +116,10 @@ export function parseSimRequest({ scenario = null, messages_json = null, channel
     // 2026-10-21: REHASH_BOOKING_FIX_ENABLED / REHASH_BETTER_PRICE_FRAMING_ENABLED for this run (on | off).
     ['rehash_booking_fix', 'rehashBookingFix', rehash_booking_fix],
     ['rehash_better_price', 'rehashBetterPrice', rehash_better_price],
+    // 2026-10-21: REHASH_OWNED_MODE / REHASH_PAUSE_MODE / REHASH_VOICE_MODE for this run.
+    ['rehash_owned_mode', 'rehashOwnedMode', rehash_owned_mode],
+    ['rehash_pause_mode', 'rehashPauseMode', rehash_pause_mode],
+    ['rehash_voice_mode', 'rehashVoiceMode', rehash_voice_mode],
   ]) {
     if (value == null || value === '') continue;
     if (!SIM_MODE_OVERRIDES[key].includes(value)) throw new Error(`${arg} must be ${SIM_MODE_OVERRIDES[key].join(', ')}`);
@@ -157,6 +162,9 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       rehash_deal_hint_mode: z.string().optional().describe('once or every (default: Railway\'s REHASH_DEAL_HINT_MODE). every hints at a better deal on each eligible rehash reply.'),
       rehash_booking_fix: z.string().optional().describe('on or off (default: Railway\'s REHASH_BOOKING_FIX_ENABLED, unset = on). The rehash call-booking fix: named times, stable offers, no question after a booking.'),
       rehash_better_price: z.string().optional().describe('on or off (default: Railway\'s REHASH_BETTER_PRICE_FRAMING_ENABLED, unset = on). Every rehash call invite gives the better-price reason.'),
+      rehash_owned_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s REHASH_OWNED_MODE). A rehash lead with a Rehash Call or LP Cnf/Issue/Reset visit, or the rehash-owned tag, gets no bot message.'),
+      rehash_pause_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s REHASH_PAUSE_MODE). A rehash rep\'s manual text or email pauses the bot 15 minutes.'),
+      rehash_voice_mode: z.string().optional().describe('rep or team (default: Railway\'s REHASH_VOICE_MODE). team: rehash replies sign Reece Team and name the rep in third person.'),
       human_takeover_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s HUMAN_TAKEOVER_MODE). live skips a reply once a person has texted the lead.'),
       wait_seconds: z.number().optional().describe('Wait up to this many seconds (max 100) for the result before returning.'),
     },
@@ -188,11 +196,14 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       rehash_deal_hint_mode: z.string().optional().describe('once or every (default: Railway\'s REHASH_DEAL_HINT_MODE). every hints at a better deal on each eligible rehash reply.'),
       rehash_booking_fix: z.string().optional().describe('on or off (default: Railway\'s REHASH_BOOKING_FIX_ENABLED, unset = on). The rehash call-booking fix: named times, stable offers, no question after a booking.'),
       rehash_better_price: z.string().optional().describe('on or off (default: Railway\'s REHASH_BETTER_PRICE_FRAMING_ENABLED, unset = on). Every rehash call invite gives the better-price reason.'),
+      rehash_owned_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s REHASH_OWNED_MODE). A rehash lead with a Rehash Call or LP Cnf/Issue/Reset visit, or the rehash-owned tag, gets no bot message.'),
+      rehash_pause_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s REHASH_PAUSE_MODE). A rehash rep\'s manual text or email pauses the bot 15 minutes.'),
+      rehash_voice_mode: z.string().optional().describe('rep or team (default: Railway\'s REHASH_VOICE_MODE). team: rehash replies sign Reece Team and name the rep in third person.'),
       human_takeover_mode: z.string().optional().describe('off, shadow or live (default: Railway\'s HUMAN_TAKEOVER_MODE). live skips a reply once a person has texted the lead.'),
     },
-    async ({ nepq_mode = 'live', lead_stage_mode = null, kb_exemplar_mode = null, include_revin_thread = null, runs = 2, turn_lock_mode = null, siro_context_mode = null, siro_followup_text_mode = null, rehash_deal_hint_mode = null, human_takeover_mode = null, rehash_booking_fix = null, rehash_better_price = null } = {}) => {
+    async ({ nepq_mode = 'live', lead_stage_mode = null, kb_exemplar_mode = null, include_revin_thread = null, runs = 2, turn_lock_mode = null, siro_context_mode = null, siro_followup_text_mode = null, rehash_deal_hint_mode = null, human_takeover_mode = null, rehash_booking_fix = null, rehash_better_price = null, rehash_owned_mode = null, rehash_pause_mode = null, rehash_voice_mode = null } = {}) => {
       let req;
-      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode, lead_stage_mode, kb_exemplar_mode, include_revin_thread, runs, turn_lock_mode, siro_context_mode, siro_followup_text_mode, rehash_deal_hint_mode, human_takeover_mode, rehash_booking_fix, rehash_better_price }); } catch (err) { return text({ error: err.message }); }
+      try { req = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode, lead_stage_mode, kb_exemplar_mode, include_revin_thread, runs, turn_lock_mode, siro_context_mode, siro_followup_text_mode, rehash_deal_hint_mode, human_takeover_mode, rehash_booking_fix, rehash_better_price, rehash_owned_mode, rehash_pause_mode, rehash_voice_mode }); } catch (err) { return text({ error: err.message }); }
       const job = startSimulationJob({ ...req, gate: true }, deps);
       return text({ job_id: job.id, status: 'running', next: 'call get_bot_simulation with this job_id (wait_seconds up to 100, repeat until done); the scorecard is at the top' });
     },
@@ -239,7 +250,7 @@ export function registerSimulatorRoutes(app, deps = simulatorDeps) {
     if (!process.env.ADMIN_API_TOKEN) return res.status(503).json({ error: 'ADMIN_API_TOKEN is not set; the bot gate is closed' });
     if (!authed(req, res)) return;
     let parsed;
-    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live', lead_stage_mode: req.body?.lead_stage_mode || null, kb_exemplar_mode: req.body?.kb_exemplar_mode || null, include_revin_thread: req.body?.include_revin_thread ?? null, runs: req.body?.runs ?? 2, turn_lock_mode: req.body?.turn_lock_mode || null, siro_context_mode: req.body?.siro_context_mode || null, siro_followup_text_mode: req.body?.siro_followup_text_mode || null, rehash_deal_hint_mode: req.body?.rehash_deal_hint_mode || null, human_takeover_mode: req.body?.human_takeover_mode || null, rehash_booking_fix: req.body?.rehash_booking_fix || null, rehash_better_price: req.body?.rehash_better_price || null }); }
+    try { parsed = parseSimRequest({ scenario: 'all', channel: 'both', nepq_mode: req.body?.nepq_mode || 'live', lead_stage_mode: req.body?.lead_stage_mode || null, kb_exemplar_mode: req.body?.kb_exemplar_mode || null, include_revin_thread: req.body?.include_revin_thread ?? null, runs: req.body?.runs ?? 2, turn_lock_mode: req.body?.turn_lock_mode || null, siro_context_mode: req.body?.siro_context_mode || null, siro_followup_text_mode: req.body?.siro_followup_text_mode || null, rehash_deal_hint_mode: req.body?.rehash_deal_hint_mode || null, human_takeover_mode: req.body?.human_takeover_mode || null, rehash_booking_fix: req.body?.rehash_booking_fix || null, rehash_better_price: req.body?.rehash_better_price || null, rehash_owned_mode: req.body?.rehash_owned_mode || null, rehash_pause_mode: req.body?.rehash_pause_mode || null, rehash_voice_mode: req.body?.rehash_voice_mode || null }); }
     catch (err) { return res.status(400).json({ error: err.message }); }
     const job = startSimulationJob({ ...parsed, gate: true }, deps);
     return res.status(202).json({ job_id: job.id, status_url: `/admin/bot-simulate/${job.id}` });

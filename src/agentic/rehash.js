@@ -25,6 +25,8 @@
  *   any call at all — the opposite of the job.
  */
 
+import { simModeOverrides } from '../simulator/sim-overrides.js';
+
 export const F0_ACTIVE_TAG = 'active-f.0';
 export const REHASH_NUMBER_DEFAULT = '7278004578';
 export const REHASH_REP_CUSTOM_VALUE = 'rehash_rep_name';
@@ -35,6 +37,17 @@ const last10 = (raw) => {
   const d = String(raw ?? '').replace(/\D/g, '');
   return d.length >= 10 ? d.slice(-10) : null;
 };
+
+// 2026-10-21 (the user, after Jim Anderson's thread): "Bot messages must show
+// as the bot, never as John." rep = the 2026-10-01 voice (written as the rehash
+// rep, signed with their first name); team = signed "— Reece Team", the rep
+// named in the third person ("John can give you a quick call"). Default rep
+// until the gate has run with team.
+export const REHASH_VOICE_MODES = Object.freeze(['rep', 'team']);
+export function rehashVoiceMode(env = process.env) {
+  const v = String(simModeOverrides().rehashVoiceMode ?? env?.REHASH_VOICE_MODE ?? '').trim().toLowerCase();
+  return REHASH_VOICE_MODES.includes(v) ? v : 'rep';
+}
 
 export function rehashNumber(env = process.env) {
   return last10(env.AGENTIC_SMS_NUMBER_REHASH || REHASH_NUMBER_DEFAULT);

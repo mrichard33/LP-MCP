@@ -457,7 +457,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 // Every prompt string this file assembles. Copy only — no logic, no env reads.
 // See src/prompts/response-generator/index.js.
 import * as P from './prompts/response-generator/index.js';
-import { isRehashContact, normalizeRehashCall, stripOfferTalk, bestDealHintUsed, REHASH_NUMBER_DEFAULT, REHASH_REP_CUSTOM_VALUE } from './agentic/rehash.js';
+import { isRehashContact, normalizeRehashCall, stripOfferTalk, bestDealHintUsed, REHASH_NUMBER_DEFAULT, REHASH_REP_CUSTOM_VALUE, rehashVoiceMode } from './agentic/rehash.js';
 import { rehashDealHintMode } from './agentic/rehash-nepq.js';
 import { rehashBetterPrice } from './agentic/rehash-flags.js';
 import { getCustomValue } from './services/ghl-custom-values.js';
@@ -1611,7 +1611,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     // file" is the bot naming itself.
     // 2026-10-11: after an unsold demo that is the rehash team, never the
     // sales rep from the visit.
-    const owner = unsoldPostDemo ? postDemoOwnerName(opts.rehash?.repName) : resolveOwningRepName(context);
+    const owner = unsoldPostDemo ? postDemoOwnerName(opts.rehash?.repName || opts.rehash?.callRepName) : resolveOwningRepName(context);
     parts.push(...P.acknowledgmentOnlyConduct(opts.escalationCategory, owner));
   }
 
@@ -1658,7 +1658,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // carves out exactly one exception (a phone call with the rep) and keeps the
   // rest of the ban (no visit, no slot, no link). See src/agentic/rehash.js.
   if (opts.rehash?.active) {
-    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true, betterPrice: rehashBetterPrice() }));
+    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true, betterPrice: rehashBetterPrice(), teamVoiceRep: opts.rehash.voice === 'team' ? (opts.rehash.callRepName || null) : null }));
   }
 
   if (fastTrack && !postAppt.post && !ackOnly) {
@@ -3768,7 +3768,14 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
     if (!rehashRepName) console.warn(`[ResponseGenerator] rehash reply for ${contactId} with no rep name — signing as the team`);
   }
-  const rehash = rehashActive ? { active: true, repName: rehashRepName } : null;
+  // 2026-10-21 (the user): REHASH_VOICE_MODE=team writes the reply as the Reece
+  // Team. repName stays null (the sign-off, the identity and the planner then
+  // speak as the team, the path a missing rep name already took) and the rep is
+  // kept as callRepName, named in the third person.
+  const teamVoice = rehashActive && rehashVoiceMode() === 'team';
+  const rehash = rehashActive
+    ? (teamVoice ? { active: true, repName: null, callRepName: rehashRepName, voice: 'team' } : { active: true, repName: rehashRepName })
+    : null;
   // 2026-10-13 (the user): "If the appointment is post demo … we can assume the
   // lead already meets the requirements." No qualifying questions, no job-scope
   // or tenant decline, no set-ND card for a lead past its demo (post-demo-lead.js).
@@ -4637,7 +4644,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // rep's name); Randy's father founded Reece; and a call "today" / "in the
   // next few minutes" is promised only inside team hours (team-hours.js).
   if (channel !== 'email') {
-    const team = enforceTeamVoice(validated.message, { allowName: rehash?.repName || null });
+    const team = enforceTeamVoice(validated.message, { allowName: rehash?.repName || null, forbidNames: rehash?.voice === 'team' && rehash.callRepName ? [rehash.callRepName] : [] });
     const timing = enforceCallTiming(team.text);
     if (team.changes.length || timing.changed) {
       console.log(`[TeamVoice] ${contactId} ${[...team.changes, ...(timing.changed ? ['call_timing'] : [])].join(',')}`);
@@ -4666,7 +4673,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // After an unsold demo the rehash team owns the lead: a reply that says the
   // sales rep will call, follow up or be in touch names our follow-up team.
   if (isUnsoldPostDemo({ postAppointment: derivePostAppointment(context, opts.contextSnapshot).post, rehash: !!rehash, sold: lpSold(context?.lp) || isCustomerP2(context) })) {
-    const owner = replaceSalesRepFollowUp(validated.message, { salesRep: resolveOwningRepName(context), keepName: rehash?.repName || null });
+    const owner = replaceSalesRepFollowUp(validated.message, { salesRep: resolveOwningRepName(context), keepName: rehash?.repName || rehash?.callRepName || null });
     if (owner.changed) {
       console.warn(`[ResponseGenerator] post-demo owner: sales rep follow-up renamed to our follow-up team for ${contactId}`);
       validated.message = owner.text;
@@ -5775,7 +5782,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     service_area: serviceAreaRecord(serviceAreaTurn?.plan, serviceAreaTurn?.coverage),
     // 2026-10-01: { active, rep_name } on a post-demo F.0 reply; the send
     // handler posts the #contact-rehash card when rehash_call.agreed.
-    rehash: rehash ? { active: true, rep_name: rehash.repName } : null,
+    rehash: rehash ? { active: true, rep_name: rehash.repName || rehash.callRepName || null, ...(rehash.voice ? { voice: rehash.voice } : {}) } : null,
     contact_known_phone: identityState?.identity?.phone || context?.lead?.phone || null,
     // 2026-10-07 (Nicholas): what the send handler's final booking-truth
     // check needs (booking-claim.js checkBookingTruth). The appointment still

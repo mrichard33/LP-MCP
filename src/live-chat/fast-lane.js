@@ -681,6 +681,8 @@ export function createLiveChatFastLane(deps) {
     // 2026-10-19 (Mark, ruling 5): the newest manual text to this contact after
     // a time (human-takeover-io.js). The default finds none, so an unwired lane sends.
     findManualOutbound: async () => null,
+    // 2026-10-21 (Mark): a rehash lead John owns gets no bot message (rehash-gate-io.js).
+    rehashGate: async () => ({ verdict: 'send' }),
     humanTakeoverMode: () => humanTakeoverMode(),
     findConversation: async () => null,
     recentTurns: async () => [],
@@ -2182,6 +2184,23 @@ export function createLiveChatFastLane(deps) {
           fingerprintExtras = { ...fingerprintExtras, input_snapshot: { ...(fingerprintExtras.input_snapshot || {}), human_takeover_shadow_would_skip: true, human_takeover: { manual_at: manual.at, manual_message_id: manual.message_id || null } } };
         }
       }
+    }
+    // 2026-10-21 (Mark, rehash ownership): a rehash lead with a Rehash Call
+    // booked, an LP Cnf / Issue / Reset visit or the rehash-owned tag belongs
+    // to the rehash rep. REHASH_OWNED_MODE live drops the reply; shadow marks it.
+    {
+      let gate = null;
+      try { gate = await d.rehashGate(contactId, { actionId: actionId ?? null, tags: sendTags.get(contactId) || [], inboundAt: timing?.t0_inbound_received || null }); } catch { gate = null; }
+      if (gate?.verdict === 'skip') {
+        d.log(`[LiveChat] reply for ${contactId} dropped: ${gate.reason}`);
+        await finishAction(actionId, {
+          status: 'skipped',
+          error_message: gate.reason,
+          execution_result: { action: 'send_message_skipped', channel: 'livechat', reason: gate.reason, draft_body: String(draft || '').slice(0, 500), rehash_gate: { owned: gate.owned || null }, ...extras, timing: finalizeTiming(timing) },
+        });
+        return { outcome: gate.reason, sent: false, message: null, timing: finalizeTiming(timing) };
+      }
+      if (gate?.shadow) fingerprintExtras = { ...fingerprintExtras, input_snapshot: { ...(fingerprintExtras.input_snapshot || {}), ...gate.shadow } };
     }
     let ghlMessageId = null;
     let sendMethod = null;

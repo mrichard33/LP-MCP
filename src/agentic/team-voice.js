@@ -26,10 +26,11 @@ function personalNames() {
 
 /**
  * @param {string} text
- * @param {{ allowName?: string|null }} [opts]  a name this line may use (rehash rep)
+ * @param {{ allowName?: string|null, forbidNames?: string[] }} [opts]  a name this line may use (rehash rep);
+ *   names it may never speak as (the rehash rep in team voice)
  * @returns {{ text: string, changes: string[] }}
  */
-export function enforceTeamVoice(text, { allowName = null } = {}) {
+export function enforceTeamVoice(text, { allowName = null, forbidNames = [] } = {}) {
   let out = String(text || '');
   const changes = [];
 
@@ -45,7 +46,9 @@ export function enforceTeamVoice(text, { allowName = null } = {}) {
 
   // 2. No personal name for the bot. "I'm Mark, handling chat here in the
   // office" / "This is Mark with the team" / "Mark here" / "— Mark".
-  const names = personalNames();
+  // 2026-10-21 (REHASH_VOICE_MODE=team): the rehash rep's name is never the
+  // bot's either ("I'm John", "John here", "— John"); third person stays.
+  const names = [...personalNames(), ...(Array.isArray(forbidNames) ? forbidNames : []).filter(Boolean)];
   const nameAlt = names.map(n => n.replace(/[^A-Za-z'-]/g, '')).filter(Boolean).join('|');
   const intro = new RegExp(String.raw`\b(I'm|I am|this is|it's|my name is)\s+(${nameAlt})\b(?:\s*,?\s*(?:with|from|on|at|handling|here)\b[^.!?]*?)?(?=[,.!?]|\s+and\b|$)`, 'gi');
   let next = out.replace(intro, (m, lead) => `${/^[A-Z]/.test(lead) ? 'This' : 'this'} is the Reece Team`);

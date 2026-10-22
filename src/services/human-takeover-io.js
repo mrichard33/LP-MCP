@@ -57,13 +57,17 @@ export async function readOurSends(contactId, afterIso, { supabase = supabaseDef
 }
 
 /**
- * @param {string} contactId
- * @param {string} afterIso   the boundary (ISO time)
- * @param {{supabase?, ghlFetch?, env?, nowMs?, excludeActionId?}} deps  excludeActionId: the
- *   send asking (its own row is "executing" and must not count as in flight)
- * @returns {Promise<{at: string, message_id: string|null, user_id: string|null}|null|undefined>}
+ * Every manual outbound to a contact after a boundary, newest first.
+ * 2026-10-21 (rehash pause): the rehash pause needs each manual message and
+ * who sent it (only a rehash-team user pauses a rehash lead), not only the
+ * newest, so the loop below collects them all. Same three answers:
+ *   [{ at, message_id, user_id, channel }, …]  people texted or emailed
+ *   []                                          nobody did
+ *   undefined                                   we could not tell
+ * A message we could not read is skipped when others were read; with none
+ * read, the answer is unknown.
  */
-export async function newestManualOutbound(contactId, afterIso, deps = {}) {
+export async function manualOutbounds(contactId, afterIso, deps = {}) {
   const supabase = deps.supabase || supabaseDefault;
   const ghlFetch = deps.ghlFetch || defaultGhlFetch;
   const env = deps.env || process.env;
@@ -76,9 +80,10 @@ export async function newestManualOutbound(contactId, afterIso, deps = {}) {
       .gt('created_at', new Date(Date.parse(afterIso)).toISOString())
       .order('created_at', { ascending: false }).limit(EVENT_LIMIT);
     if (error) throw new Error(`system_events: ${error.message}`);
-    if (!events?.length) return null;
+    if (!events?.length) return [];
     const ours = await readOurSends(contactId, afterIso, { supabase, nowMs, excludeActionId: deps.excludeActionId ?? null });
     let unknown = false;
+    const found = [];
     for (const ev of events) {
       const p = { ...(ev.payload || {}) };
       const id = String(p.messageId ?? p.message_id ?? '').trim();
@@ -91,19 +96,33 @@ export async function newestManualOutbound(contactId, afterIso, deps = {}) {
         } catch { /* body unread: unknown below */ }
       }
       const manual = isManualOutbound({ payload: p, botMessageIds: ours.ids, botBodies: ours.bodies, aiSenderUserId: aiSenderUserId(env) });
-      if (manual === true) {
-        // One of our sends still in flight could be this very message (its id
-        // not recorded yet): we cannot tell, so the bot sends.
-        if (ours.inFlight) return undefined;
-        return { at: ev.created_at, message_id: id || null, user_id: p.userId || null };
-      }
-      if (manual === null) unknown = true;
+      if (manual === true) found.push({ at: ev.created_at, message_id: id || null, user_id: p.userId || null, channel: p.type ? String(p.type).toLowerCase() : null });
+      else if (manual === null) unknown = true;
     }
-    return unknown ? undefined : null;
+    // One of our sends still in flight could be any of these (its id not
+    // recorded yet): we cannot tell, so the bot sends.
+    if (found.length && ours.inFlight) return undefined;
+    if (!found.length && unknown) return undefined;
+    return found;
   } catch (err) {
     (deps.log || console.warn)(`[HumanTakeover] ${contactId} read failed: ${String(err?.message || err).slice(0, 160)}`);
     return undefined;
   }
+}
+
+/**
+ * @param {string} contactId
+ * @param {string} afterIso   the boundary (ISO time)
+ * @param {{supabase?, ghlFetch?, env?, nowMs?, excludeActionId?}} deps  excludeActionId: the
+ *   send asking (its own row is "executing" and must not count as in flight)
+ * @returns {Promise<{at: string, message_id: string|null, user_id: string|null}|null|undefined>}
+ */
+export async function newestManualOutbound(contactId, afterIso, deps = {}) {
+  const all = await manualOutbounds(contactId, afterIso, deps);
+  if (all === undefined) return undefined;
+  if (!all.length) return null;
+  const { at, message_id, user_id } = all[0];
+  return { at, message_id, user_id };
 }
 
 /** The lead's last inbound time (a proactive send's boundary), or null. */

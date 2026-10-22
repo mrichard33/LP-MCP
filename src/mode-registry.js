@@ -249,6 +249,24 @@ export const MODES = Object.freeze([
     goLive: '48h of shadow: every human_takeover_shadow_would_skip row is a real person\'s text (no bot send read as manual)',
     note: "A person's manual text pauses the bot (ruling 5): live drops a queued reply and any proactive send until the lead's next inbound; shadow sends and marks input_snapshot.human_takeover_shadow_would_skip.",
   }),
+  // 2026-10-21 (Mark, with John Manieri and Brandon): rehash pause + ownership.
+  m('REHASH_OWNED_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-21', decider: 'Mark',
+    evidence: { events: ['rehash.owned_skip', 'rehash.owned_would_skip'], table: 'bot_message_context' },
+    goLive: '24h of shadow: every rehash.owned_would_skip names a contact with the rehash-owned tag, an upcoming Rehash Call or an LP Cnf / Issue / Reset visit',
+    note: 'John owns a rehash lead once a Rehash Call is booked, LP has the visit set, or the rehash-owned tag is on: live sends no bot message, no F.0 touch, no #contact-rehash card, and closes the bot\'s promised call.',
+  }),
+  m('REHASH_PAUSE_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-21', decider: 'Mark',
+    evidence: { events: ['rehash.pause_started', 'rehash.pause_restarted', 'rehash.pause_fired', 'rehash.pause_would_hold'], table: 'bot_message_context' },
+    goLive: '24h of shadow: every rehash.pause_would_hold follows a manual text or email from a REHASH_TEAM_USER_IDS user',
+    note: 'A rehash rep\'s manual text or email pauses the bot REHASH_PAUSE_MINUTES (15): the reply is held, a newer team message restarts it, then the thread decides (complete = no send, open = the reply). Once live it replaces HUMAN_TAKEOVER_MODE on rehash contacts. Rollback: off.',
+  }),
+  m('REHASH_VOICE_MODE', 'bot', 'enum', ['rep', 'team'], 'rep', { live: ['team'], off: ['rep'] }, {
+    since: '2026-10-21', decider: 'Mark',
+    goLive: 'the gate with rehash_voice_mode=team is not worse and no rehash reply signs a person\'s name',
+    note: 'Rehash replies: rep = written as the rehash rep and signed with their first name (2026-10-01); team = signed "— Reece Team", the rep named in third person (the user, 2026-10-21: bot messages show as the bot, never as John).',
+  }),
   m('F0_FORMULA_MODE', 'bot', 'enum', ['v1', 'four_step'], 'v1', { live: ['four_step'], off: ['v1'] }, {
     since: '2026-10-20', decider: 'Mark', evidence: { table: 'agentic_messages' },
     goLive: 'the four-step preview passes the checks for the 10 preflight recordings with no price, discount or sensitive detail; activate the version-2 F.0 rows first',
