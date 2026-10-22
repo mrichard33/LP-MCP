@@ -154,3 +154,24 @@ test('a discovery turn always ends on a question, never one already sent', () =>
   assert.equal(enforceNepqPlan('That makes sense. What was she hoping to fix?', p).text, 'That makes sense. What was she hoping to fix?');
   assert.notEqual(discoveryQuestion({ required_move: 'consequence', recent_outbound: ['What happens if you leave them as they are another season?'] }), 'What happens if you leave them as they are another season?');
 });
+
+// investment_owner chat, 2026-10-22: "Let me get someone from our team to walk
+// through the details with you. What's the best number to reach you on." on a
+// consequence turn, then a discovery question appended: two questions.
+test('a discovery turn drops a detail ask and never stacks a second question', () => {
+  const p = { required_move: 'consequence', recent_outbound: [], booking: { allowed: false } };
+  const live = "That's a solid-sized project. For a flip, we can handle that. Let me get someone from our team to walk through the details with you. What's the best number to reach you on.";
+  const out = enforceNepqPlan(live, p);
+  assert.equal((out.text.match(/\?/g) || []).length, 1);
+  assert.doesNotMatch(out.text, /best number|someone from our team/i);
+  assert.match(out.text, /^That's a solid-sized project\. For a flip, we can handle that\. .+\?$/);
+  assert.ok(out.changes.includes('detail_request_dropped'));
+  // The model's own question ending in "." gets its "?" back; nothing is appended.
+  const dot = enforceNepqPlan('Got it, that sounds frustrating. What happens if you leave them another season.', p);
+  assert.equal(dot.text, 'Got it, that sounds frustrating. What happens if you leave them another season?');
+  assert.ok(!dot.changes.includes('discovery_question_added'));
+  // A detail ask with "?" next to a real question: the ask goes, the question stays.
+  assert.equal(enforceNepqPlan("What's your best phone number? How has that been affecting you?", p).text, 'How has that been affecting you?');
+  // A reply that is only the ask is never emptied.
+  assert.equal(enforceNepqPlan("What's the best number to reach you?", p).text, "What's the best number to reach you?");
+});

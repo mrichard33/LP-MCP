@@ -48,6 +48,7 @@ import { extractZip } from './service-area-turn.js';
 import { isLeadSignOff, leadWillReachOut } from './sign-off.js';
 import { PP_LINES, PP_MARKERS, PP_DM_ASK_RX, PP_ONLY_ONE_RX, bothConfirmedInThread } from './one-leg-presentation.js';
 import { appendTrigger } from './burst-trigger.js';
+import { restoreQuestionMark } from './human-voice.js';
 
 export { isKnockComplaint };
 
@@ -3164,19 +3165,34 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   // (2026-10-09: "Enjoy your week. Is it more how they look, or how they work?").
   const endsOnSignOff = isSignOffLine(splitSentences(body).slice(-1)[0] || '');
   const noDiscovery = plan.post_demo || plan.no_question === true || ['defer', 'close', 'competitor_signed', 'post_demo_ack', 'post_demo_stop', 'post_demo_space', 'post_demo_close', 'not_owner'].includes(plan.step) || endsOnSignOff;
-  if ((plan.required_move === 'probe' || plan.required_move === 'consequence') && !body.includes('?') && !actionable && !noDiscovery) {
+  const discoveryTurn = (plan.required_move === 'probe' || plan.required_move === 'consequence') && !actionable && !noDiscovery;
+  if (discoveryTurn) {
     // A discovery turn collects no details: "Let me get your zip code so I can
     // confirm…" next to the question was two asks, and a zip asked twice
     // (2026-10-03 replay). The statement goes; the discovery question stays.
-    const kept = splitSentences(body).filter(x => !DETAIL_REQUEST_RX.test(x));
-    if (kept.length && kept.length < splitSentences(body).length) { body = kept.join(' '); changes.push('detail_request_dropped'); }
+    // Dropped BEFORE the question check, and a real question the model wrote
+    // with "." gets its "?" back first (investment_owner chat, 2026-10-22:
+    // "Let me get someone from our team to walk through the details with you.
+    // What's the best number to reach you on. How has that been affecting you?"
+    // The phone ask ended in ".", so a second question was appended to it).
+    const all = splitSentences(body);
+    const kept = all.filter(x => !DETAIL_REQUEST_RX.test(x));
+    if (kept.length && kept.length < all.length) { body = kept.join(' '); changes.push('detail_request_dropped'); }
+    const restored = restoreQuestionMark(body);
+    if (restored.changed) { body = restored.text; changes.push('question_mark_restored'); }
+  }
+  if (discoveryTurn && !body.includes('?')) {
     body = `${body.replace(/\s+$/, '')} ${discoveryQuestion(plan)}`.trim();
     changes.push('discovery_question_added');
   }
   return { text: changes.length ? withSignOff(body) : original, changes, failed: [] };
 }
 
-const DETAIL_REQUEST_RX = /\b(?:let\s+me\s+(?:get|grab|have)|(?:i|we)(?:'ll|’ll|\s+will)?\s+(?:just\s+|also\s+)?need|(?:can|could)\s+(?:you|i\s+get))\b[^.?!]*\b(?:zip|address|phone|number|e-?mail|name)\b/i;
+// A detail request, or a person the plan never promised, on a discovery turn.
+// The second and third alternatives were added 2026-10-22 (investment_owner chat):
+// "What's the best number to reach you on" and "Let me get someone from our team
+// to walk through the details with you".
+const DETAIL_REQUEST_RX = /\b(?:let\s+me\s+(?:get|grab|have)|(?:i|we)(?:'ll|’ll|\s+will)?\s+(?:just\s+|also\s+)?need|(?:can|could)\s+(?:you|i\s+get))\b[^.?!]*\b(?:zip|address|phone|number|e-?mail|name)\b|\bwhat(?:'s|’s|\s+is)\s+(?:the\s+best|a\s+good|your(?:\s+best)?)\s+(?:phone\s+)?(?:number|phone|e-?mail|address|zip(?:\s+code)?|way\s+to\s+(?:reach|contact|get\s+(?:a\s+)?hold\s+of)\s+you)\b|\blet\s+me\s+(?:get|have)\s+(?:someone|a\s+team\s+member|one\s+of\s+our)\b[^.?!]*\b(?:walk|call|reach|follow|go\s+over|contact|get\s+in\s+touch)\b/i;
 
 const DISCOVERY_QUESTIONS = {
   // A bare hello (2026-10-16): open, plain, never an either/or.
