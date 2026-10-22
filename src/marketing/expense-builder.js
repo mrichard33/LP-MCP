@@ -31,6 +31,9 @@ export const FLAGS = Object.freeze({
   VENDOR_FROM_MODEL: 'vendor_matched_by_ai_only',
   REPLACES_APPROVED: 'replaces_approved_invoice',
   UNVERIFIED_SOURCE: 'arrived_without_intake_password',
+  // 2026-10-22 (the user): a newer version of an invoice already on file (same
+  // vendor and number, different total) asks a person before it replaces it.
+  NEWER_VERSION: 'newer_version_of_invoice',
 });
 
 const cents = (n) => Math.round(Number(n || 0) * 100);
@@ -233,6 +236,7 @@ export const FLAG_LABELS = Object.freeze({
   [FLAGS.VENDOR_FROM_MODEL]: 'Vendor was picked by the AI only (the sender and name did not match one on file)',
   [FLAGS.REPLACES_APPROVED]: 'Replaces an invoice with the same number that was already approved',
   [FLAGS.UNVERIFIED_SOURCE]: 'Arrived before the intake password was set, so it could not be checked (never auto-approved)',
+  [FLAGS.NEWER_VERSION]: 'A newer version of an invoice already on file: approving it replaces the original',
   // 2026-10-19: set at ingest from the allocation preview, not by computeFlags.
   billed_more_than_found: 'Billed for more than we can find: approving accepts it as received and parks the difference as Disputed',
   // 2026-10-19: set at ingest by commission-invoice.js.

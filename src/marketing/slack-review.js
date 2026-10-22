@@ -179,9 +179,27 @@ export function disputedTotal(allocation = []) {
  * @param {object} [p.decision]     { by, at, outcome } once decided
  * @param {string} [p.note]         a line to append (e.g. "edited by …")
  */
+/**
+ * The newer-version line (the user, 2026-10-22): a revised invoice (same vendor
+ * and number, a different total) asks whether it should replace the original,
+ * and a replaced original says so. Null when neither applies.
+ */
+export function versionText({ revisionOf = null, replacedBy = null, total = null, decided = false } = {}) {
+  if (replacedBy) {
+    return `♻️ *Replaced by a newer version*${replacedBy.total != null ? ` (${usd(replacedBy.total)})` : ''}. This version no longer counts in the market costs.`;
+  }
+  if (!revisionOf) return null;
+  const was = revisionOf.total;
+  const diff = was == null || total == null ? null : Math.round((Number(total) - Number(was)) * 100) / 100;
+  const change = diff == null ? '' : ` (${diff >= 0 ? '+' : '−'}${usd(Math.abs(diff))})`;
+  const head = `🔁 *Newer version of invoice #${escapeMrkdwn(revisionOf.invoice_number || '?')}.* The original (${revisionOf.approved ? 'approved' : 'still in review'}) is ${usd(was)}; this one is ${usd(total)}${change}.`;
+  if (decided) return head;
+  return `${head}\n*Should this version replace the original?* *Approve & replace* swaps it in and updates the amount; *Reject* keeps the original.`;
+}
+
 export function buildReviewCard({
   document, vendor, facts, rows = [], allocation = [], flags = [], confidence = null, extraction = null,
-  vendorMethod = null, disagreements = [], decision = null, note = null,
+  vendorMethod = null, disagreements = [], decision = null, note = null, revisionOf = null, replacedBy = null,
 }) {
   const vendorName = vendor?.vendor_name || facts?.vendor_name_hint || 'Unknown vendor';
   const title = `Marketing invoice · ${vendorName}`;
@@ -217,8 +235,10 @@ export function buildReviewCard({
 
   const context = `Confidence ${confidence == null ? '—' : Number(confidence).toFixed(2)} · ${extractionLine(extraction)} · analyzer ${document?.analyzer || 'rules'} · ref ${short(document?.id)} · original file: dashboard, admins only`;
 
+  const revision = versionText({ revisionOf, replacedBy, total, decided: !!decision });
   const blocks = [
     { type: 'section', text: { type: 'mrkdwn', text: head.slice(0, 2900) } },
+    ...(revision ? [{ type: 'section', text: { type: 'mrkdwn', text: revision.slice(0, 2900) } }] : []),
     { type: 'section', text: { type: 'mrkdwn', text: `*Lines*\n${lineText}`.slice(0, 2900) } },
     { type: 'section', text: { type: 'mrkdwn', text: `*Allocation${decision ? '' : ' preview'}*\n${allocText}`.slice(0, 2900) } },
     { type: 'section', text: { type: 'mrkdwn', text: flagText.slice(0, 2900) } },
@@ -227,8 +247,13 @@ export function buildReviewCard({
   if (note) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: escapeMrkdwn(note).slice(0, 2900) }] });
 
   if (decision) {
-    const icon = decision.outcome === 'approved' ? '✅' : decision.outcome === 'auto_approved' ? '🤖✅' : '🚫';
-    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} *${decision.outcome.replace('_', ' ')}* by ${escapeMrkdwn(decision.by)} · ${decision.at}` } });
+    const icon = decision.outcome === 'approved' ? '✅' : decision.outcome === 'auto_approved' ? '🤖✅' : decision.outcome === 'replaced' ? '♻️' : '🚫';
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} *${decision.outcome.replace('_', ' ')}*${decision.by ? ` by ${escapeMrkdwn(decision.by)}` : ''} · ${decision.at}` } });
+    // A replaced version is settled by the newer one's card: nothing to click here.
+    if (decision.outcome === 'replaced') {
+      const text = `${title} — ${usd(total)} · replaced by a newer version`;
+      return { text, blocks };
+    }
     // 2026-10-19 (the user: "I would like the ability to reopen"): a decided
     // invoice can go back to review. Undoing the split is the handler's job.
     const disputed = decision.outcome === 'rejected' ? 0 : disputedTotal(allocation);
@@ -270,10 +295,12 @@ export function buildReviewCard({
       block_id: `mktinv_${document?.id}`,
       elements: [
         {
-          type: 'button', action_id: ACTION_MKTINV_APPROVE, style: 'primary', text: { type: 'plain_text', text: 'Approve' }, value: String(document?.id),
+          type: 'button', action_id: ACTION_MKTINV_APPROVE, style: 'primary', text: { type: 'plain_text', text: revisionOf ? 'Approve & replace' : 'Approve' }, value: String(document?.id),
           confirm: {
-            title: { type: 'plain_text', text: 'Approve this invoice?' },
-            text: { type: 'mrkdwn', text: disputedTotal(allocation) > 0
+            title: { type: 'plain_text', text: revisionOf ? 'Replace the original?' : 'Approve this invoice?' },
+            text: { type: 'mrkdwn', text: revisionOf
+              ? `Replaces the original invoice (${usd(revisionOf.total)}) with this version (${usd(total)}): the original stops counting and this amount is allocated as previewed.`
+              : disputedTotal(allocation) > 0
               ? `Accepts ${usd(total)} as received. ${usd(Math.round((total - disputedTotal(allocation)) * 100) / 100)} goes to the offices; ${usd(disputedTotal(allocation))} sits as Disputed until a revised invoice, a confirmed charge or a credit settles it.`
               : `Posts ${usd(total)} to the ledger and allocates it as previewed.` },
             confirm: { type: 'plain_text', text: 'Approve' }, deny: { type: 'plain_text', text: 'Cancel' },

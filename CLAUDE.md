@@ -1485,6 +1485,13 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   after Outlook's per-send noise is stripped (`bodyShaText`: `[cid:…]`, safe-links), and after analysis
   `findDuplicateInvoice` drops a document whose invoice number AND total match an existing one (unless both vendors are
   known and differ; a rejected one never counts), remembered as `duplicate_invoice` in `marketing_invoice_skips`.
+- **A newer version asks before it replaces (the user, 2026-10-22).** The same vendor and invoice number with a
+  DIFFERENT total is a newer version (`findEarlierVersion`, never a rejected or already-replaced one): its card leads
+  with "Newer version of invoice #N … original $X, this one $Y (±$Z). Should this version replace the original?",
+  the button reads **Approve & replace**, flag `newer_version_of_invoice` (never auto-approved), and the original's
+  card gets one thread reply (`newerVersionThreadNote`). Approving it supersedes the original's lines whether they were
+  approved or still in review (`replaceEarlierInvoice`), redraws the original card as ♻️ replaced (no buttons) and
+  replies in its thread; Reject keeps the original. The same total is still a copy (above) and never asks.
 - **Nothing sits on the Failed list (the user, 2026-10-13).** A failure a retry cannot fix removes the document and its
   rows (`removeDocument`) and posts one line naming the file and the error; a service outage keeps the row for n8n's
   retry, and `purgeStaleFailedDocuments` (nightly) removes one still failed a day later, with one line.

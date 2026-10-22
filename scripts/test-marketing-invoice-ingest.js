@@ -790,3 +790,78 @@ test('reconcileAllocations pages past PostgREST\'s 1,000-row cap (2026-10-19: 66
   base.tables.marketing_expense_allocations.find((a) => a.expense_id === 'e1400').amount = 9;
   assert.deepEqual((await reconcileAllocations({ supabase: capped })).map((x) => x.id), ['e1400']);
 });
+
+// 2026-10-22 (the user): "if our system receives a new invoice that is different
+// then the original we should replace with the newer version and update the
+// amount. This should only occur if the numbers are different", with a Slack
+// question first. The same number with a different total is a newer version.
+import { findEarlierVersion, newerVersionThreadNote } from '../src/jobs/marketing-invoice-ingest.js';
+import { versionText } from '../src/marketing/slack-review.js';
+
+async function ingestMhpTotal(supabase, posts, amount, id) {
+  const ai = { ...GOOD_AI, vendor_name: 'My Home Pros', vendor_match_id: MHP_ID, total: amount, lines: [{ description: 'Leads', amount, lp_sub_source: 'MyHomePros', markets: [], market_evidence: null }] };
+  const text = `My Home Pros\nInvoice # MHP-1\nService Period: 09/01/2026 - 09/30/2026\nTotal Due $${amount.toLocaleString('en-US')}.00`;
+  return ingestInvoice(payload({ gmail_message_id: id, from: 'billing@myhomepros.com', file_name: `MHP-1-${id}.pdf`, file_b64: Buffer.from(text).toString('base64') }), depsFor(supabase, { posts, ai }));
+}
+
+test('a newer version (same number, different total) asks on its card and in the original\'s thread; approving it replaces the original', async () => {
+  const supabase = db({}, MHP_ISSUED);
+  const posts = [];
+  const first = await ingestMhpTotal(supabase, posts, 1000, 'v1');
+  assert.equal(first.success, true);
+  const firstTs = supabase.tables.marketing_invoice_documents.find((d) => d.id === first.document_id).slack_ts;
+
+  const second = await ingestMhpTotal(supabase, posts, 1200, 'v2');
+  assert.equal(second.duplicate, false, 'a different total is not a copy');
+  assert.equal(second.auto_approved, false, 'a newer version always asks a person');
+  assert.ok(second.flags.includes('newer_version_of_invoice'));
+  const newDoc = supabase.tables.marketing_invoice_documents.find((d) => d.id === second.document_id);
+  assert.deepEqual([newDoc.analysis.revision_of.document_id, newDoc.analysis.revision_of.total, newDoc.analysis.revision_of.approved], [first.document_id, 1000, false]);
+  const card = posts.find((p) => p.opts?.blocks && p.text.includes('$1,200.00'));
+  const cardText = card.opts.blocks.map((b) => b.text?.text || '').join('\n');
+  assert.match(cardText, /Newer version of invoice #MHP-1\..*\$1,000\.00.*\$1,200\.00 \(\+\$200\.00\)/);
+  assert.match(cardText, /Should this version replace the original\?/);
+  assert.equal(card.opts.blocks.at(-1).elements[0].text.text, 'Approve & replace');
+  const note = posts.find((p) => p.opts?.threadTs === firstTs);
+  assert.ok(note, 'the original card hears about the newer version in its thread');
+  assert.match(note.text, /newer version of invoice #MHP-1 arrived: \$1,200\.00 \(this one is \$1,000\.00\)/);
+
+  // Approve the newer one: the original, still in review, is replaced too.
+  const updates = [];
+  const replies = [];
+  const deps = { supabase, approvers: new Set(['U_MARK']), reply: async (_u, b) => replies.push(b), signedLink: async () => null,
+    postToSlack: async (text, channel, opts) => { posts.push({ text, channel, opts }); return { ok: true, ts: `${posts.length}.0`, channel }; },
+    updateSlackMessage: async (channel, ts, text, opts) => { updates.push({ channel, ts, text, opts }); return { ok: true }; } };
+  const r = await handleMarketingInvoiceInteraction(parsedClick('approve', second.document_id), deps);
+  assert.equal(r.action, 'approved');
+  const rows = supabase.tables.marketing_expenses;
+  assert.ok(rows.filter((x) => x.document_id === first.document_id).every((x) => x.status === 'superseded'), 'the original no longer counts');
+  assert.ok(rows.filter((x) => x.document_id === second.document_id).every((x) => x.status === 'approved'));
+  const oldDoc = supabase.tables.marketing_invoice_documents.find((d) => d.id === first.document_id);
+  assert.equal(oldDoc.analysis.replaced_by, second.document_id);
+  assert.equal(oldDoc.analysis.replaced_by_total, 1200);
+  const redrawn = updates.find((u) => u.ts === firstTs);
+  assert.ok(redrawn, 'the original card is redrawn');
+  assert.match(redrawn.opts.blocks.map((b) => b.text?.text || '').join('\n'), /Replaced by a newer version.*\$1,200\.00/);
+  assert.ok(!redrawn.opts.blocks.some((b) => b.type === 'actions'), 'no buttons on a replaced card');
+  assert.ok(posts.some((p) => p.opts?.threadTs === firstTs && /Replaced by a newer version \(\$1,200\.00\), approved by mark/.test(p.text)));
+  assert.ok(posts.some((p) => /\$1,000\.00 → \$1,200\.00/.test(p.text)), 'the approval reply names the change');
+
+  // A click on the old card's approve afterwards changes nothing.
+  const late = await handleMarketingInvoiceInteraction(parsedClick('approve', first.document_id), deps);
+  assert.equal(late.action, 'already_resolved');
+});
+
+test('findEarlierVersion: same number and vendor, a different total, never rejected or already replaced; newest first', () => {
+  const d = (id, total, extra = {}) => ({ id, status: 'posted', created_at: `2026-10-${10 + id.length}`, analysis: { vendor_id: 'v', facts: { invoice_number: '17844', total } }, ...extra });
+  const opts = { documentId: 'z', facts: { invoice_number: '17844', total: 1500 }, vendorId: 'v' };
+  assert.equal(findEarlierVersion([d('a', 1200)], opts)?.id, 'a');
+  assert.equal(findEarlierVersion([d('a', 1500)], opts), null, 'the same total is a copy, not a version');
+  assert.equal(findEarlierVersion([d('a', 1200, { status: 'rejected' })], opts), null);
+  assert.equal(findEarlierVersion([d('a', 1200, { analysis: { vendor_id: 'v', replaced_by: 'q', facts: { invoice_number: '17844', total: 1200 } } })], opts), null);
+  assert.equal(findEarlierVersion([d('a', 1200, { analysis: { vendor_id: 'other', facts: { invoice_number: '17844', total: 1200 } } })], opts), null);
+  assert.equal(findEarlierVersion([d('a', 1200), d('bb', 1300)], opts)?.id, 'bb');
+  assert.match(newerVersionThreadNote({ invoiceNumber: '17844', was: 1200, now: 1500 }), /\$1,500\.00 \(this one is \$1,200\.00\)/);
+  assert.match(versionText({ revisionOf: { invoice_number: '17844', total: 1500, approved: true }, total: 1200 }), /approved\) is \$1,500\.00; this one is \$1,200\.00 \(−\$300\.00\)/);
+  assert.equal(versionText({}), null);
+});
