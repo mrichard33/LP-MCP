@@ -104,7 +104,8 @@ async function waitingInquiry(d, phone, nowMs) {
  * Plan every lead. Never throws for one lead: an unreadable read blocks that row.
  * @returns {{ rows, table, sheet? }}
  */
-export async function planRfedBatch({ ids = MARK_50, sheet = false, withProspect = false, deps = {} } = {}) {
+export async function planRfedBatch({ ids = MARK_50, sheet = false, withProspect = false, blankPromoterIds = [], deps = {} } = {}) {
+  const blankOk = new Set((blankPromoterIds || []).map(String));
   const d = await defaults(deps);
   const nowMs = d.now();
   const today = todayEt(nowMs);
@@ -151,6 +152,7 @@ export async function planRfedBatch({ ids = MARK_50, sheet = false, withProspect
     const row = planRfedRow({
       leadId: id, origin, prospectId, originBranch: s?.lp_branch_id || origin?.brn_id,
       promoterCatalog, sourceCatalog, inboundSrs: null, check, assertNotTransposed: d.assertNotTransposed,
+      blankPromoterOk: blankOk.has(id),
     });
     row.ghl_contact_id = contactId;
     rows.push(row);
@@ -231,11 +233,11 @@ export async function verifyRfedBatch({ batchNo = null, deps = {} } = {}) {
  * that changed since the table was approved is skipped, not sent. Never re-sends a row that
  * left 'approved' (a timeout does not mean LP did not take it). Stops on the first failure.
  */
-export async function createRfedBatch({ ids, batchNo = null, deps = {} } = {}) {
+export async function createRfedBatch({ ids, batchNo = null, blankPromoterIds = [], deps = {} } = {}) {
   if (!Array.isArray(ids) || !ids.length) throw new Error('ids required');
   if (ids.length > 10) throw new Error('at most 10 ids a call');
   const d = await defaults(deps);
-  const { rows, prospects } = await planRfedBatch({ ids, withProspect: true, deps: d });
+  const { rows, prospects } = await planRfedBatch({ ids, withProspect: true, blankPromoterIds, deps: d });
   const out = [];
   let stopped = null;
   for (const r of rows) {

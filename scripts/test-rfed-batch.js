@@ -249,3 +249,15 @@ test('a 1-2 digit Sub-Source id (Reecewindows.com = 7) is copied only when the c
   const wrongName = planRfedRow({ leadId: '1', origin: { ...o, sourcesubdescr: 'Other' }, prospectId: '2', promoterCatalog: CATALOG, sourceCatalog: cat, check: OK_CHECK });
   assert.equal(wrongName.status, 'blocked');
 });
+
+test('Mark\'s exception: a promoter not in LP\'s list goes blank only for the leads he names, and the note says which to set', () => {
+  const o = lead({ promotername: 'Thomas, Shaniqua - FTM' });
+  assert.equal(planRfedRow({ leadId: '556000', origin: o, prospectId: '443852', promoterCatalog: CATALOG, check: OK_CHECK }).status, 'blocked');
+  const r = planRfedRow({ leadId: '556000', origin: o, prospectId: '443852', promoterCatalog: CATALOG, check: OK_CHECK, blankPromoterOk: true });
+  assert.equal(r.status, 'ready');
+  assert.equal(r.rfed.pro_id, null);
+  assert.equal(r.rfed.promoter_status, 'set_at_merge');
+  const { fields } = buildRfedLeadFields({ row: r, prospect: { firstname: 'P', phone1: '3525550188' }, contactId: 'c1' });
+  assert.equal(fields.pro_id, '');
+  assert.match(fields.notes, /Set the Promoter to "Thomas, Shaniqua - FTM" when merging/);
+});

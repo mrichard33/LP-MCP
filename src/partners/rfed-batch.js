@@ -147,7 +147,7 @@ export function shortSrsConfirmed(attr, sourceCatalog) {
  *          sourceCatalog, inboundSrs, check (changeCheck result), assertNotTransposed }
  * @returns the row: what the new RFED lead carries, and ready / skip / blocked with reasons.
  */
-export function planRfedRow({ leadId, origin, prospectId, originBranch, promoterCatalog, sourceCatalog, inboundSrs, check, assertNotTransposed }) {
+export function planRfedRow({ leadId, origin, prospectId, originBranch, promoterCatalog, sourceCatalog, inboundSrs, check, assertNotTransposed, blankPromoterOk = false }) {
   const attr = attributionOf(origin) || { source: '', sub_source: '', srs_id: '', promoter: '' };
   // 2026-10-22: the batch found Sub-Source ids 7 (Internet / Reecewindows.com) and 8 (Job Signs / Install) on real
   // 1-Leg leads. resolveSubSource takes only 3-digit ids (a 4-digit one is a promoter), so a 1-2 digit id is copied
@@ -160,8 +160,14 @@ export function planRfedRow({ leadId, origin, prospectId, originBranch, promoter
   const reasons = [...(check?.reasons || [])];
   let status = check?.status === 'ok' ? 'ready' : (check?.status || 'blocked');
   if (!sub) { reasons.push('sub_source_unresolved'); status = 'blocked'; }
-  // The ruling: a promoter the original HAD must be copied; never sent blank.
-  if (attr.promoter && !pro.proId) { reasons.push(`promoter_${pro.promoterStatus}`); status = 'blocked'; }
+  // The ruling: a promoter the original HAD must be copied; never sent blank. Mark's exception (2026-10-22):
+  // a promoter LP's list does not carry (an inactive canvasser) goes blank when Mark names the lead, and he
+  // sets it while merging; the merge note names it (promoter_status set_at_merge).
+  if (attr.promoter && !pro.proId) {
+    if (blankPromoterOk && ['promoter_not_in_lp_catalog', 'promoter_name_ambiguous', 'pro_id_not_4_digit'].includes(pro.promoterStatus)) {
+      pro.promoterStatus = 'set_at_merge';
+    } else { reasons.push(`promoter_${pro.promoterStatus}`); status = 'blocked'; }
+  }
   return {
     original_lp_lead_id: clean(leadId),
     lp_prospect_id: clean(prospectId),
@@ -235,9 +241,11 @@ export function buildRfedLeadFields({ row, prospect, contactId }) {
   if (!clean(prospect?.firstname)) return { error: 'no_first_name' };
   if (phone.length !== 10) return { error: 'no_10_digit_phone' };
   if (!row?.rfed?.srs_id) return { error: 'no_sub_source' };
-  if (row.rfed.promoter && !row.rfed.pro_id) return { error: 'promoter_unresolved' };
+  const setAtMerge = row.rfed.promoter_status === 'set_at_merge';
+  if (row.rfed.promoter && !row.rfed.pro_id && !setAtMerge) return { error: 'promoter_unresolved' };
   const notes = `RFED copy of 1-Leg lead ${row.original_lp_lead_id} (Prospect ${row.lp_prospect_id}), Mark 2026-10-22. ` // lead-id-ok: an LP inquiry note for the person merging it, never Slack text
-    + `Merge onto Prospect ${row.lp_prospect_id} and set the market to RFED. Product Roof. Keep the original 1-Leg lead as it is.`;
+    + `Merge onto Prospect ${row.lp_prospect_id} and set the market to RFED. Product Roof. Keep the original 1-Leg lead as it is.`
+    + (setAtMerge ? ` Set the Promoter to "${row.rfed.promoter}" when merging (not in LP's promoter list).` : '');
   return {
     fields: {
       firstname: clean(prospect.firstname),

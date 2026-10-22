@@ -62,13 +62,15 @@ export function registerPartnerTools(server, deps = {}) {
       ids: z.array(z.string().regex(/^\d+$/)).optional().describe('LP lead ids (default: Mark\'s 50 for plan)'),
       batch_no: z.number().int().min(1).optional(),
       sheet: z.boolean().optional().default(false),
+      blank_promoter_ids: z.array(z.string().regex(/^\d+$/)).optional()
+        .describe('Mark 2026-10-22: these leads\' promoters are not in LP\'s list; send them blank, the note names the promoter to set at merge'),
     },
-    async ({ action, ids, batch_no, sheet }) => {
+    async ({ action, ids, batch_no, sheet, blank_promoter_ids }) => {
       const run = await import('../partners/rfed-batch-run.js');
       if (action === 'record') return text(await run.recordRfedBatch({ approvedIds: ids, batchNo: batch_no ?? null, deps }));
       if (action === 'verify') return text(await run.verifyRfedBatch({ batchNo: batch_no ?? null, deps }));
-      if (action === 'create') return text(await run.createRfedBatch({ ids, batchNo: batch_no ?? null, deps }));
-      const r = await run.planRfedBatch({ ...(ids?.length ? { ids } : {}), sheet, deps });
+      if (action === 'create') return text(await run.createRfedBatch({ ids, batchNo: batch_no ?? null, blankPromoterIds: blank_promoter_ids || [], deps }));
+      const r = await run.planRfedBatch({ ...(ids?.length ? { ids } : {}), sheet, blankPromoterIds: blank_promoter_ids || [], deps });
       return text(sheet ? r : { table: r.table, rows: r.rows });
     },
   );
