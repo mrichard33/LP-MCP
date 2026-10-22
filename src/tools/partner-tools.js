@@ -10,7 +10,8 @@
  *                               Promoter. Never a fix. Dry run by default.
  *   rfed_batch_run              (2026-10-22, Build 2) Mark's 50 1-Leg leads → RFED: plan
  *                               (read-only dry-run table), record (approved ids →
- *                               partner_rfed_batch), verify. Never writes LP, GHL or Five9.
+ *                               partner_rfed_batch), create (sends each ready lead to LP's
+ *                               inbound queue, at most 10 a call), verify.
  *
  * WHY TOOLS: the same runs exist as admin routes (src/partners/routes.js), but those take
  * the strict operator token, which no chat session holds; production holds the LP, Five9
@@ -52,10 +53,12 @@ export function registerPartnerTools(server, deps = {}) {
     'Mark\'s 50 1-Leg leads → a new LP lead on RFED (Build 2). action plan (default, read-only): the dry-run table '
       + '(Source, Sub-Source, Promoter copied, canvass included; skips a sale, any DNC, a new appointment, a newer lead). '
       + 'sheet:true also returns the LP-ready lines (names, phones) for LP support. action record: approved ids → '
-      + 'partner_rfed_batch. action verify: the created RFED leads, Ross the owner, phone-team, a Five9 removal row. '
-      + 'Never writes LP, GHL or Five9.',
+      + 'partner_rfed_batch. action create (at most 10 ids, Mark 2026-10-22): re-plans, then sends each ready lead to '
+      + 'LP\'s inbound queue (addLead, legacy path only) for a person to merge onto the prospect and set RFED; stops on '
+      + 'the first failure, never re-sends. action verify: the merged RFED leads, Ross the owner, phone-team, a Five9 '
+      + 'removal row. Only create writes to LP; nothing writes GHL or Five9.',
     {
-      action: z.enum(['plan', 'record', 'verify']).optional().default('plan'),
+      action: z.enum(['plan', 'record', 'create', 'verify']).optional().default('plan'),
       ids: z.array(z.string().regex(/^\d+$/)).optional().describe('LP lead ids (default: Mark\'s 50 for plan)'),
       batch_no: z.number().int().min(1).optional(),
       sheet: z.boolean().optional().default(false),
@@ -64,6 +67,7 @@ export function registerPartnerTools(server, deps = {}) {
       const run = await import('../partners/rfed-batch-run.js');
       if (action === 'record') return text(await run.recordRfedBatch({ approvedIds: ids, batchNo: batch_no ?? null, deps }));
       if (action === 'verify') return text(await run.verifyRfedBatch({ batchNo: batch_no ?? null, deps }));
+      if (action === 'create') return text(await run.createRfedBatch({ ids, batchNo: batch_no ?? null, deps }));
       const r = await run.planRfedBatch({ ...(ids?.length ? { ids } : {}), sheet, deps });
       return text(sheet ? r : { table: r.table, rows: r.rows });
     },

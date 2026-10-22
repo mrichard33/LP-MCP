@@ -190,3 +190,62 @@ test('recordRfedBatch writes only approved ready rows', async () => {
   assert.equal(row.partner_branch, 'RFED');
   assert.equal(row.batch_no, 1);
 });
+
+// ── create: send each ready lead to LP's inbound queue (Mark, 2026-10-22) ──
+import { createRfedBatch } from '../src/partners/rfed-batch-run.js';
+import { buildRfedLeadFields } from '../src/partners/rfed-batch.js';
+
+test('buildRfedLeadFields: product Roof, the copied ids, the merge note, no appointment', () => {
+  const row = { original_lp_lead_id: '569069', lp_prospect_id: '450001', rfed: { srs_id: '412', pro_id: '6102', promoter: 'Canvass, Jane Doe' } };
+  const { fields } = buildRfedLeadFields({ row, prospect: { firstname: 'Pat', lastname: 'Lee', phone1: '(352) 555-0188', zip: '33908' }, contactId: 'cBB' });
+  assert.equal(fields.productID, 'Roof');
+  assert.equal(fields.srs_id, '412');
+  assert.equal(fields.pro_id, '6102');
+  assert.equal(fields.phone, '3525550188');
+  assert.equal(fields.lognumber, 'cBB');
+  assert.match(fields.notes, /Merge onto Prospect 450001 and set the market to RFED/);
+  assert.equal(fields.apptdate, undefined);
+  // A blank original promoter goes out blank; a promoter we could not resolve never goes out.
+  assert.equal(buildRfedLeadFields({ row: { ...row, rfed: { srs_id: '412', pro_id: null, promoter: null } }, prospect: { firstname: 'P', phone1: '3525550188' } }).fields.pro_id, '');
+  assert.equal(buildRfedLeadFields({ row: { ...row, rfed: { srs_id: '412', pro_id: null, promoter: 'X' } }, prospect: { firstname: 'P', phone1: '3525550188' } }).error, 'promoter_unresolved');
+  assert.equal(buildRfedLeadFields({ row, prospect: { firstname: 'P', phone1: '555' } }).error, 'no_10_digit_phone');
+});
+
+test('createRfedBatch: sends legacy-only, records the inquiry, never re-sends', async () => {
+  const { db, deps } = runDeps();
+  const sent = [];
+  deps.addLead = async (f) => { sent.push(f); return { message: 'Lead added 431999' }; };
+  deps.extractInboundLeadId = (r) => (String(r.message).match(/(\d+)$/) || [])[1] || null;
+  const r = await createRfedBatch({ ids: ['569069'], batchNo: 1, deps });
+  assert.equal(r.sent, 1);
+  assert.equal(sent[0]._legacy_only, true, 'the REST fallback drops srs_id / pro_id');
+  assert.equal(sent[0].pro_id, '6102');
+  const row = db.tables.partner_rfed_batch[0];
+  assert.equal(row.status, 'sent_to_lp');
+  assert.equal(row.detail.in1_id, '431999');
+  const again = await createRfedBatch({ ids: ['569069'], batchNo: 1, deps });
+  assert.equal(again.sent, 0);
+  assert.equal(again.rows[0].outcome, 'already_sent');
+  assert.equal(sent.length, 1);
+});
+
+test('createRfedBatch: stops on the first failure and marks the row failed', async () => {
+  const { db, deps } = runDeps();
+  deps.addLead = async () => { throw new Error('LP 500'); };
+  deps.extractInboundLeadId = () => null;
+  const r = await createRfedBatch({ ids: ['569069'], deps });
+  assert.equal(r.stopped_on, '569069');
+  assert.equal(db.tables.partner_rfed_batch[0].status, 'failed');
+  await assert.rejects(() => createRfedBatch({ ids: Array.from({ length: 11 }, (_, i) => String(i + 1)), deps }), /at most 10/);
+});
+
+test('a 1-2 digit Sub-Source id (Reecewindows.com = 7) is copied only when the catalog confirms it by id and names', () => {
+  const cat = [{ lp_source_id: '7', lp_source_raw: 'Internet', lp_source_subdetail: 'Reecewindows.com', active: true }];
+  const o = lead({ source: 'Internet', sourcesubdescr: 'Reecewindows.com', srs_id: '7', promotername: '' });
+  const ok = planRfedRow({ leadId: '1', origin: o, prospectId: '2', promoterCatalog: CATALOG, sourceCatalog: cat, check: OK_CHECK });
+  assert.equal(ok.status, 'ready');
+  assert.equal(ok.rfed.srs_id, '7');
+  assert.equal(ok.rfed.srs_from, 'lead_catalog_confirmed');
+  const wrongName = planRfedRow({ leadId: '1', origin: { ...o, sourcesubdescr: 'Other' }, prospectId: '2', promoterCatalog: CATALOG, sourceCatalog: cat, check: OK_CHECK });
+  assert.equal(wrongName.status, 'blocked');
+});

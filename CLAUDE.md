@@ -1377,13 +1377,22 @@ original lead, canvass included; Promoter is blank only when the original had no
 exactly one LP promoter id BLOCKS the row, never sends it blank. **LP's API cannot do it:** every create path (addLead,
 `/api/Leads/LeadAdd`, `/api/Leads/AddLead`) lands in the inbound queue, LP picks the branch from the zip (no inquiry landed
 on RFED in 21 days; the RFED leads since 10/01 were moved there by hand), and LP's auto-import took 0 of 974 inquiries
-whose phone was already in LP. So Mark's 50 (`MARK_50`, `src/partners/rfed-batch.js`, pure) are created in LP directly
-(LP support or a person, from the sheet), and the original 1-Leg lead stays as it is. `src/partners/rfed-batch-run.js`
+whose phone was already in LP. So Mark's 50 (`MARK_50`, `src/partners/rfed-batch.js`, pure) go to LP's inbound queue
+and Mark merges each onto its prospect and sets RFED by hand (his ruling, the same day: "create and send the lead to the
+inbound queue … I can click and do this"); the original 1-Leg lead stays as it is. `src/partners/rfed-batch-run.js`
 (`POST /n8n/admin/partner-owner/rfed-batch`, CLI `scripts/rfed-1leg-batch.js`): `plan` (read-only; skips a sale, a DNC
 of any kind, a new live appointment, a newer lead, a waiting inquiry or a lead no longer 1Leg; an unreadable read
-blocks; `sheet: true` returns the LP lines to the caller only), `record` (approved ids → `partner_rfed_batch`), `verify`
-(the RFED lead with the same fields, Ross the owner, `phone-team`, a `partner_five9_removals` row). It never writes LP,
-GHL or Five9. **The guard: Ross owns it in GHL ⇒ it must be RFED in LP.** `src/partners/rfed-integrity.js`, run in the
+blocks; `sheet: true` returns the LP lines to the caller only), `record` (approved ids → `partner_rfed_batch`), `create`
+(at most 10 ids a call: re-plans, claims the `partner_rfed_batch` row as `sent_to_lp` BEFORE `addLead` (not idempotent;
+a timeout is never re-sent), sends with `_legacy_only` (the REST fallback drops srs_id / pro_id), product Roof, no
+appointment, a merge note; stops on the first failure), `verify` (the merged RFED lead with the same fields, Ross the
+owner, `phone-team`, a `partner_five9_removals` row). Only `create` writes LP; nothing writes GHL or Five9.
+**Every lead handed to a partner is kept (Mark, 2026-10-22: "keep track of every lead we assign to Ross … run the
+metrics").** `partner_lead_ledger` (`src/partners/lead-ledger.js`), one row per partner + contact + partner-branch lead
+(`lead_key` '' while there is none), written by the partner Five9 sweep for every partner OWNER it reads, whoever assigned
+it (`assigned_how` lp_sync | batch | ghl_or_manual); `first_seen_at` never moves, `returned_at` is set when a pass reads
+the contact back with Reece. `v_partner_lead_metrics` joins each row to the lead's LP disposition, appointment, sale and
+jobs (count, value): the partner metrics read it, never the partner logs. **The guard: Ross owns it in GHL ⇒ it must be RFED in LP.** `src/partners/rfed-integrity.js`, run in the
 partner Five9 sweep's loop after its live read (no extra GHL reads): a contact whose live OWNER is a partner (a tag alone
 is not) must have its newest LP lead (`newestLead`) on the partner's branch, with the Source / Sub-Source / Promoter of the
 lead it came from (the `partner_rfed_batch` origin, else the newest 1Leg lead on the prospect within 180 days; none →

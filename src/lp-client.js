@@ -1237,6 +1237,12 @@ export async function addLead(fields = {}) {
   const preferPath = (fields._prefer_path === 'rest') ? 'rest' : 'legacy';
   delete cleanFields._prefer_path;
 
+  // 2026-10-22 (RFED batch): the REST fallback silently drops srs_id and pro_id
+  // (see the 2026-08 note above), so a caller whose whole job is the attribution
+  // passes _legacy_only and gets the legacy error instead of a lead without it.
+  const legacyOnly = fields._legacy_only === true || String(fields._legacy_only) === 'true';
+  delete cleanFields._legacy_only;
+
   // Optional legacy-path retry budget. Default 2 preserves the historical
   // behavior for every existing caller; the canvassing webhook passes 3.
   const attempts = Math.max(1, Number(fields._attempts) || 2);
@@ -1282,6 +1288,10 @@ export async function addLead(fields = {}) {
 
   console.log(`[LP] addLead → trying ${preferPath.toUpperCase()} path first: firstname=${cleanFields.firstname}, phone=${cleanFields.phone}, srs_id=${cleanFields.srs_id}, pro_id=${cleanFields.pro_id || '(none)'}, email=${cleanFields.email || '(none)'}, lognumber=${cleanFields.lognumber || '(none)'}, apptdate=${cleanFields.apptdate || '(none)'}, appttime=${cleanFields.appttime || '(none)'}`);
 
+  if (legacyOnly) {
+    const result = await _callLegacyAddLead(cleanFields, attempts);
+    return { ...(result || {}), _path: 'legacy' };
+  }
   if (preferPath === 'legacy') {
     return _addLeadLegacyFirst(cleanFields, attempts);
   }

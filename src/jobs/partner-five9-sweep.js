@@ -28,6 +28,10 @@
 // Sub-Source and Promoter. A card, never a fix. The scheduled pass needs the Five9 mode
 // on; { integrityOnly } (POST /n8n/admin/partner-owner/rfed-integrity) runs the guard
 // alone, whatever that mode, and skips the Five9 work.
+// 2026-10-22 (Mark: "keep track of every lead we assign to Ross ... run the metrics"): every
+// pass also writes partner_lead_ledger (src/partners/lead-ledger.js) for each partner OWNER it
+// reads, whoever assigned the contact, and closes the rows of a contact back with Reece.
+// v_partner_lead_metrics is the read side. A dry run writes nothing.
 
 import { runJob } from '../job-runner.js';
 import { partnerSyncConfig, postGhlSetCard } from '../partners/owner-sync.js';
@@ -35,7 +39,8 @@ import { loadPartnerMap } from '../partners/owner-resolver.js';
 import {
   partnerFive9Mode, ensurePartnerFive9Removal, releasePartnerFive9, settleRecentGroups, partnerFor,
 } from '../partners/five9-removal.js';
-import { rfedIntegrityMode, checkPartnerContact } from '../partners/rfed-integrity.js';
+import { rfedIntegrityMode, checkPartnerContact, readPartnerLeadState, originFor } from '../partners/rfed-integrity.js';
+import { recordPartnerLead, markPartnerLeadReturned } from '../partners/lead-ledger.js';
 
 export const JOB_ID = 'partner-five9-sweep';
 const INTERVAL_MS = 30 * 60 * 1000;
@@ -141,7 +146,7 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false, integrit
   const nameOf = (id) => map.find((r) => String(r.ghl_user_id) === String(id))?.partner_name || null;
   const nowMs = now();
   const { candidates, errors } = await candidateIds(d, map, nowMs);
-  const counts = { candidates: candidates.length, read: 0, partner_owned: 0, memo_skipped: 0, removals: {}, released: 0, ghl_set_cards: 0, read_errors: 0, integrity: {}, integrity_cards: 0 };
+  const counts = { candidates: candidates.length, read: 0, partner_owned: 0, memo_skipped: 0, removals: {}, released: 0, ghl_set_cards: 0, read_errors: 0, integrity: {}, integrity_cards: 0, ledger: {} };
   const integrityHits = [];
   const contacts = [];
   for (const c of candidates) {
@@ -162,6 +167,7 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false, integrit
     const hit = partnerFor(contact, map);
     if (!hit) {
       notPartnerMemo.set(c.id, nowMs);
+      if (!dryRun) await markPartnerLeadReturned({ contactId: c.id, nowMs, deps: fdeps });
       if (c.source === 'removed' && doFive9) {
         const r = await releasePartnerFive9({ contactId: c.id, contact, partnerRows: map, trigger: 'sweep_not_partner', dryRun, deps: fdeps });
         if (r.outcome === 'released' || r.outcome === 'would_release') counts.released++;
@@ -172,11 +178,23 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false, integrit
     notPartnerMemo.delete(c.id);
     counts.partner_owned++;
     const partnerName = hit.row.partner_name || nameOf(owner);
-    // Build 3: only a partner OWNER is checked (a tag alone is not ownership).
+    // Build 3 and the ledger: only a partner OWNER counts (a tag alone is not ownership).
+    let state = null;
+    if (partnerIds.has(owner)) {
+      try { state = await readPartnerLeadState(fdeps, c.id, contact, map); } catch { state = null; }
+    }
+    if (state && !dryRun) {
+      const origin = state.newest
+        ? originFor({ newest: state.newest, prospectLeads: state.prospectLeads || [], batchRow: state.batchRow, partnerBranches: state.partnerBranches })
+        : null;
+      const l = await recordPartnerLead({ contactId: c.id, state, origin, nowMs, deps: fdeps });
+      counts.ledger[l.outcome] = (counts.ledger[l.outcome] || 0) + 1;
+      if (l.why && errors.length < 10) errors.push(`ledger ${c.id}: ${l.why}`);
+    }
     if (doIntegrity && partnerIds.has(owner)) {
       let g;
       try {
-        g = await checkPartnerContact({ contactId: c.id, contact, map, dryRun, deps: fdeps });
+        g = await checkPartnerContact({ contactId: c.id, contact, map, dryRun, state: state ?? undefined, deps: fdeps });
       } catch (err) {
         g = { outcome: 'unknown', why: `threw: ${err.message}` };
       }

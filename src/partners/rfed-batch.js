@@ -132,6 +132,15 @@ export function changeCheck({ origin, prospectLeads, tags, dnd, five9Dnc, intdnc
   return { status: 'ok', reasons: [] };
 }
 
+/** Pure: a 1-2 digit Sub-Source id the source catalog confirms by id AND names, or null. */
+export function shortSrsConfirmed(attr, sourceCatalog) {
+  const id = clean(attr?.srs_id);
+  if (!/^[1-9]\d?$/.test(id) || !Array.isArray(sourceCatalog)) return null;
+  const hit = sourceCatalog.find((r) => clean(r?.lp_source_id) === id && r?.active !== false
+    && nameKey(r?.lp_source_raw) === nameKey(attr.source) && nameKey(r?.lp_source_subdetail) === nameKey(attr.sub_source));
+  return hit ? { srsId: id, srsSource: 'lead_catalog_confirmed' } : null;
+}
+
 /**
  * One row of the dry-run table. Pure.
  * input: { leadId, origin (LP live lead or lp_leads row), prospectId, originBranch, promoterCatalog,
@@ -140,7 +149,11 @@ export function changeCheck({ origin, prospectLeads, tags, dnd, five9Dnc, intdnc
  */
 export function planRfedRow({ leadId, origin, prospectId, originBranch, promoterCatalog, sourceCatalog, inboundSrs, check, assertNotTransposed }) {
   const attr = attributionOf(origin) || { source: '', sub_source: '', srs_id: '', promoter: '' };
-  const sub = resolveSubSource({ srsId: attr.srs_id, leadSource: attr.source, leadSourceDetail: attr.sub_source, sourceCatalog, inboundSrs });
+  // 2026-10-22: the batch found Sub-Source ids 7 (Internet / Reecewindows.com) and 8 (Job Signs / Install) on real
+  // 1-Leg leads. resolveSubSource takes only 3-digit ids (a 4-digit one is a promoter), so a 1-2 digit id is copied
+  // only when lp_source_catalog confirms that id carries the same source and sub-source names.
+  const sub = resolveSubSource({ srsId: attr.srs_id, leadSource: attr.source, leadSourceDetail: attr.sub_source, sourceCatalog, inboundSrs })
+    || shortSrsConfirmed(attr, sourceCatalog);
   const pro = attr.promoter
     ? resolvePromoter({ srsId: sub?.srsId, promoterName: attr.promoter, catalog: promoterCatalog, assertNotTransposed })
     : { proId: null, promoterStatus: 'no_promoter_on_original' };
@@ -206,4 +219,43 @@ export function verifyRow({ batch, rfedLead, contact, partnerUserId, partnerTag,
   steps.five9 = removalRow ? `ok (${removalRow.mode})` : 'missing';
   const done = Object.values(steps).every((v) => String(v).startsWith('ok'));
   return { original_lp_lead_id: batch.origin_lp_lead_id, rfed_lp_lead_id: rfedLead ? leadIdOf(rfedLead) : null, done, steps };
+}
+
+/**
+ * Pure: the LP addLead body for one approved row (Mark, 2026-10-22: "create and send the
+ * lead to the inbound queue; they will then be merged to the leads manually"). The lead
+ * lands in LP's inbound queue as an inquiry; a person merges it onto the prospect and sets
+ * the market to RFED (LP picks a branch from the zip, and no API field sets it). No
+ * appointment. Source comes with the Sub-Source id; the Promoter id is copied, blank only
+ * when the original had none. lognumber / User1 = the GHL contact, as every addLead sends.
+ * @returns {{ fields } | { error }}
+ */
+export function buildRfedLeadFields({ row, prospect, contactId }) {
+  const phone = clean(prospect?.phone1 || prospect?.phone).replace(/\D/g, '').slice(-10);
+  if (!clean(prospect?.firstname)) return { error: 'no_first_name' };
+  if (phone.length !== 10) return { error: 'no_10_digit_phone' };
+  if (!row?.rfed?.srs_id) return { error: 'no_sub_source' };
+  if (row.rfed.promoter && !row.rfed.pro_id) return { error: 'promoter_unresolved' };
+  const notes = `RFED copy of 1-Leg lead ${row.original_lp_lead_id} (Prospect ${row.lp_prospect_id}), Mark 2026-10-22. ` // lead-id-ok: an LP inquiry note for the person merging it, never Slack text
+    + `Merge onto Prospect ${row.lp_prospect_id} and set the market to RFED. Product Roof. Keep the original 1-Leg lead as it is.`;
+  return {
+    fields: {
+      firstname: clean(prospect.firstname),
+      lastname: clean(prospect.lastname),
+      address1: clean(prospect.address1),
+      city: clean(prospect.city),
+      state: clean(prospect.state),
+      zip: clean(prospect.zip),
+      phone,
+      email: clean(prospect.email),
+      srs_id: row.rfed.srs_id,
+      pro_id: row.rfed.pro_id || '',
+      productID: RFED_PRODUCT,
+      proddescr: RFED_PRODUCT,
+      sender: 'GHL-RFEDBatch',
+      notes,
+      lognumber: clean(contactId),
+      User1: clean(contactId),
+    },
+  };
 }

@@ -28,20 +28,17 @@ These were in the earlier plan. Do not build them without a new ruling from Mark
 | Five9 removal | `src/partners/five9-removal.js`, job `partner-five9-sweep` | A partner-owned contact comes off every Reece outbound list, again after each 6 AM LP load. `PARTNER_FIVE9_REMOVAL_MODE` off / log / enforce. |
 | Phone presentation | `src/agentic/one-leg-presentation.js`, `executeBookAppointment` | `phone-team` contacts only. |
 | RFED batch (Mark's 50) | `src/partners/rfed-batch.js`, `src/partners/rfed-batch-run.js`, `scripts/rfed-1leg-batch.js`, `POST /n8n/admin/partner-owner/rfed-batch` | plan (dry-run table), record (approved rows → `partner_rfed_batch`), verify. Never writes LP, GHL or Five9. |
+| Lead ledger | `src/partners/lead-ledger.js`, table `partner_lead_ledger`, view `v_partner_lead_metrics` | Every lead Ross owns, however it was assigned, with first / last seen and returned dates; the view adds each lead's LP disposition, appointment, sale and job value for metrics. |
 | Integrity guard | `src/partners/rfed-integrity.js`, inside `partner-five9-sweep` | Ross owns it in GHL ⇒ newest LP lead is RFED with the original's Source / Sub-Source / Promoter. A card, never a fix. `PARTNER_RFED_INTEGRITY_MODE` off / log / alert. |
 
-## Why the 50 RFED leads are created in LP, not by our code
+## How the 50 RFED leads reach LP
 
-- Every LP create path we have (`addLead`, `/api/Leads/LeadAdd`, `/api/Leads/AddLead`) puts an inquiry in LP's
-  inbound queue. A person has to import it.
-- In the 21 days to 2026-10-22, LP's auto-import took **0 of 974** inquiries whose phone was already in LP. All 50 of
-  these customers are already in LP, so all 50 would wait for a person.
-- LP picks the branch from the zip. No inquiry landed on RFED in those 21 days. The RFED leads created since 10/01 came
-  in on ORL or BOCA and a person moved them to RFED in LP.
+Mark's ruling (2026-10-22): "create and send the lead to the inbound queue. They will then need to be merged to the
+leads manually. I can click and do this."
 
-So the leads are created directly on each prospect in LP: LP support (from the sheet the `plan` step returns), or one
-person from the same sheet. We also asked LP whether an API exists that creates a lead on an existing prospect with a
-branch; if it does, the batch can run through it with the same rules.
+- Every LP create path puts an inquiry in LP's inbound queue; LP's auto-import took 0 of 974 inquiries in 21 days whose
+  phone was already in LP, so all 50 wait for a person: Mark merges each onto its prospect.
+- LP picks the branch from the zip, so the market is set to RFED during the merge. Each inquiry's note says so.
 
 ## The batch, step by step
 
@@ -51,8 +48,9 @@ branch; if it does, the batch can run through it with the same rules.
    does not match exactly one LP promoter id blocks the row; it is never sent blank.
 2. Mark approves the table.
 3. `record` the approved ids, 10 at a time (`batch_no`).
-4. LP support (or a person) creates the 10 RFED leads: same prospect, product Roof, the copied fields. The original
-   1-Leg lead stays untouched.
+4. `create` the same ids (at most 10 a call): each goes to LP's inbound queue with product Roof and the copied
+   Source / Sub-Source / Promoter, and Mark merges it onto the prospect and sets RFED. The original 1-Leg lead stays
+   untouched.
 5. `verify` the batch: the RFED lead in LP with the same fields → Ross the owner → `phone-team` → a Five9 removal row.
    Stop on the first batch with a failure.
 

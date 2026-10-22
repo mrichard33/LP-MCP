@@ -148,26 +148,37 @@ async function readBatchRow(d, newest) {
 }
 
 /**
- * Check one contact the sweep already read live. Never throws, never writes GHL or LP.
- * deps: { supabase, postToSlack, alertPosted, env, log }
- * @returns {{ outcome: 'ok'|'mismatch'|'unknown'|'not_owner', why?, posted?, mismatches? }}
+ * The LP side of one partner-owned contact, read once and shared by the guard and the
+ * lead ledger (src/partners/lead-ledger.js). null when the live owner is not a partner.
  */
-export async function checkPartnerContact({ contactId, contact, map, dryRun = false, deps }) {
-  const d = deps;
-  const mode = rfedIntegrityMode(d.env);
-  if (mode === 'off') return { outcome: 'off' };
+export async function readPartnerLeadState(d, contactId, contact, map) {
   const owner = String(contact?.assignedTo || '');
   const row = (map || []).find((r) => r?.ghl_user_id && String(r.ghl_user_id) === owner);
-  if (!row) return { outcome: 'not_owner' };
+  if (!row) return null;
   const partnerBranches = new Set((map || []).map((r) => clean(r.lp_branch_id).toUpperCase()).filter(Boolean));
   const leads = await readLeads(d, contactId);
   const newest = Array.isArray(leads) ? newestLead(leads) : null;
   const prospectLeads = newest ? await readProspectLeads(d, newest.lp_prospect_id) : [];
   const batchRow = newest ? await readBatchRow(d, newest) : null;
+  return { row, partnerBranches, leads, newest, prospectLeads, batchRow };
+}
+
+/**
+ * Check one contact the sweep already read live. Never throws, never writes GHL or LP.
+ * deps: { supabase, postToSlack, alertPosted, env, log }
+ * @returns {{ outcome: 'ok'|'mismatch'|'unknown'|'not_owner', why?, posted?, mismatches? }}
+ */
+export async function checkPartnerContact({ contactId, contact, map, dryRun = false, state = undefined, deps }) {
+  const d = deps;
+  const mode = rfedIntegrityMode(d.env);
+  if (mode === 'off') return { outcome: 'off' };
+  const st = state === undefined ? await readPartnerLeadState(d, contactId, contact, map) : state;
+  if (!st) return { outcome: 'not_owner' };
+  const { row, partnerBranches, leads, prospectLeads, batchRow } = st;
   const result = checkRfedIntegrity({ partnerRow: row, leads, prospectLeads, batchRow, partnerBranches });
-  if (result.verdict !== 'mismatch') return { outcome: result.verdict, why: result.why || null, origin: result.origin?.kind || null };
+  if (result.verdict !== 'mismatch') return { outcome: result.verdict, why: result.why || null, origin: result.origin?.kind || null, result };
   const summary = result.mismatches.map((m) => m.field);
-  if (mode !== 'alert' || dryRun) return { outcome: 'mismatch', mismatches: summary, posted: false, why: dryRun ? 'dry_run' : 'log_mode' };
+  if (mode !== 'alert' || dryRun) return { outcome: 'mismatch', mismatches: summary, posted: false, why: dryRun ? 'dry_run' : 'log_mode', result };
   const channel = clean(d.env.PARTNER_ALERT_SLACK_CHANNEL);
   if (!channel) {
     d.log(`[PartnerRfedIntegrity] card for contact ${contactId} not posted: PARTNER_ALERT_SLACK_CHANNEL unset`);

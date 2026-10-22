@@ -10,6 +10,11 @@
 //           the LP-ready lines with name, phone and address for LP support. The sheet is
 //           returned to the caller only, never logged or stored.
 //   record  writes the ready rows Mark approved to partner_rfed_batch (status approved).
+//   create  (Mark, 2026-10-22: "create and send the lead to the inbound queue … I can click
+//           and do this") re-plans the given ids, records the ready ones, and sends each to
+//           LP's addLead (legacy path only: the REST fallback drops srs_id / pro_id). The lead
+//           is an inquiry until Mark merges it onto the prospect and sets RFED. Claimed on the
+//           partner_rfed_batch row first (addLead is not idempotent); stops on the first failure.
 //   verify  read-only per recorded row: the RFED lead in lp_leads with the same fields,
 //           Ross the GHL owner, phone-team, a partner_five9_removals row. Fills
 //           rfed_lp_lead_id / checked_at / status (the one write, to our own table).
@@ -18,7 +23,7 @@
 // LP, Five9 and GHL credentials. Thin CLI: scripts/rfed-1leg-batch.js.
 
 import {
-  MARK_50, RFED_BRANCH, RFED_PRODUCT, changeCheck, planRfedRow, verifyRow, formatPlanTable,
+  MARK_50, RFED_BRANCH, RFED_PRODUCT, changeCheck, planRfedRow, verifyRow, formatPlanTable, buildRfedLeadFields,
 } from './rfed-batch.js';
 import { parsePromoterCatalog } from '../lp-post-issue.js';
 
@@ -33,10 +38,12 @@ function todayEt(nowMs) {
 async function defaults(deps) {
   const out = { ...deps };
   if (!out.supabase) out.supabase = (await import('../supabase.js')).default;
-  if (!out.getLeadByLdsId || !out.getPromoters) {
+  if (!out.getLeadByLdsId || !out.getPromoters || !out.addLead || !out.extractInboundLeadId) {
     const lp = await import('../lp-client.js');
     out.getLeadByLdsId = out.getLeadByLdsId || lp.getLeadByLdsId;
     out.getPromoters = out.getPromoters || (() => lp.getLeadsSourceSubPromoter('p'));
+    out.addLead = out.addLead || lp.addLead;
+    out.extractInboundLeadId = out.extractInboundLeadId || lp.extractInboundLeadId;
   }
   if (!out.ghlFetch) out.ghlFetch = (await import('../actions/helpers.js')).ghlFetch;
   if (!out.checkDnc) out.checkDnc = (await import('../five9-admin.js')).checkDncForNumbers;
@@ -97,7 +104,7 @@ async function waitingInquiry(d, phone, nowMs) {
  * Plan every lead. Never throws for one lead: an unreadable read blocks that row.
  * @returns {{ rows, table, sheet? }}
  */
-export async function planRfedBatch({ ids = MARK_50, sheet = false, deps = {} } = {}) {
+export async function planRfedBatch({ ids = MARK_50, sheet = false, withProspect = false, deps = {} } = {}) {
   const d = await defaults(deps);
   const nowMs = d.now();
   const today = todayEt(nowMs);
@@ -111,6 +118,7 @@ export async function planRfedBatch({ ids = MARK_50, sheet = false, deps = {} } 
   const stored = await readStored(d, ids.map(String));
   const rows = [];
   const sheetRows = [];
+  const prospects = new Map();
   for (const id of ids.map(String)) {
     const s = stored.get(id) || null;
     let live = null;
@@ -146,6 +154,7 @@ export async function planRfedBatch({ ids = MARK_50, sheet = false, deps = {} } 
     });
     row.ghl_contact_id = contactId;
     rows.push(row);
+    if (withProspect && live?.prospect) prospects.set(id, live.prospect);
     if (sheet && row.status === 'ready' && live?.prospect) {
       const p = live.prospect;
       sheetRows.push({
@@ -156,7 +165,7 @@ export async function planRfedBatch({ ids = MARK_50, sheet = false, deps = {} } 
       });
     }
   }
-  return { rows, table: formatPlanTable(rows), ...(sheet ? { sheet: sheetRows } : {}) };
+  return { rows, table: formatPlanTable(rows), ...(sheet ? { sheet: sheetRows } : {}), ...(withProspect ? { prospects } : {}) };
 }
 
 /** Write the approved ready rows to partner_rfed_batch. Only ids in `approvedIds` that plan as ready. */
@@ -215,4 +224,49 @@ export async function verifyRfedBatch({ batchNo = null, deps = {} } = {}) {
     out.push({ ...v, batch_no: b.batch_no, status });
   }
   return { checked: out.length, verified: out.filter((r) => r.done).length, rows: out };
+}
+
+/**
+ * Create the RFED inquiries for approved ids (at most 10 a call). Re-plans first, so a lead
+ * that changed since the table was approved is skipped, not sent. Never re-sends a row that
+ * left 'approved' (a timeout does not mean LP did not take it). Stops on the first failure.
+ */
+export async function createRfedBatch({ ids, batchNo = null, deps = {} } = {}) {
+  if (!Array.isArray(ids) || !ids.length) throw new Error('ids required');
+  if (ids.length > 10) throw new Error('at most 10 ids a call');
+  const d = await defaults(deps);
+  const { rows, prospects } = await planRfedBatch({ ids, withProspect: true, deps: d });
+  const out = [];
+  let stopped = null;
+  for (const r of rows) {
+    if (stopped) { out.push({ id: r.original_lp_lead_id, outcome: 'not_tried', why: `stopped after ${stopped}` }); continue; }
+    if (r.status !== 'ready') { out.push({ id: r.original_lp_lead_id, outcome: 'skipped', why: r.reasons.join(', ') }); continue; }
+    const { data: existing } = await d.supabase.from('partner_rfed_batch').select('id, status, detail')
+      .eq('origin_lp_lead_id', r.original_lp_lead_id).limit(1);
+    const prior = existing?.[0] || null;
+    if (prior && prior.status !== 'approved') { out.push({ id: r.original_lp_lead_id, outcome: 'already_sent', status: prior.status }); continue; }
+    const built = buildRfedLeadFields({ row: r, prospect: prospects.get(r.original_lp_lead_id), contactId: r.ghl_contact_id });
+    if (built.error) { out.push({ id: r.original_lp_lead_id, outcome: 'skipped', why: built.error }); continue; }
+    const claim = {
+      origin_lp_lead_id: r.original_lp_lead_id, lp_prospect_id: r.lp_prospect_id, ghl_contact_id: r.ghl_contact_id,
+      partner_branch: RFED_BRANCH, product: RFED_PRODUCT, source: r.rfed.source, sub_source: r.rfed.sub_source,
+      srs_id: r.rfed.srs_id, promoter: r.rfed.promoter, pro_id: r.rfed.pro_id, status: 'sent_to_lp', batch_no: batchNo,
+      detail: { ...(prior?.detail || {}), sending_at: new Date(d.now()).toISOString() },
+    };
+    const { error: claimErr } = await d.supabase.from('partner_rfed_batch').upsert(claim, { onConflict: 'origin_lp_lead_id' });
+    if (claimErr) { stopped = r.original_lp_lead_id; out.push({ id: r.original_lp_lead_id, outcome: 'failed', why: `claim: ${claimErr.message}` }); continue; }
+    try {
+      const resp = await d.addLead({ ...built.fields, _legacy_only: true, _skip_dupe_check: true });
+      const in1 = d.extractInboundLeadId(resp);
+      await d.supabase.from('partner_rfed_batch').update({ detail: { ...claim.detail, in1_id: in1, path: resp?._path || null, sent_at: new Date(d.now()).toISOString() } })
+        .eq('origin_lp_lead_id', r.original_lp_lead_id);
+      out.push({ id: r.original_lp_lead_id, outcome: 'sent', in1_id: in1, prospect: r.lp_prospect_id });
+    } catch (err) {
+      stopped = r.original_lp_lead_id;
+      await d.supabase.from('partner_rfed_batch').update({ status: 'failed', detail: { ...claim.detail, error: String(err.message).slice(0, 300) } })
+        .eq('origin_lp_lead_id', r.original_lp_lead_id);
+      out.push({ id: r.original_lp_lead_id, outcome: 'failed', why: String(err.message).slice(0, 200) });
+    }
+  }
+  return { sent: out.filter((o) => o.outcome === 'sent').length, stopped_on: stopped, rows: out };
 }
