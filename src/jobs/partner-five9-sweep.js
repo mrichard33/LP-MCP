@@ -7,10 +7,12 @@
 // on the Reece lists at 6 AM ET every day. This pass, every 30 minutes:
 //   1. collects the contacts that may be partner-owned: our open assignments, every
 //      contact in partner_owner_log (60 days), every contact we took off Five9 and have
-//      not released, and HL-mirror contacts carrying a partner's GHL tag (phone-team) or
-//      the S5.2 1 Leg branch's sent:s5.2-1leg-* tags (updated in 45 days);
-//   2. reads each contact's LIVE GHL owner (the mirror holds no owner column);
-//   3. partner owner → ensurePartnerFive9Removal (once per removal day and mode, so the
+//      not released, every contact our tag snapshot (contact_tag_snapshot) shows with a
+//      partner's GHL tag (phone-team: the trigger, the user 2026-10-22), and HL-mirror
+//      contacts carrying that tag or the S5.2 1 Leg branch's sent:s5.2-1leg-* tags
+//      (updated in 45 days);
+//   2. reads each contact live (owner and tags; the mirror holds no owner column);
+//   3. the partner tag or a partner owner → ensurePartnerFive9Removal (once per removal day and mode, so the
 //      first pass after each 6 AM load removes them again), plus the "set by GHL" card
 //      when no assignment of ours explains it; not a partner any more after a removal
 //      of ours → releasePartnerFive9;
@@ -25,7 +27,7 @@ import { runJob } from '../job-runner.js';
 import { partnerSyncConfig, postGhlSetCard } from '../partners/owner-sync.js';
 import { loadPartnerMap } from '../partners/owner-resolver.js';
 import {
-  partnerFive9Mode, ensurePartnerFive9Removal, releasePartnerFive9, settleRecentGroups, latestRow,
+  partnerFive9Mode, ensurePartnerFive9Removal, releasePartnerFive9, settleRecentGroups, partnerFor,
 } from '../partners/five9-removal.js';
 
 export const JOB_ID = 'partner-five9-sweep';
@@ -76,6 +78,13 @@ async function candidateIds(d, map, nowMs) {
     if (error) throw new Error(error.message);
     for (const r of data || []) add(r.ghl_contact_id, 'owner_log');
   } catch (err) { errors.push(`partner_owner_log: ${err.message}`); }
+  for (const tag of [...new Set(map.map((r) => String(r.ghl_tag || '').trim().toLowerCase()).filter(Boolean))]) {
+    try {
+      const { data, error } = await d.supabase.from('contact_tag_snapshot').select('ghl_contact_id').contains('tags', [tag]).limit(2000);
+      if (error) throw new Error(error.message);
+      for (const r of data || []) add(r.ghl_contact_id, 'tag_snapshot');
+    } catch (err) { errors.push(`contact_tag_snapshot: ${err.message}`); }
+  }
   try {
     const rows = await d.hlRunSQL(buildMirrorSql(map.map((r) => r.ghl_tag), nowMs));
     for (const r of rows || []) add(r.ghl_contact_id, 'hl_mirror');
@@ -132,10 +141,11 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false } = {}) {
       continue; // could not tell: nothing removed, nothing released
     }
     const owner = String(contact.assignedTo || '');
-    if (!partnerIds.has(owner)) {
+    const hit = partnerFor(contact, map);
+    if (!hit) {
       notPartnerMemo.set(c.id, nowMs);
       if (c.source === 'removed') {
-        const r = await releasePartnerFive9({ contactId: c.id, trigger: 'sweep_not_partner', dryRun, deps: fdeps });
+        const r = await releasePartnerFive9({ contactId: c.id, contact, partnerRows: map, trigger: 'sweep_not_partner', dryRun, deps: fdeps });
         if (r.outcome === 'released' || r.outcome === 'would_release') counts.released++;
         contacts.push({ contact_id: c.id, owner: owner || null, five9: r.outcome });
       }
@@ -143,9 +153,10 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false } = {}) {
     }
     notPartnerMemo.delete(c.id);
     counts.partner_owned++;
-    const partnerName = nameOf(owner);
+    const partnerName = hit.row.partner_name || nameOf(owner);
     let card = null;
-    if (!dryRun) {
+    // The "set by GHL" card is about the OWNER: a tag alone (GHL has not reassigned yet) posts none.
+    if (!dryRun && partnerIds.has(owner)) {
       const { data: assignment } = await d.supabase.from('partner_owner_assignments').select('ghl_user_id')
         .eq('ghl_contact_id', c.id).is('released_at', null).maybeSingle();
       if (!assignment || String(assignment.ghl_user_id) !== owner) {
@@ -154,12 +165,12 @@ export async function runPartnerFive9Sweep(deps = {}, { dryRun = false } = {}) {
       }
     }
     const r = await ensurePartnerFive9Removal({
-      contactId: c.id, contact, partnerUserIds: partnerIds, partnerName, trigger: 'sweep', dryRun, deps: fdeps,
+      contactId: c.id, contact, partnerRows: map, partnerName, trigger: 'sweep', dryRun, deps: fdeps,
     });
     counts.removals[r.outcome] = (counts.removals[r.outcome] || 0) + 1;
     if (r.error && errors.length < 10) errors.push(`five9 ${c.id}: ${r.error}`);
     contacts.push({
-      contact_id: c.id, source: c.source, partner: partnerName, five9: r.outcome,
+      contact_id: c.id, source: c.source, partner: partnerName, via: hit.via, five9: r.outcome,
       ...(r.lists ? { would_leave: r.lists, phones: r.phones } : {}), ...(card?.posted ? { ghl_set_card: true } : {}),
     });
   }

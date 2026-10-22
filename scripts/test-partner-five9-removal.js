@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { fakeSupabase } from './lib/fake-supabase.js';
 import {
   partnerFive9Mode, removalDay, phonesOf, planRemovalRows, ensurePartnerFive9Removal, releasePartnerFive9,
-  settleRecentGroups, summarizeGroup, RULE,
+  settleRecentGroups, summarizeGroup, RULE, partnerFor, partnerTagTrigger,
 } from '../src/partners/five9-removal.js';
 import { runPartnerFive9Sweep, buildMirrorSql, __resetForTests } from '../src/jobs/partner-five9-sweep.js';
 import { clearCache } from '../src/partners/owner-resolver.js';
@@ -152,6 +152,9 @@ test('release: a returned lead stops being removed and its queued rows are skipp
   const w = world({ mode: 'enforce' });
   await ensurePartnerFive9Removal({ contactId: C1, partnerUserId: ROSS, deps: w.deps });
   w.deps.now = () => NOW + 60_000; // the release is written after the removal
+  // Still Ross's → nothing released.
+  assert.equal((await releasePartnerFive9({ contactId: C1, trigger: 'returned', deps: w.deps })).outcome, 'still_partner');
+  w.contacts.get(C1).assignedTo = REECE;
   const r = await releasePartnerFive9({ contactId: C1, trigger: 'returned', deps: w.deps });
   assert.equal(r.outcome, 'released');
   assert.equal(r.cancelled_rows, 4);
@@ -238,4 +241,54 @@ test('the executor runs a partner removal unarmed only while the mode is enforce
   const src = (await import('node:fs')).readFileSync(new URL('../src/actions/handlers/five9.js', import.meta.url), 'utf8');
   assert.match(src, /PARTNER_REMOVAL_RULE_KEY = 'PARTNER_FIVE9_REMOVAL'/);
   assert.match(src, /rule_applied === PARTNER_REMOVAL_RULE_KEY\) \{\s*return String\(process\.env\.PARTNER_FIVE9_REMOVAL_MODE \|\| ''\)\.trim\(\)\.toLowerCase\(\) === 'enforce';/);
+});
+
+// ── The tag is the trigger (the user, 2026-10-22) ────────────────────────────
+
+test('partnerFor: a partner owner, or the partner tag (any case), or nothing', () => {
+  assert.equal(partnerFor({ assignedTo: ROSS, tags: [] }, MAP).via, 'owner');
+  assert.equal(partnerFor({ assignedTo: REECE, tags: ['Phone-Team'] }, MAP).via, 'tag');
+  assert.equal(partnerFor({ assignedTo: REECE, tags: ['phone'] }, MAP), null);
+});
+
+test('the phone-team tag alone takes the contact off the lists (owner not changed yet)', async () => {
+  const w = world({ mode: 'log', owner: REECE });
+  w.contacts.get(C1).tags = ['phone-team'];
+  const r = await ensurePartnerFive9Removal({ contactId: C1, trigger: 'tag_added', deps: w.deps });
+  assert.equal(r.outcome, 'logged');
+  assert.equal(r.via, 'tag');
+  assert.equal(rows(w, 'partner_five9_removals')[0].ghl_user_id, ROSS);
+});
+
+test('a release waits while the tag is still on, even with a Reece owner', async () => {
+  const w = world({ mode: 'enforce', owner: REECE });
+  w.contacts.get(C1).tags = ['phone-team'];
+  await ensurePartnerFive9Removal({ contactId: C1, deps: w.deps });
+  w.deps.now = () => NOW + 60_000;
+  assert.equal((await releasePartnerFive9({ contactId: C1, deps: w.deps })).outcome, 'still_partner');
+  w.contacts.get(C1).tags = [];
+  assert.equal((await releasePartnerFive9({ contactId: C1, deps: w.deps })).outcome, 'released');
+});
+
+test('tag trigger: phone-team added → removal; removed → release; other tags and the sync off → nothing', async () => {
+  const w = world({ mode: 'log', owner: REECE });
+  w.contacts.get(C1).tags = ['phone-team'];
+  assert.equal((await partnerTagTrigger({ contactId: C1, added: ['phone-team'], deps: w.deps })).outcome, 'logged');
+  assert.equal((await partnerTagTrigger({ contactId: C1, added: ['active-s5.2'], deps: w.deps })).outcome, 'no_partner_tag');
+  w.contacts.get(C1).tags = [];
+  w.deps.now = () => NOW + 60_000;
+  assert.equal((await partnerTagTrigger({ contactId: C1, removed: ['phone-team'], deps: w.deps })).outcome, 'released');
+  const off = await partnerTagTrigger({ contactId: C1, added: ['phone-team'], deps: { ...w.deps, env: { ...w.deps.env, PARTNER_GO_LIVE_AT: '' } } });
+  assert.equal(off.outcome, 'partner_sync_off');
+  const modeOff = await partnerTagTrigger({ contactId: C1, added: ['phone-team'], deps: { ...w.deps, env: baseEnv('off') } });
+  assert.equal(modeOff.outcome, 'off');
+});
+
+test('sweep: a contact our tag snapshot shows with phone-team is found and removed (no "set by GHL" card for a tag alone)', async () => {
+  const w = world({ mode: 'log', owner: REECE, seed: { contact_tag_snapshot: [{ ghl_contact_id: C1, tags: ['phone-team', 'active-s5.2'] }] } });
+  w.contacts.get(C1).tags = ['phone-team'];
+  const r = await runPartnerFive9Sweep(w.deps);
+  assert.equal(r.removals.logged, 1);
+  assert.equal(r.contacts[0].via, 'tag');
+  assert.equal(w.slack.length, 0);
 });

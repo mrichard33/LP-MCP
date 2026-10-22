@@ -9,6 +9,14 @@
 //      which it never moves), found by owner-sync or by the sweep
 //      (src/jobs/partner-five9-sweep.js), which reads the contact's live owner.
 //
+// THE TRIGGER (the user, 2026-10-22): "When a lead gets tagged phone team then it should
+// be removed from all Five9 dialing list." The partner's GHL tag (partner_owner_map.ghl_tag,
+// Ross → phone-team) is the trigger: the tag processor (src/ghl-tag-handler.js →
+// partnerTagTrigger) runs the removal the moment the tag lands and a release when it
+// comes off. A partner OWNER still qualifies as a backup: on 2026-10-22 the three known
+// Ross 1 Leg contacts were Ross's in GHL with no phone-team tag, and adding the tag
+// ourselves would fire U.RFED's customer SMS and email. A release needs both gone.
+//
 // WHAT IT DOES: every phone on the contact (GHL phone + additional phones + every
 // lp_leads phone / phone_alt) comes off every outbound list in Five9's LIVE inventory
 // except Sale / Rehash / Inbound Queue (the disqualified set, disqualifiedTargetLists),
@@ -39,6 +47,7 @@
 import { disqualifiedTargetLists } from '../actions/handlers/disqualified-cleanup.js';
 import { MAX_DELETE_LISTS_PER_ACTION } from '../five9/admin-writes.js';
 import { prospectLabel, slackPhone } from '../format-helpers.js';
+import { loadPartnerMap } from './owner-resolver.js';
 
 export const RULE = 'PARTNER_FIVE9_REMOVAL';
 export const AUDIT = 'partner_five9';
@@ -48,6 +57,24 @@ export const DAY_ROLLOVER_MS = (6 * 60 + 20) * 60 * 1000;
 const PENDING_STATUSES = ['pending', 'pending_approval', 'approved'];
 
 const digits10 = (p) => String(p || '').replace(/\D/g, '').slice(-10);
+const normTag = (t) => String(t ?? '').trim().toLowerCase();
+
+/** Pure: the partner map row a contact belongs to, by its partner owner first, then by a partner tag; or null. */
+export function partnerFor(contact, rows) {
+  const active = (rows || []).filter((r) => r && r.ghl_user_id);
+  const owner = String(contact?.assignedTo || '');
+  const byOwner = owner && active.find((r) => String(r.ghl_user_id) === owner);
+  if (byOwner) return { row: byOwner, via: 'owner' };
+  const tags = new Set((contact?.tags || []).map(normTag));
+  const byTag = active.find((r) => r.ghl_tag && tags.has(normTag(r.ghl_tag)));
+  return byTag ? { row: byTag, via: 'tag' } : null;
+}
+
+/** Pure: the partner tags in a list of (normalized) tags. */
+export function partnerTagsIn(tags, rows) {
+  const wanted = new Set((rows || []).map((r) => normTag(r?.ghl_tag)).filter(Boolean));
+  return (tags || []).map(normTag).filter((t) => wanted.has(t));
+}
 
 /** off | log | enforce; anything unknown is log (records only). Pure. */
 export function partnerFive9Mode(env = process.env) {
@@ -154,7 +181,8 @@ export async function latestRow(supabase, contactId) {
 
 /**
  * Take a partner-owned contact off every Reece Five9 list (once per removal day and mode).
- * opts: { contactId, contact?, partnerUserId?, partnerName?, partnerUserIds?: Set, trigger, dryRun, deps }
+ * opts: { contactId, contact?, partnerRows?, partnerName?, trigger, dryRun, deps }
+ * Qualifies by a partner owner OR the partner's GHL tag (partnerFor).
  * Returns { ok, outcome, ... } — never throws.
  */
 export async function ensurePartnerFive9Removal(opts = {}) {
@@ -172,8 +200,11 @@ export async function ensurePartnerFive9Removal(opts = {}) {
     if (!contact) contact = (await d.ghlFetch('GET', `/contacts/${contactId}`))?.contact;
     if (!contact) throw new Error(`contact ${contactId} not found in GHL`);
     const owner = String(contact.assignedTo || '');
-    const partnerIds = opts.partnerUserIds || new Set([opts.partnerUserId].filter(Boolean));
-    if (!owner || !partnerIds.has(owner)) return { ok: true, outcome: 'not_partner_owned', owner: owner || null };
+    const rows = opts.partnerRows || await loadPartnerMap(d);
+    const hit = partnerFor(contact, rows);
+    if (!hit) return { ok: true, outcome: 'not_partner_owned', owner: owner || null };
+    const partnerUser = String(hit.row.ghl_user_id);
+    const partnerName = opts.partnerName || hit.row.partner_name || null;
 
     if (!dryRun) {
       const { data: done, error } = await d.supabase.from('partner_five9_removals').select('id')
@@ -196,10 +227,10 @@ export async function ensurePartnerFive9Removal(opts = {}) {
 
     // The claim is written BEFORE anything is queued (a unique index backs it).
     const { error: claimErr } = await d.supabase.from('partner_five9_removals').insert({
-      ghl_contact_id: String(contactId), ghl_user_id: owner, partner_name: opts.partnerName || null,
+      ghl_contact_id: String(contactId), ghl_user_id: partnerUser, partner_name: partnerName,
       action: 'remove', mode, trigger, removal_day: day, phones, lists, group_key: mode === 'enforce' ? group : null,
       lp_lead_id: lead?.lp_lead_id ? String(lead.lp_lead_id) : null, // lead-id-ok: machine value in our own table
-      detail: { list_count: lists.length },
+      detail: { list_count: lists.length, via: hit.via },
       created_at: new Date(d.now()).toISOString(),
     });
     if (claimErr) {
@@ -207,19 +238,19 @@ export async function ensurePartnerFive9Removal(opts = {}) {
       throw new Error(`partner_five9_removals claim failed: ${claimErr.message}`);
     }
     if (mode === 'log') {
-      d.log(`[PartnerFive9] log: ${contactId} (${opts.partnerName || owner}) would leave ${lists.length} list(s) for ${phones.length} phone(s)`);
-      return { ok: true, outcome: 'logged', mode, ...plan };
+      d.log(`[PartnerFive9] log: ${contactId} (${partnerName || partnerUser}, by ${hit.via}) would leave ${lists.length} list(s) for ${phones.length} phone(s)`);
+      return { ok: true, outcome: 'logged', mode, via: hit.via, ...plan };
     }
-    const rows = planRemovalRows({ contactId, phones, lists, partnerName: opts.partnerName, group, lead, nowMs: d.now() });
-    const { error: insErr } = await d.supabase.from('agent_actions').insert(rows);
+    const actionRows = planRemovalRows({ contactId, phones, lists, partnerName, group, lead, nowMs: d.now() });
+    const { error: insErr } = await d.supabase.from('agent_actions').insert(actionRows);
     if (insErr) {
       // Release the claim so the next pass tries again, and say so now.
       await d.supabase.from('partner_five9_removals').delete()
         .eq('ghl_contact_id', String(contactId)).eq('action', 'remove').eq('mode', mode).eq('removal_day', day);
       throw new Error(`agent_actions insert failed: ${insErr.message}`);
     }
-    d.log(`[PartnerFive9] enforce: ${contactId} (${opts.partnerName || owner}) queued ${rows.length} removal row(s), ${phones.length} phone(s) × ${lists.length} list(s)`);
-    return { ok: true, outcome: 'queued', mode, rows_queued: rows.length, ...plan };
+    d.log(`[PartnerFive9] enforce: ${contactId} (${partnerName || partnerUser}, by ${hit.via}) queued ${actionRows.length} removal row(s), ${phones.length} phone(s) × ${lists.length} list(s)`);
+    return { ok: true, outcome: 'queued', mode, via: hit.via, rows_queued: actionRows.length, ...plan };
   } catch (err) {
     d.log(`[PartnerFive9] ${contactId}: ${err.message}`);
     const card = mode === 'enforce' && !dryRun
@@ -241,6 +272,12 @@ export async function releasePartnerFive9(opts = {}) {
   try {
     const last = await latestRow(d.supabase, contactId);
     if (!last || last.action !== 'remove') return { ok: true, outcome: 'nothing_to_release' };
+    // Released only when neither the partner tag nor a partner owner remains (read live;
+    // a failed read releases nothing).
+    const contact = opts.contact || (await d.ghlFetch('GET', `/contacts/${contactId}`))?.contact;
+    if (!contact) throw new Error(`contact ${contactId} not found in GHL`);
+    const still = partnerFor(contact, opts.partnerRows || await loadPartnerMap(d));
+    if (still) return { ok: true, outcome: 'still_partner', via: still.via };
     if (dryRun) return { ok: true, outcome: 'would_release' };
     const { data: cancelled, error: cErr } = await d.supabase.from('agent_actions')
       .update({ status: 'skipped', execution_result: { skipped: true, reason: 'partner_returned_to_reece' } })
@@ -310,4 +347,31 @@ export async function settleRecentGroups({ deps = {}, sinceMs = 2 * 24 * 60 * 60
     }
   }
   return out;
+}
+
+/**
+ * The tag trigger (the user, 2026-10-22), called by the tag processor with the diff it
+ * computed. A partner tag added → the removal now; one removed → the release (which
+ * still holds while a partner owns the contact). Never throws. Off with the partner
+ * sync off or the mode off, so the processor's own tests never reach Five9.
+ */
+export async function partnerTagTrigger({ contactId, added = [], removed = [], deps = {} } = {}) {
+  try {
+    const env = deps.env || process.env;
+    if (partnerFive9Mode(env) === 'off') return { outcome: 'off' };
+    const { partnerSyncConfig } = await import('./owner-sync.js');
+    if (!partnerSyncConfig(env).enabled) return { outcome: 'partner_sync_off' };
+    const d = await defaultDeps(deps);
+    const rows = await loadPartnerMap(d);
+    if (partnerTagsIn(added, rows).length) {
+      return await ensurePartnerFive9Removal({ contactId, partnerRows: rows, trigger: 'tag_added', deps: d });
+    }
+    if (partnerTagsIn(removed, rows).length) {
+      return await releasePartnerFive9({ contactId, partnerRows: rows, trigger: 'tag_removed', deps: d });
+    }
+    return { outcome: 'no_partner_tag' };
+  } catch (err) {
+    console.warn(`[PartnerFive9] tag trigger for ${contactId}: ${err.message}`);
+    return { outcome: 'error', error: err.message };
+  }
 }

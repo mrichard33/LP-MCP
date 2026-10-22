@@ -116,7 +116,12 @@ export function fakeSupabase(seed = {}, { rpc = {}, files = {} } = {}) {
       is(c, v) { q.filters.push((r) => r[c] == v); return chain; },
       not(c, op, v) { q.filters.push((r) => (op === 'is' ? r[c] != v : r[c] !== v)); return chain; },
       // 2026-10-22: shallow jsonb containment, enough for .contains('action_payload', { group }).
-      contains(c, obj) { q.filters.push((r) => Object.entries(obj).every(([k, v]) => r[c]?.[k] === v)); return chain; },
+      contains(c, obj) {
+        q.filters.push(Array.isArray(obj)
+          ? (r) => Array.isArray(r[c]) && obj.every((v) => r[c].includes(v))
+          : (r) => Object.entries(obj).every(([k, v]) => r[c]?.[k] === v));
+        return chain;
+      },
       like(c, pat) { const rx = new RegExp('^' + String(pat).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*') + '$'); q.filters.push((r) => rx.test(String(r[c] ?? ''))); return chain; },
       order(c, o) { q.order = [c, o?.ascending !== false]; return chain; },
       limit(n) { q.limit = n; return chain; },

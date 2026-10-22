@@ -492,7 +492,7 @@ async function decideAndApply(d, cfg, lead, prevRow, dryRun) {
       const r = trigger === 'returned'
         ? await d.partnerFive9.releasePartnerFive9({ contactId: lead.ghl_contact_id, trigger, deps: fdeps })
         : await d.partnerFive9.ensurePartnerFive9Removal({
-          contactId: lead.ghl_contact_id, contact: contactNow, partnerUserIds: partnerIds, partnerName, trigger, deps: fdeps,
+          contactId: lead.ghl_contact_id, contact: contactNow, partnerRows: rows, partnerName, trigger, deps: fdeps,
         });
       return r && { outcome: r.outcome, ...(r.mode ? { mode: r.mode } : {}), ...(r.rows_queued ? { rows_queued: r.rows_queued } : {}),
         ...(r.lists ? { list_count: r.lists.length } : {}), ...(r.error ? { error: r.error } : {}) };
