@@ -350,6 +350,19 @@ test('an owner who rents the home out is never turned away (landlord_lead, live 
   }
 });
 
+test('an owner never gets the old renter script (landlord_lead, live chat, after #1427, 2026-10-22)', async () => {
+  const { TENANT_LINE } = await import('../src/agentic/non-owner.js');
+  const LIVE = "Got it. Our estimates are for homeowners since the work involves permanent improvements to the structure. If you own a home in the future, feel free to reach back out. What's bothering you most about your windows or doors right now?";
+  const landlord = 'Hi, I need new windows on a house I rent out to tenants';
+  const r = J.enforceJobScope(LIVE, { thread: [], inbound: landlord });
+  assert.equal(r.text, "Got it. We work with homeowners, and that includes homes you rent out. What's bothering you most about your windows or doors right now?");
+  assert.match(r.reason, /owner_redirected/);
+  // A tenant gets that script for real, and nothing known keeps it too.
+  assert.equal(J.enforceJobScope(LIVE, { thread: [], inbound: 'I rent this place from my landlord' }).changed, false);
+  assert.equal(J.enforceJobScope(LIVE, {}).changed, false);
+  assert.equal(J.enforceJobScope(TENANT_LINE, { inbound: landlord }).changed, false);
+});
+
 test('an owner is never sent to "the owner" (landlord_lead, live chat, after #1426, 2026-10-22)', async () => {
   const { TENANT_LINE, NON_OWNER_LINE } = await import('../src/agentic/non-owner.js');
   const LIVE = "Got it. We work with homeowners on their own properties. Since you're renting this out to tenants, you'd need to have the owner reach out to us directly. If that changes or you own another home, feel free to come back. What's bothering you most about your windows or doors right now?";

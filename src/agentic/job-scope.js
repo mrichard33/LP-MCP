@@ -393,8 +393,11 @@ const CLAIMS = [
     // homeowners on their own properties. Since you're renting this out to tenants, you'd need to have the owner reach
     // out to us directly. If that changes or you own another home, feel free to come back." This is the non-owner
     // turn-away (NON_OWNER_LINE) aimed at someone who owns the home, so it runs only when the lead's own words say they
-    // own it (homeownerFromThread 'yes': "a house I rent out", "my tenants").
-    rx: /\b(?:have|get|ask)\s+the\s+(?:home\s*|property\s*)?owners?\b|\bown\s+another\s+(?:home|house|property)\b|\b(?:their|your)\s+own\s+(?:propert(?:y|ies)|homes?|houses?)\b/i,
+    // own it (homeownerFromThread 'yes': "a house I rent out", "my tenants"). The next day (#1427 live) it copied the old
+    // renter script still in kb_embeddings 3275: "Our estimates are for homeowners since the work involves permanent
+    // improvements ... If you own a home in the future, feel free to reach back out." That text is fixed at the source
+    // (sql/seeds/2026-10-22_kb_embeddings_owners_of_rentals.sql); these two shapes are the backstop.
+    rx: /\b(?:have|get|ask)\s+the\s+(?:home\s*|property\s*)?owners?\b|\bown\s+another\s+(?:home|house|property)\b|\b(?:their|your)\s+own\s+(?:propert(?:y|ies)|homes?|houses?)\b|\bif\s+you\s+(?:ever\s+)?(?:purchase|buy|own)\s+a\s+(?:home|house)\b|\b(?:estimates?|visits?|assessments?|services?)\s+(?:are|is)\s+(?:designed\s+|only\s+|meant\s+|built\s+)?for\s+(?:homeowners|owner[\s-]occupied)\b/i,
     line: 'We work with homeowners, and that includes homes you rent out.',
     negated: true,
     ownerOnly: true,
