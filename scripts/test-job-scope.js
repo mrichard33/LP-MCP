@@ -326,3 +326,26 @@ test('a count after the noun is the count (live dry run, 2026-10-15)', () => {
   // Under the minimum still gets the one friendly check.
   assert.equal(J.jobScopeFromThread([], 'I need windows, just 1 of them').check, true);
 });
+
+test('an owner who rents the home out is never turned away (landlord_lead, live chat, 2026-10-22)', async () => {
+  const { TENANT_LINE, NON_OWNER_LINE } = await import('../src/agentic/non-owner.js');
+  const LIVE = "Got it. We work with homeowners on their primary residences. Since you're renting this out, it wouldn't be the right fit for us. If you own a home you live in, we'd be happy to help.";
+  const landlord = 'Hi, I need new windows on a house I rent out to tenants';
+  const r = J.enforceJobScope(LIVE, { thread: [], inbound: landlord });
+  assert.equal(r.changed, true);
+  assert.equal(r.text, 'Got it. We work with homeowners, and that includes homes you rent out.');
+  assert.doesNotMatch(r.text, /primary|right fit|live in/i);
+  assert.match(r.reason, /owner_rental_declined/);
+  for (const d of ["We don't work on investment properties.", 'Unfortunately, rentals aren’t a good fit for us.', "Sorry, we can't take on flips."]) {
+    assert.equal(J.enforceJobScope(d, {}).text, 'We work with homeowners, and that includes homes you rent out.', d);
+  }
+  // A tenant (or a property manager) is the real turn-away: never rewritten.
+  assert.equal(J.enforceJobScope(LIVE, { thread: [], inbound: 'I rent this place and my landlord will not fix the windows' }).changed, false);
+  assert.equal(J.enforceJobScope(LIVE, { thread: [], inbound: "I'm the property manager for the building owner" }).changed, false);
+  // Our own lines and ordinary replies are fixed points.
+  for (const l of [TENANT_LINE, NON_OWNER_LINE, J.COMMERCIAL_LINE, J.BELOW_MINIMUM_LINE, 'Do you own the home?',
+    'Happy to help with the rental. How many windows and doors are you looking to get a quote on?',
+    "We don't need the landlord there, just you. How many windows?"]) {
+    assert.equal(J.enforceJobScope(l, {}).changed, false, l);
+  }
+});
