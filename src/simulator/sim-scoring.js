@@ -45,7 +45,9 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // scenario name (reschedule_unclear).
 // 2026-10-22.1: owner_declined also reads "primary residence", "not the right fit" and "a home you live in" (the
 // live chat turned landlord_lead away in words the old check missed).
-export const SCORING_VERSION = '2026-10-22.1';
+// 2026-10-22.2: owner_declined also reads "have the owner reach out", "own another home" and "their own properties"
+// (the same chat, the next day's wording, after .1 went live).
+export const SCORING_VERSION = '2026-10-22.2';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -84,7 +86,7 @@ function declinedNotBooked(r, saidRx, what) {
 
 // An owner of a rental or an investment home is a lead (the user, 2026-10-20).
 // 2026-10-22: also the live chat's "primary residences … it wouldn't be the right fit … a home you live in".
-const OWNER_DECLINED_RX = /\b(?:don'?t|do\s+not|can'?t|cannot|not\s+able\s+to)\b[^.!?]*\b(?:rentals?|investments?|flip(?:s|ping|pers?)?|landlords?|rent(?:ed)?\s+out)\b|\bonly\s+work\s+with\s+homeowners\b|\bprimary\s+(?:residences?|homes?)\b|(?:\bnot|n['’]t)\s+(?:be\s+)?(?:a\s+|the\s+)?(?:right|good)\s+fit\b|\bhomes?\s+you\s+(?:actually\s+)?live\s+in\b/i;
+const OWNER_DECLINED_RX = /\b(?:don'?t|do\s+not|can'?t|cannot|not\s+able\s+to)\b[^.!?]*\b(?:rentals?|investments?|flip(?:s|ping|pers?)?|landlords?|rent(?:ed)?\s+out)\b|\bonly\s+work\s+with\s+homeowners\b|\bprimary\s+(?:residences?|homes?)\b|(?:\bnot|n['’]t)\s+(?:be\s+)?(?:a\s+|the\s+)?(?:right|good)\s+fit\b|\bhomes?\s+you\s+(?:actually\s+)?live\s+in\b|\b(?:have|get|ask)\s+the\s+(?:home\s*|property\s*)?owners?\b|\bown\s+another\s+(?:home|house|property)\b|\b(?:their|your)\s+own\s+(?:propert(?:y|ies)|homes?|houses?)\b/i;
 function ownerNotDeclined(r, who) {
   const no = allReplies(r).find(x => OWNER_DECLINED_RX.test(x.text));
   return no ? [{ code: 'owner_declined', detail: `a ${who} (an owner) was turned away: ${no.text}`, turn: no.turn }] : [];

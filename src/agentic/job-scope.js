@@ -387,13 +387,25 @@ const CLAIMS = [
     negated: true,
     skipForTenant: true,
   },
+  {
+    key: 'owner_redirected',
+    // 2026-10-22 (landlord_lead, live chat, after #1426 went live): the model sent the OWNER to the owner: "We work with
+    // homeowners on their own properties. Since you're renting this out to tenants, you'd need to have the owner reach
+    // out to us directly. If that changes or you own another home, feel free to come back." This is the non-owner
+    // turn-away (NON_OWNER_LINE) aimed at someone who owns the home, so it runs only when the lead's own words say they
+    // own it (homeownerFromThread 'yes': "a house I rent out", "my tenants").
+    rx: /\b(?:have|get|ask)\s+the\s+(?:home\s*|property\s*)?owners?\b|\bown\s+another\s+(?:home|house|property)\b|\b(?:their|your)\s+own\s+(?:propert(?:y|ies)|homes?|houses?)\b/i,
+    line: 'We work with homeowners, and that includes homes you rent out.',
+    negated: true,
+    ownerOnly: true,
+  },
 ];
 
-function fixClaims(text, { tenant = false } = {}) {
+function fixClaims(text, { tenant = false, owner = false } = {}) {
   const reasons = [];
   const parts = String(text || '').match(/[^.!?]+(?:[.!?]+|$)\s*/g) || [];
   const fixed = parts.map(s => {
-    const rule = CLAIMS.find(r => !(tenant && r.skipForTenant) && r.rx.test(s) && (r.negated || !NEGATION_RX.test(s)));
+    const rule = CLAIMS.find(r => !(tenant && r.skipForTenant) && !(r.ownerOnly && !owner) && r.rx.test(s) && (r.negated || !NEGATION_RX.test(s)));
     if (!rule) return s;
     reasons.push(rule.key);
     return rule.line + (/\s$/.test(s) ? ' ' : '');
@@ -415,7 +427,9 @@ const VISIT_OFFER_RX = /\b(?:I\s+have\b[^.?!]*\bor\b|hold(?:ing)?\s+(?:a\s+time|
 export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
   const original = String(draft || '');
   const scope = jobScopeFromThread(thread, inbound);
-  const tenant = homeownerFromThread([...(Array.isArray(thread) ? thread : []), { direction: 'inbound', text: inbound }]) === 'no';
+  const ownership = homeownerFromThread([...(Array.isArray(thread) ? thread : []), { direction: 'inbound', text: inbound }]);
+  const tenant = ownership === 'no';
+  const owner = ownership === 'yes';
 
   if (scope.block) {
     const line = LINE_FOR[scope.block];
@@ -423,7 +437,7 @@ export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
     if (scope.now) return { text: line, changed: true, reason: `${scope.block}:said_now`, block: scope.block };
     const asks = new Set(findBookingAsks(original));
     const kept = sentences(original).filter(s => !asks.has(s) && !CLOCK_RX.test(s) && !VISIT_OFFER_RX.test(s)).join(' ').trim();
-    const claims = fixClaims(kept, { tenant });
+    const claims = fixClaims(kept, { tenant, owner });
     const out = claims.text;
     if (out === original.trim()) return { text: original, changed: false, reason: null, block: scope.block };
     return { text: out || line, changed: true, reason: out ? `${scope.block}:visit_offer_dropped` : `${scope.block}:said_earlier`, block: scope.block };
@@ -435,7 +449,7 @@ export function enforceJobScope(draft, { thread = [], inbound = '' } = {}) {
     return { text: scope.doors ? MINIMUM_CHECK_DOORS_LINE : MINIMUM_CHECK_LINE, changed: true, reason: 'minimum_check', block: 'minimum_check' };
   }
 
-  const claims = fixClaims(original, { tenant });
+  const claims = fixClaims(original, { tenant, owner });
   if (claims.reasons.length) return { text: claims.text, changed: true, reason: claims.reasons.join(','), block: null };
   return { text: original, changed: false, reason: null, block: null };
 }
