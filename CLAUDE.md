@@ -923,6 +923,11 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   footer / address / unsubscribe line, a sensitive detail, a quote of the rep or Siro's draft copied. No signature (the
   template signs) and the thank-you opener is allowed. One re-write, then `suppressed_low_conf`: a quiet exit to
   position 1, never a fixed email.
+- **The greeting name is cleaned, never the raw field (2026-10-22).** The live preview opened "Hi A," because GHL's
+  first name was "a" (LP: "AJ / Anita") and any non-empty GHL name won. `greetingName` (`f0-context.js`): a couple's first
+  person, a first word under two letters is no name (then LP's lead, then none), two or three typed capitals stay ("AJ");
+  `applyGreetingName` puts the result (even '') in `{{lead.first_name}}` for the email and Four-Step texts, in the
+  orchestrator and the preview alike. A misspelled GHL name ("gorge") is a data fix in GHL, not a guess in code.
 - **The rehash rep is the follower, for every F.0 touch**: `resolveRehashRepFirst` (`f0-context.js`): `rehashRepFor`
   (2026-10-15) → `REHASH_TEAM_USER_NAMES` / the GHL user, else the `rehash_rep_name` custom value, else "Reece Team".
 - **`F0_EMAIL_MODE` off|shadow|live, default shadow, decides the email ALONE** (the user, 2026-10-21: the email and the

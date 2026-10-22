@@ -149,7 +149,7 @@ import { buildInputSnapshot } from '../bot-feedback/fingerprint-core.js';
 import { slackPhone, prospectLabel } from '../format-helpers.js';
 // 2026-10-16 (Siro PR 1) — F.0 v2: the post-demo sequence written from the
 // Siro visit, as the rehash rep, through this same orchestrator.
-import { loadF0Context } from '../siro/f0-context.js';
+import { loadF0Context, applyGreetingName } from '../siro/f0-context.js';
 import { postDemoInterrupt } from '../siro/f0-interrupts.js';
 import { checkF0Copy, f0RetryNote } from '../siro/f0-copy-checks.js';
 import { parseFourStepOutput, dropTrailingSignature, FOUR_STEP_WAIT_HOURS } from '../siro/f0-four-step.js';
@@ -269,9 +269,8 @@ export async function runNurtureGeneration(request) {
     context.nurture_request = { workflow_code: request.workflow_code, sequence_position: request.sequence_position };
     // 2026-10-20: the Four-Step prompt reads {{lead.first_name}}; a couple's
     // field ("George/Paula") left it empty and the model guessed "Gorge".
-    if ((f0.vars.formula === 'four_step' || isF0Email) && !context.lead?.first_name && f0.vars.first_name) {
-      context.lead = { ...(context.lead || {}), first_name: f0.vars.first_name };
-    }
+    // 2026-10-22: and a lone initial ("a") is replaced too, by LP's name or none.
+    applyGreetingName(context, f0, { fourStep: f0.vars.formula === 'four_step', email: isF0Email });
     await stampSiroRecording(generation_id, f0.recordingId);
     let pd = request.force_send !== true ? postDemoInterrupt(f0.interruptInput) : null;
     // The email is never written without the recording, force_send included:
@@ -590,7 +589,7 @@ function runOutputChecks(output, prompt, context, f0, request) {
         repFirstName: f0.vars?.rehash_rep_first_name || null,
         formula,
         slots: output?.four_step_slots || null,
-        firstName: ((fourStep || email) ? f0.vars?.first_name : null) || context?.lead?.first_name || null,
+        firstName: ((fourStep || email) ? (f0.vars?.first_name || null) : (context?.lead?.first_name || null)),
         followupText: f0.vars?.followup_text_line ? f0.facts?.followup_text || null : null,
         ...(email ? { subject: output?.subject || '', preheader: output?.preheader || '', ps: output?.ps_text || '' } : {}),
       });
