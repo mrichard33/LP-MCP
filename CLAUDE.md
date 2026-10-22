@@ -904,7 +904,12 @@ Seven rulings. Each change is behind its own flag in `src/mode-registry.js`; the
   Jackson's "decision maker not present" included) and returns `{ slots, text }`; `checkF0Copy` formula 'four_step'
   checks the first name first, "If I could" and the call question naming the rep at P1–P4, no question at P5, each slot
   in the text, hesitation and reframe grounded in the visit (2+ shared content words), and `rep_quoted`. One re-write,
-  then `suppressed_low_conf`. Prompts are version-2 rows (`sql/seeds/2026-10-19_f0_v2_four_step_prompts.sql`, built by
+  then `suppressed_low_conf`. **The close is a strategy, not a script (the user, 2026-10-22: "we do not need to say word
+  for word 'if I could would you'").** Any conditional offer counts (`CONDITIONAL_OFFER_RX`, `src/siro/f0-four-step.js`;
+  `no_conditional_offer` when there is none), each prompt reads EARLIER CLOSES (`{{siro.earlier_closes}}`, our earlier
+  messages' closing questions) and a close that repeats one we sent fails `close_repeated` (`closeRepeats`: "if I/we
+  could" once per thread, or the same four opening words), email included. Copy:
+  `sql/seeds/2026-10-22_f0_v2_four_step_varied_close.sql` (the 35 rows in place, run after the deploy). Prompts are version-2 rows (`sql/seeds/2026-10-19_f0_v2_four_step_prompts.sql`, built by
   `scripts/build-f0-four-step-seed.mjs`), seeded INACTIVE; `nurture-prompt-selector.js` reads version 2 only in four_step
   and version 1 otherwise (`f0FormulaAllows`). Go-live: activate the v2 rows (the UPDATE in the seed's header), then flip
   the mode. `siro_lead_presentation { preview_f0_position, formula: 'four_step' }` previews them while inactive.
@@ -956,11 +961,11 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   (2026-10-15) → `REHASH_TEAM_USER_NAMES` / the GHL user, else the `rehash_rep_name` custom value, else "Reece Team".
 - **The email is the Reece Team's; the call is with the rehash rep (Mark, 2026-10-22; replaces "written as John, the
   rehash rep", 2026-10-21).** Written and signed as the Reece Team ("we", never "I"); the body ends on the call invite
-  ("If we could …, would you be open to a quick call with John?") and the line "The Reece Team". The rep is the GHL
+  (a conditional offer and a quick call with John, in its own words: the varied close above) and the line "The Reece Team". The rep is the GHL
   custom value `rehash_rep_name` FIRST (`resolveEmailRepFirst`; a blank, a failed read or a merge tag is no name), then
   the follower, else the invite is "a quick call with our team" (`{{siro.call_with}}`); never guessed. Prompt
   `F.0-P0-email-V2` (`sql/seeds/2026-10-22_f0_v2_email_prompt_team_voice.sql`, run after the deploy); `checkF0Copy`
-  voice 'team' fails `first_person`, `signed_as_person`, `missing_signature`, `call_names_other`, `no_if_we_could`.
+  voice 'team' fails `first_person`, `signed_as_person`, `missing_signature`, `call_names_other`.
   `F0_EMAIL_VOICE` team (default) | rep: rep reads V1 (left active for this one-variable rollback) and its checks. GHL
   step 0f From Name = Reece Team. The five texts keep their voice.
 - **`F0_EMAIL_MODE` off|shadow|live, default shadow, decides the email ALONE** (the user, 2026-10-21: the email and the

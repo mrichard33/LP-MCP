@@ -17,7 +17,7 @@ import { readSiroRows } from './context-read.js';
 import { ensureRecordingForLead } from './ensure-recording.js';
 import { buildPresentationFacts, presentationTemplateVars, repFirstName } from './presentation-facts.js';
 import { siroConfig, siroModes } from './config.js';
-import { buildVisitFacts, fourStepObjectionType, STORY_ANGLES } from './f0-four-step.js';
+import { buildVisitFacts, fourStepObjectionType, STORY_ANGLES, earlierClosesLine } from './f0-four-step.js';
 import { firstPersonName } from '../services/lp-identity-fill.js';
 import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { lpSold, isUnsoldPostDemo } from '../agentic/post-demo-owner.js';
@@ -81,6 +81,15 @@ export function greetingName(raw) {
 export function applyGreetingName(context, f0, { fourStep = false, email = false } = {}) {
   if (!(fourStep || email) || !f0?.vars || f0.vars.first_name === undefined) return;
   context.lead = { ...(context.lead || {}), first_name: f0.vars.first_name || '' };
+}
+
+/**
+ * Our earlier messages to this lead, newest last (at most 8), for the "never the
+ * same close twice" check and the prompt's EARLIER CLOSES (the user,
+ * 2026-10-22). Pure.
+ */
+export function earlierOutbound(conversation = []) {
+  return (Array.isArray(conversation) ? conversation : []).filter(isOutbound).map(textOf).filter(Boolean).slice(-8);
 }
 
 /** The lead texted after our last F.0 touch. Pure. */
@@ -266,6 +275,7 @@ export async function loadF0Context(context, request, { env = process.env, deps 
     ...(email ? { email_voice: emailVoice } : {}),
     ...(teamEmail ? { call_with: rehashRepFirst || F0_TEAM_CALL_FALLBACK } : {}),
     days_since_demo: Number.isFinite(age) ? String(Math.floor(age / 24)) : '',
+    earlier_closes: earlierClosesLine(earlierOutbound(context?.conversation_recent || [])),
     recording_id: facts?.recording_id || '',
     presentation: facts,
   };
@@ -308,6 +318,7 @@ export async function loadF0Context(context, request, { env = process.env, deps 
     vars,
     recordingId: facts?.recording_id || null,
     testLink: testLink || null,
+    earlierMessages: earlierOutbound(context?.conversation_recent || []),
     interruptInput: {
       lpSold: sold,
       unsoldPostDemo: testLink ? true : isUnsoldPostDemo({ postAppointment, rehash: rehashActive, sold }),

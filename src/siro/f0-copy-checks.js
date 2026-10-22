@@ -16,7 +16,8 @@
  * 2026-10-19 (Mark, handoff v2): every formula refuses a sensitive detail
  * (ruling 7: a death, an illness, divorce, a lost job, debt, age) and a copy
  * of Siro's suggested text (ruling 2). formula 'four_step' (ruling 6) adds the
- * Four-Step checks: the first name first, "If I could" and the call question
+ * Four-Step checks: the first name first, a conditional offer (any wording,
+ * 2026-10-22) and the call question
  * naming the rep at positions 1-4, and every slot grounded in the visit
  * (verify, don't trust: CANON.K.047).
  */
@@ -25,7 +26,7 @@ import { POST_DEMO_REBUTTAL_RX, UNPROMISED_FOLLOW_UP_RX } from '../agentic/nepq-
 import { enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { hasSensitiveDetail } from './text-guards.js';
 import { copiesSiroDraft, repQuoteRx } from './presentation-guard.js';
-import { groundingSources, FOUR_STEP_SLOTS } from './f0-four-step.js';
+import { groundingSources, FOUR_STEP_SLOTS, CONDITIONAL_OFFER_RX, closeRepeats } from './f0-four-step.js';
 import { findExclamations } from '../agentic/discovery-discipline.js';
 import { F0_EMAIL_SUBJECT_MAX, F0_EMAIL_PREHEADER_MAX, F0_EMAIL_BODY_WORDS, F0_TEAM_SIGNATURE, F0_TEAM_CALL_FALLBACK } from './f0-email.js';
 
@@ -120,12 +121,13 @@ function startsWithName(body, firstName) {
 }
 
 /** The Four-Step checks (formula 'four_step'). Pure. */
-function fourStepFailures(body, { facts, position, repFirstName, slots, firstName, team = false }) {
+function fourStepFailures(body, { facts, position, repFirstName, slots, firstName }) {
   const fail = [];
   if (!startsWithName(body, firstName)) fail.push('first_name_not_first');
   if (position < CLOSE_POSITION) {
-    // The Reece Team email (Mark, 2026-10-22) asks "If we could …".
-    if (team ? !/\bif\s+we\s+could\b/i.test(body) : !/\bif\s+i\s+could\b/i.test(body)) fail.push(team ? 'no_if_we_could' : 'no_if_i_could');
+    // 2026-10-22 (the user): "if I could, would you" is the strategy, not the
+    // words. Any conditional offer to make it work better counts.
+    if (!CONDITIONAL_OFFER_RX.test(body)) fail.push('no_conditional_offer');
     const last = (body.match(/[^.!?]*\?\s*$/) || [''])[0];
     if (!last || !repFirstName || !new RegExp(`\\b${String(repFirstName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(last) || !/\bcall\b/i.test(last)) fail.push('no_call_question');
   }
@@ -244,7 +246,7 @@ function teamVoiceFailures(body, { subject = '', preheader = '', ps = '', callWi
  *   followupText?: string|null, subject?: string, preheader?: string, ps?: string}} o
  * @returns {string[]} failure codes (empty = pass)
  */
-export function checkF0Copy(text, { facts = null, position = 1, repFirstName = null, formula = 'v1', slots = null, firstName = null, followupText = null, subject = '', preheader = '', ps = '', voice = 'rep', callWith = null } = {}) {
+export function checkF0Copy(text, { facts = null, position = 1, repFirstName = null, formula = 'v1', slots = null, firstName = null, followupText = null, subject = '', preheader = '', ps = '', voice = 'rep', callWith = null, earlierMessages = [] } = {}) {
   let body = String(text || '').trim();
   const fail = [];
   if (!body) return ['empty'];
@@ -296,15 +298,17 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
   if (repQuoteRx(facts?.rep_first_name || null).test(body)) fail.push('rep_quoted');
   // Ruling 2: Siro's suggested text is a reference, never sent as written.
   if (followupText && copiesSiroDraft(body, followupText)) fail.push('siro_draft_copied');
+  // 2026-10-22 (the user): never the same close twice in one thread.
+  if ((email || fourStep) && closeRepeats(body, earlierMessages)) fail.push('close_repeated');
 
   if (email) {
     fail.push(...emailFailures(body, { subject, preheader, ps, salesRepFirstName: facts?.rep_first_name || null }));
     // The Four-Step close and slots, as at position 1: the first name first,
-    // "If I could" and the call invite naming the rehash rep, both slots
+    // a conditional offer and the call invite naming the rehash rep, both slots
     // required and grounded in the visit. A recording is required (no facts =
     // no email), so the grounding always runs.
     const team = voice === 'team';
-    fail.push(...fourStepFailures(body, { facts, position: 1, repFirstName: team ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName, team }));
+    fail.push(...fourStepFailures(body, { facts, position: 1, repFirstName: team ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName }));
     if (!facts) fail.push('no_visit_facts');
   } else if (fourStep) {
     fail.push(...fourStepFailures(body, { facts, position, repFirstName, slots, firstName }));
@@ -347,8 +351,9 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     siro_draft_copied: 'Do not copy the suggested follow-up; write your own text.',
     four_step_output: 'Answer as JSON: {"slots": {"hesitation", "affirm", "reframe", "if_i_could"}, "text"}.',
     first_name_not_first: 'Start the text with their first name.',
-    no_if_i_could: 'Use "If I could …, would you …?" for the close.',
-    no_call_question: teamEmail ? 'End the email on the question "would you be open to a quick call with <CALL WITH>?", then the line "The Reece Team".' : 'End with the question "would you be open to a quick call with <rep first name>?"',
+    no_conditional_offer: 'Before the call question, offer to make it work better for them, in your own words (for example "if there\'s a way to …", "we may be able to …"). It does not have to say "If I could".',
+    close_repeated: 'The close repeats one we already sent this lead. Word the call question a new way, and do not use "if I could" or "if we could" again.',
+    no_call_question: teamEmail ? 'End the email on one question asking for a quick call with <CALL WITH>, in your own words, then the line "The Reece Team".' : 'End with one question asking for a quick call with <rep first name>, in your own words.',
     'slot_missing:hesitation': 'Fill the hesitation slot from <visit_facts>.',
     'slot_missing:reframe': 'Fill the reframe slot from <visit_facts>.',
     'slot_ungrounded:hesitation': position === 3 ? 'Slot 1 must come from what the home means to them in <visit_facts>.' : 'The hesitation slot must restate their hesitation from <visit_facts>, in their words.',
@@ -364,7 +369,6 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     your_rep: 'Never say "your rep"; name the person who visited at most once, as the one who came out.',
     sales_rep_named_twice: 'Name the person who visited at most once.',
     no_visit_facts: 'There is no visit on file.',
-    no_if_we_could: 'Use "If we could …, would you …?" for the close.',
     first_person: 'Write as the Reece Team: "we", "us", "our". Never "I", "me" or "my".',
     signed_as_person: 'Sign as the Reece Team, never as a person: the last line is exactly "The Reece Team".',
     call_names_other: 'The call invite names only the rep given in CALL WITH.',

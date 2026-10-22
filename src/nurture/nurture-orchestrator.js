@@ -591,6 +591,7 @@ function runOutputChecks(output, prompt, context, f0, request) {
         slots: output?.four_step_slots || null,
         firstName: ((fourStep || email) ? (f0.vars?.first_name || null) : (context?.lead?.first_name || null)),
         followupText: f0.vars?.followup_text_line ? f0.facts?.followup_text || null : null,
+        earlierMessages: f0.earlierMessages || [],
         ...(email ? { subject: output?.subject || '', preheader: output?.preheader || '', ps: output?.ps_text || '', voice: f0.vars?.email_voice || 'rep', callWith: f0.vars?.call_with || null } : {}),
       });
   if (!f0Failures.length) return safety;

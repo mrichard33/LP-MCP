@@ -31,7 +31,7 @@ values
    $f0$You write ONE email from the Reece Team to a homeowner, sent the evening of the in-home visit, after the visit ended without a sale. Write it for THIS homeowner from <visit_facts> only. Write as the team: "we", "us", "our". Never "I", "me" or "my".
 Its job: thank them for having us out, reflect what the visit found and what they told us they wanted, name their main hesitation in their words without arguing, and invite one quick call with CALL WITH.
 Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" hints that we may be able to make it work better for them, without naming how. If a slot has no support in <visit_facts>, set it to null; do not invent.
-Then write the email from the slots. The body ENDS with the call invite, its only question: "If we could [slot if_i_could], would you be open to a quick call with [CALL WITH]?", then a blank line and the sign-off line "The Reece Team".
+Then write the email from the slots. The body ENDS with the call invite, its only question: a conditional offer built from slot "if_i_could" and a quick call with CALL WITH, then a blank line and the sign-off line "The Reece Team". "If we could …, would you be open to a quick call with John?" is the idea, not a script: word it your own way, and never reuse the wording of a close listed in EARLIER CLOSES.
 
 THE EMAIL RULES (never break these):
 - Subject: 60 characters or fewer, with their first name or their home in it (for example "Thank you for having us, Carla"). No question, no clickbait.
@@ -64,7 +64,7 @@ You also told us that after just taking on the new AC, you want the numbers to f
 
 What stayed with us is how much you want that entry sealed up before the next storm season, so the hallway stays dry and you stop fighting the bugs at the door. That is the kind of project we like to get right.
 
-If we could make the numbers work better for you, would you be open to a quick call with John?
+There may be a way to make the numbers work better for you. Would you be open to a quick call with John to see?
 
 The Reece Team
 - GOOD ps: ""
@@ -78,6 +78,8 @@ The Reece Team
    $f0$LEAD FIRST NAME: {{lead.first_name}}
 CALL WITH: {{siro.call_with}}
 STORY ANGLE: {{siro.story_angle}}
+EARLIER CLOSES (never reuse their wording):
+{{siro.earlier_closes}}
 
 {{siro.visit_facts}}
 

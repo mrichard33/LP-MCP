@@ -147,9 +147,8 @@ test('checkF0Copy team: a first-person draft fails', () => {
   for (const b of cases) assert.ok(checkF0Copy(b, opts()).includes('first_person'), b.slice(0, 60));
   assert.ok(checkF0Copy(BODY, opts({ subject: 'I loved meeting you, James' })).includes('first_person'));
   assert.ok(checkF0Copy(BODY, opts({ ps: 'Let me know if anything changes.' })).includes('first_person'));
-  // The 2026-10-21 close ("If I could") is first person and not the team's close.
-  const iCould = checkF0Copy(BODY.replace('If we could', 'If I could'), opts());
-  assert.ok(iCould.includes('first_person') && iCould.includes('no_if_we_could'), JSON.stringify(iCould));
+  // "If I could" is first person: the team says "we".
+  assert.ok(checkF0Copy(BODY.replace('If we could', 'If I could'), opts()).includes('first_person'));
 });
 
 test('checkF0Copy team: signed as a person, no signature, or the invite names someone else', () => {
@@ -170,12 +169,12 @@ test('checkF0Copy team: signed as a person, no signature, or the invite names so
 });
 
 test('the re-write note speaks to the team voice', () => {
-  const note = f0RetryNote(['first_person', 'signed_as_person', 'missing_signature', 'call_names_other', 'no_if_we_could', 'no_call_question'], { position: 0, formula: 'email', voice: 'team' });
+  const note = f0RetryNote(['first_person', 'signed_as_person', 'missing_signature', 'call_names_other', 'no_conditional_offer', 'no_call_question'], { position: 0, formula: 'email', voice: 'team' });
   assert.match(note, /Never "I", "me" or "my"/);
   assert.match(note, /exactly "The Reece Team"/);
   assert.match(note, /End the body with the line "The Reece Team"/);
   assert.match(note, /CALL WITH/);
-  assert.match(note, /If we could/);
+  assert.match(note, /in your own words/);
   // The texts' signature note is unchanged.
   assert.match(f0RetryNote(['missing_signature'], { position: 5 }), /rep first name/);
 });
@@ -210,7 +209,7 @@ test('the V2 seed: active, version 2, CALL WITH, and its example passes the team
   const words = content.split(/\s+/).filter(Boolean).length;
   assert.ok(words >= 120 && words <= 180, `example is ${words} words`);
   assert.equal((ex.match(/\?/g) || []).length, 1);
-  assert.match(ex, /If we could/);
+  assert.match(ex, /There may be a way/, 'the example close is not "If we could": the idea, not the script');
   assert.doesNotMatch(content, /\bI\b|\b(?:me|my)\b/);
   assert.doesNotMatch(ex, /!|\bdeal\b|founder|—/i);
 });
@@ -236,7 +235,7 @@ test('preview: team voice reads V2 and checks the team rules; no merge tag in th
     assert.equal(res.voice, 'team');
     assert.equal(res.call_with, 'John');
     assert.match(res.body, /quick call with John\?\n\nThe Reece Team$/);
-    for (const f of ['first_person', 'signed_as_person', 'missing_signature', 'call_names_other', 'no_if_we_could']) {
+    for (const f of ['first_person', 'signed_as_person', 'missing_signature', 'call_names_other', 'no_conditional_offer']) {
       assert.ok(!(Array.isArray(res.checks.f0) && res.checks.f0.includes(f)), `${f}: ${JSON.stringify(res.checks)}`);
     }
     noTags({ subject: res.subject, preheader: res.preheader, body: res.body, ps: res.ps });

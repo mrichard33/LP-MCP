@@ -147,6 +147,9 @@ contact as for a text.
    `F.0-P0-email-V2`). Set the GHL custom value `rehash_rep_name` (today **John**).
    `F0_EMAIL_VOICE=rep` puts back the email written as the rehash rep (prompt V1,
    left active for that rollback) and its checks.
+6. (2026-10-22) Run `sql/seeds/2026-10-22_f0_v2_four_step_varied_close.sql` after the
+   same deploy: the texts word their call ask differently each time and never repeat
+   an earlier close ("if I could … would you" is the idea, not the script).
 
 ## Testing on a test contact (the user, 2026-10-21)
 

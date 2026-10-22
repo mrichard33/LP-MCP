@@ -66,6 +66,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
         followupText: f0.vars.followup_text_line ? f0.facts?.followup_text || null : null,
         subject: out.subject, preheader: out.preheader, ps: out.ps_text,
         voice: f0.vars.email_voice || 'rep', callWith: f0.vars.call_with || null,
+        earlierMessages: f0.earlierMessages || [],
       });
       return { out, safety, f0Failures, slots: out.four_step_slots };
     }
@@ -80,6 +81,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
       facts: f0.facts, position: pos, repFirstName: f0.vars.rehash_rep_first_name,
       formula: fourStep ? 'four_step' : 'v1', slots, firstName: fourStep ? (f0.vars?.first_name || null) : (context?.lead?.first_name || null),
       followupText: f0.vars.followup_text_line ? f0.facts?.followup_text || null : null,
+      earlierMessages: f0.earlierMessages || [],
     });
     return { out, safety, f0Failures, slots };
   };
