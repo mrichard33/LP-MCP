@@ -25,6 +25,7 @@ import { decisionMakersFromThread, dmSettled } from '../agentic/qualifying.js';
 import { BRIDGE_RX } from '../agentic/nepq-planner.js';
 import { jobScopeFromThread } from '../agentic/job-scope.js';
 import { isCallPromise } from '../agentic/promised-callbacks.js';
+import { isComparisonQuestion } from '../agentic/rehash-nepq.js';
 import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from '../agentic/rehash-nepq.js';
 
 // 2026-10-12 (handoff PR 7): the scenario checks have their own version. A run
@@ -42,7 +43,7 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // 2026-10-21.2: the rehash booking fix and better-price scenarios (rehash_bare_time_pick ... rehash_call_reason).
 // 2026-10-21.3: the approved identity ask is read from the turn's flow step, not the
 // scenario name (reschedule_unclear).
-export const SCORING_VERSION = '2026-10-21.3';
+export const SCORING_VERSION = '2026-10-21.4';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -62,6 +63,8 @@ const HOLD_LINE_RX = /\bI'?m\s+holding\b|\byou(?:'|’)?re\s+(?:all\s+set|on\s+t
 const HOLD_MOVES = new Set(['confirm', 'hold', 'collect']);
 
 const replies = (t) => (Array.isArray(t?.bot) ? t.bot.filter(Boolean) : []);
+// The first comparison question in a reply, or null (rehash-nepq.js).
+const comparisonIn = (text) => String(text || '').split(/(?<=[.!?])\s+/).find(isComparisonQuestion) || null;
 const allReplies = (r) => (r.transcript || []).flatMap(t => replies(t).map(text => ({ turn: t.turn, text })));
 // Everything the run would have done: live chat keeps one list, SMS one per turn.
 const wouldDo = (r) => [...(r.would_do || []), ...(r.transcript || []).flatMap(t => (t.would_do || []).map(w => ({ turn: t.turn, ...w })))];
@@ -436,9 +439,36 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (r.rehash_better_price !== 'on') return out;
     const first = (r.transcript || [])[0];
     const text = replies(first).join(' ');
-    if (/\bhow\s+do\s+(?:they|the\s+quotes?)\s+compare\b/i.test(text)) out.push({ code: 'compare_asked_back', detail: text, turn: first?.turn });
+    // 2026-10-21: any comparison question ("stack up", "compared to"), not one wording.
+    if (/\bhow\s+do\s+(?:they|the\s+quotes?)\s+compare\b/i.test(text) || comparisonIn(text)) out.push({ code: 'compare_asked_back', detail: text, turn: first?.turn });
     if (!hasBetterPrice(text)) out.push({ code: 'no_better_price_offer', detail: text, turn: first?.turn });
     return out;
+  },
+  // 2026-10-21 (Mark, ruling 4; Jim Anderson): no comparison question at any attempt.
+  rehash_price_compare_any_attempt: (r) => {
+    const out = rehashLaneFailures(r);
+    if (r.rehash_better_price !== 'on') return out;
+    for (const t of r.transcript || []) {
+      const hit = replies(t).map(comparisonIn).find(Boolean);
+      if (hit) out.push({ code: 'compare_asked_back', detail: hit, turn: t.turn });
+    }
+    return out;
+  },
+  // 2026-10-21 (Mark): checked only when the run had REHASH_PAUSE_MODE live.
+  rehash_paused_after_manual: (r) => {
+    if (r.rehash_pause_mode !== 'live') return [];
+    const last = (r.transcript || []).at(-1);
+    return replies(last).length ? [{ code: 'reply_sent_after_rehash_rep_closed', detail: replies(last).join(' '), turn: last?.turn }] : [];
+  },
+  rehash_pause_open_question: (r) => {
+    if (r.rehash_pause_mode !== 'live') return [];
+    const last = (r.transcript || []).at(-1);
+    return replies(last).length ? [] : [{ code: 'open_question_not_answered_after_pause', detail: last?.rehash_gate?.reason || 'no reply', turn: last?.turn }];
+  },
+  // Checked only when the run had REHASH_OWNED_MODE live.
+  rehash_owned_after_booking: (r) => {
+    if (r.rehash_owned_mode !== 'live') return [];
+    return (r.transcript || []).filter(t => replies(t).length).map(t => ({ code: 'reply_sent_to_owned_lead', detail: replies(t).join(' '), turn: t.turn }));
   },
   rehash_call_reason: (r) => {
     const out = rehashLaneFailures(r);

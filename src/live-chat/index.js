@@ -18,6 +18,7 @@
  */
 
 import { newestManualOutbound } from '../services/human-takeover-io.js';
+import { runRehashGate } from '../services/rehash-gate-io.js';
 import supabase from '../supabase.js';
 import { queueSpanishList, SPANISH_LIST_RULE } from './spanish-list.js';
 import { ghlFetch } from '../actions/helpers.js';
@@ -476,6 +477,7 @@ export function productionLaneDeps() {
   return {
     // 2026-10-19 (Mark, ruling 5): a person's text after the visitor's message.
     findManualOutbound: (contactId, afterIso, { excludeActionId = null } = {}) => newestManualOutbound(contactId, afterIso, { excludeActionId }),
+    rehashGate: (contactId, { actionId = null, tags = [], inboundAt = null } = {}) => runRehashGate({ contactId, actionId, channel: 'livechat', tags, inboundAt, ownedOnly: true }),
     fetchContact,
     fetchMessages,
     findConversation,

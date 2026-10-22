@@ -66,6 +66,7 @@ test('read-back: kept, ignored, unknown', () => {
 });
 
 function verifyHarness({ sentAs, ghlUserId }) {
+  const alerts = [];
   const events = [];
   const updates = [];
   const rows = [{ id: 1, target_id: 'ySxZUqvXqSHInFgglEmL', executed_at: '2026-10-15T13:00:00Z', execution_result: { message_id: 'm1', ...(sentAs ? { sent_as_user_id: sentAs } : {}) } }];
@@ -84,21 +85,26 @@ function verifyHarness({ sentAs, ghlUserId }) {
     ghlFetch: async () => ({ message: { status: 'delivered', userId: ghlUserId } }),
     emitEvent: async (e) => { events.push(e); return { id: 1 }; },
     attemptCarrierResend: async () => ({ queued: false }),
+    alertSenderIgnored: async (a) => { alerts.push(a); return { sent: true }; },
   };
-  return { deps, events, updates };
+  return { deps, events, updates, alerts };
 }
 
 test('verify: GHL kept the AI user → no event, readback stamped', async () => {
-  const { deps, events, updates } = verifyHarness({ sentAs: AI, ghlUserId: AI });
+  const { deps, events, updates, alerts } = verifyHarness({ sentAs: AI, ghlUserId: AI });
   await verifyRecentSends(deps);
   assert.equal(events.length, 0);
+  assert.equal(alerts.length, 0);
   assert.equal(updates[0].execution_result.sender_readback, 'kept');
 });
 
 test('verify: GHL ignored the userId → one agentic.ai_sender_ignored, row stays completed', async () => {
-  const { deps, events, updates } = verifyHarness({ sentAs: AI, ghlUserId: 'TYcZ9DcNkuPCFYsFxRFV' });
+  const { deps, events, updates, alerts } = verifyHarness({ sentAs: AI, ghlUserId: 'TYcZ9DcNkuPCFYsFxRFV' });
   await verifyRecentSends(deps);
   assert.deepEqual(events.map((e) => e.event_type), ['agentic.ai_sender_ignored']);
+  // 2026-10-21: and one #ops-alerts line (the alert itself dedupes per contact per day).
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].ghlUserId, 'TYcZ9DcNkuPCFYsFxRFV');
   assert.equal(updates[0].status, undefined, 'never flips the row');
   assert.equal(updates[0].execution_result.sender_readback, 'ignored');
 });
@@ -115,4 +121,12 @@ test('every Conversations API send passes opts (fromNumber + the AI sender)', ()
   const calls = src.match(/await sendViaConversationsAPI\([^)]*\)/g) || [];
   assert.ok(calls.length >= 3);
   for (const c of calls) assert.match(c, /,\s*opts\)$/, `drops opts: ${c}`);
+});
+
+test('the ignored-sender alert: one line per contact per Eastern day, no lead id', async () => {
+  const { formatSenderIgnoredAlert } = await import('../src/services/send-delivery-verify.js');
+  const text = formatSenderIgnoredAlert({ contactId: '5Cp5CiWtQ2zSRlxb2XPL', sentAs: AI, ghlUserId: 'TYcZ9DcNkuPCFYsFxRFV', fromNumber: '+17274748052' });
+  assert.match(text, /Contact ID: 5Cp5CiWtQ2zSRlxb2XPL/);
+  assert.match(text, /from 7274748052/);
+  assert.doesNotMatch(text, /lead\s+\d|LDS\d/i);
 });

@@ -26,6 +26,7 @@ import {
 } from '../agentic/promised-callbacks.js';
 import { SIM_CONTACT_PREFIX } from '../services/promised-callbacks-io.js';
 import { mayMessage } from '../services/may-message.js';
+import { rehashOwnedMode } from '../agentic/rehash-owned.js';
 
 export const JOB_ID = 'promised-callback-sweep';
 const INTERVAL_MS = 15 * 60 * 1000;
@@ -47,6 +48,8 @@ async function withDefaults(deps) {
     d.recordPosted ||= ap.recordPosted;
   }
   if (!d.readTags) d.readTags = (contactId) => readTagSnapshot(d, contactId);
+  // 2026-10-21 (Mark): John owns a rehash lead with a call or visit set (rehash-owned.js).
+  if (!d.readOwned) d.readOwned = async (contactId, { tags } = {}) => (await import('../services/rehash-gate-io.js')).readRehashOwnership(contactId, { tags });
   if (!d.addTag) {
     const { executeAddTag } = await import('../actions/handlers/tags.js');
     d.addTag = (contactId, tag) => executeAddTag({ target_id: contactId, action_payload: { tag }, rule_applied: 'PROMISED_CALLBACK_EXPIRED' });
@@ -193,6 +196,17 @@ export async function runPromisedCallbackSweep(deps = {}) {
       await cancelRow(d, promise, 'lead_opted_out', stamp);
       summary.cancelled += 1;
       continue;
+    }
+    // 2026-10-21 (Mark, rehash ownership): a rehash lead John owns (a Rehash
+    // Call booked, LP's visit set, or the rehash-owned tag) is his to call; the
+    // bot's promise is closed, never carded.
+    if (rehashOwnedMode(d.env) === 'live') {
+      const owned = await d.readOwned(promise.ghl_contact_id, { tags }).catch(() => null);
+      if (owned?.owned === true) {
+        await cancelRow(d, promise, 'rehash_owned', stamp);
+        summary.cancelled += 1;
+        continue;
+      }
     }
     if (decision.action === 'expired') {
       if (mode === 'live') {

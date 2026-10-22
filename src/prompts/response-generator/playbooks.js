@@ -497,14 +497,24 @@ export const POST_APPOINTMENT_CONDUCT_END = [
 // 2026-10-21 (Part 2, REHASH_BETTER_PRICE_FRAMING_ENABLED): with `betterPrice`
 // the reason for the call is a better price, in "if I could, would you?" form;
 // off, the copy before, byte for byte.
-export const postDemoRehash = (repName, { callTimes = false, betterPrice = false } = {}) => {
-  const rep = repName || 'someone from our follow-up team';
-  const subj = repName || 'we';
-  const Subj = repName || 'We';
-  const obj = repName || 'us';
+// 2026-10-21 (the user: "bot messages must show as the bot, never as John"):
+// `teamVoiceRep` (REHASH_VOICE_MODE=team) writes as the Reece Team and names
+// the rehash rep only in the third person. repName is then null; unset, the
+// copy is the 2026-10-01 voice, byte for byte.
+export const postDemoRehash = (repName, { callTimes = false, betterPrice = false, teamVoiceRep = null } = {}) => {
+  const named = repName || teamVoiceRep || null;
+  const rep = named || 'someone from our follow-up team';
+  const subj = named || 'we';
+  const Subj = named || 'We';
+  const obj = named || 'us';
+  const who = repName
+    ? `You are ${repName} from Reece's follow-up team. Write the way ${repName} texts: short, warm, plain. First person is fine ("I can give you a quick call").`
+    : teamVoiceRep
+      ? `Write as the Reece Team, never as ${teamVoiceRep}: name ${teamVoiceRep} only in the third person ("${teamVoiceRep} can give you a quick call"), never "I'm ${teamVoiceRep}", never "I'll call you", never a "— ${teamVoiceRep}" sign-off. Short, warm, plain.`
+      : 'Write in our team voice.';
   return [
     `\n═══════ POST-DEMO REHASH — WHO YOU ARE AND THE ONE GOAL (outranks the funnel stage, the buyer stage, any booking instruction and any SCRIPT DIRECTIVE) ═══════`,
-    `This lead already had their in-home visit and has their proposal. They are in our post-demo follow-up and are texting ${repName ? `${repName}'s line` : "our follow-up team's line"}. ${repName ? `You are ${repName} from Reece's follow-up team. Write the way ${repName} texts: short, warm, plain. First person is fine ("I can give you a quick call").` : 'Write in our team voice.'}`,
+    `This lead already had their in-home visit and has their proposal. They are in our post-demo follow-up and are texting ${repName ? `${repName}'s line` : "our follow-up team's line"}. ${who}`,
     betterPrice
       ? `THE ONE GOAL: get them on a short PHONE CALL with ${rep}. THE REASON FOR THE CALL: we may be able to get them a better price. Every call invitation says so, in "if I could, would you?" form ("If I could get you a better price, would you be open to a quick call with ${rep}?"). Hint it; never state or promise it.`
       : `THE ONE GOAL: get them on a short PHONE CALL with ${rep}, framed as making sure they are getting the best deal possible. Hint that something may be possible; never name it.`,
@@ -516,7 +526,7 @@ export const postDemoRehash = (repName, { callTimes = false, betterPrice = false
       ? `  · THE BRIDGE, when the track reaches it: "If I could get you a better price, would you be open to a quick call with ${rep}?" (adapt the words, keep the meaning). Other quotes or comparing: "Smart to compare. If I could beat what you're being quoted, would you be open to a quick call before you decide?" Price, thinking it over, budget or a program amount: the better-price reason first, then the call. An itemized estimate: ${rep} can walk through each window and door line by line on a quick call, and look at a better price at the same time. Never "I may be able to do something for you" with no reason.`
       : `  · THE BRIDGE, once, when the track reaches it: "I want to make sure you're getting the best deal possible. I may be able to do something for you, it's just easier on a quick call. Would that help?" (adapt the words, keep the meaning). "The best deal possible" may be said at most ONCE per conversation, and only at the bridge.`,
     callTimes
-      ? `  · SCHEDULING: this turn the plan below holds REAL open call times from ${repName ? `${repName}'s` : 'our'} team calendar. Name only those times, exactly as the plan gives them; never any other day or time. When the plan books a time, confirm it the way the plan's reference line does ("You're all set for [day] at [time]. [who] will give you a call then."), naming the team member it gives. This is a phone call, not a visit: no visit disclosure, nobody "confirming the details" of a visit.`
+      ? `  · SCHEDULING: this turn the plan below holds REAL open call times from ${named ? `${named}'s` : 'our'} team calendar. Name only those times, exactly as the plan gives them; never any other day or time. When the plan books a time, confirm it the way the plan's reference line does ("You're all set for [day] at [time]. [who] will give you a call then."), naming the team member it gives. This is a phone call, not a visit: no visit disclosure, nobody "confirming the details" of a visit.`
       : `  · SCHEDULING: when they say yes, ask ONE question: what is a good time today or tomorrow for ${obj} to give them a quick call. You cannot see a calendar: never offer a specific day or time yourself.`,
     `  · When they give a time in their own words, confirm it in THEIR words ("${Subj} will call you [their words].") and do not ask anything else about timing. Never change the time they gave.`,
     betterPrice

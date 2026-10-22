@@ -19,7 +19,7 @@
 
 export const F0_SUPPRESS_REASONS = Object.freeze([
   'sold', 'not_post_demo', 'rehash_ended', 'newer_lead', 'booked', 'note_dq',
-  'disqualified', 'post_demo_stop', 'lead_replied_since_last_touch',
+  'disqualified', 'post_demo_stop', 'lead_replied_since_last_touch', 'rehash_owned',
 ]);
 
 const SOLD_TAGS = ['deal-won'];
@@ -35,6 +35,7 @@ const DQ_TAGS = ['lp-disqualified'];
  * @param {boolean} i.noteDq              a team note says we cannot run the lead
  * @param {boolean} i.postDemoStop        the sticky two-no stop was sent
  * @param {boolean} i.repliedSinceLastTouch the lead texted after our last F.0 touch
+ * @param {boolean} i.rehashOwned         John owns the lead (rehash-owned.js, REHASH_OWNED_MODE=live)
  * @param {string[]} i.tags               lowercased contact tags
  * @param {object|null} i.siroFacts       buildPresentationFacts() or null
  * @param {number|null} i.demoAgeH        hours since the demo
@@ -44,7 +45,7 @@ const DQ_TAGS = ['lp-disqualified'];
 export function postDemoInterrupt({
   lpSold = false, unsoldPostDemo = false, rehashActive = false, newerLead = false,
   appointmentOnFile = false, noteDq = false, postDemoStop = false,
-  repliedSinceLastTouch = false, tags = [], siroFacts = null, demoAgeH = null,
+  repliedSinceLastTouch = false, rehashOwned = false, tags = [], siroFacts = null, demoAgeH = null,
   waitMaxH = 24, waitHoldH = 2,
 } = {}) {
   const t = new Set((tags || []).map(x => String(x).toLowerCase()));
@@ -54,6 +55,9 @@ export function postDemoInterrupt({
   if (!unsoldPostDemo) return end('not_post_demo');
   if (!rehashActive) return end('rehash_ended');
   if (newerLead) return end('newer_lead');
+  // 2026-10-21 (Mark): a Rehash Call is booked, LP has the visit set, or John
+  // tagged the contact rehash-owned: John owns the lead, so no F.0 touch goes.
+  if (rehashOwned) return end('rehash_owned');
   if (appointmentOnFile) return end('booked');
   if (noteDq) return end('note_dq');
   if (DQ_TAGS.some(x => t.has(x))) return end('disqualified');

@@ -7,6 +7,28 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-10-21
 
+- **John owns a rehash lead once a call or a visit is set.** A rehash or post-demo
+  contact with an upcoming Rehash Call, an LP lead at Cnf / Issue / Reset with a
+  visit today or later, or the `rehash-owned` tag gets no bot message: no reply,
+  no F.0 touch, no #contact-rehash card, and the bot's promised call is closed.
+  `REHASH_OWNED_MODE` (default shadow). `src/agentic/rehash-owned.js`.
+- **A rehash rep's manual text or email pauses the bot for 15 minutes.** The
+  lead's next text is held; a newer message from the rep restarts the clock;
+  when it runs out, the thread is read: if the lead closed it ("see you
+  tomorrow"), nothing is sent; if something is still open ("what time
+  again?"), the bot answers. `REHASH_PAUSE_MODE` (default shadow).
+  `src/agentic/rehash-pause.js`, `src/agentic/conversation-complete.js`.
+- **The rehash bot never asks a lead to compare quotes.** A "how do they stack
+  up?" the model writes is replaced by the better-price call invite, and
+  `checkReply` fails `rehash_comparison_question`.
+- **Rehash replies can sign as the Reece Team.** `REHASH_VOICE_MODE=team` writes
+  as the team and names the rep in the third person; default `rep` is unchanged.
+- **GHL showing a bot text as a person is now an #ops-alerts line**, once per
+  contact per day (`agentic.ai_sender_ignored`).
+- **Rules:** the post-demo objection rules no longer move a rehash contact
+  (`rehash`, `active-f.0`, `rehash-owned`) into O.0; their tags and notifications
+  still fire (`sql/seeds/2026-10-21_rehash_no_o0_routing.sql`).
+
 - **F.0 v2 gets a personal email the evening of the demo.** Position 0 of F.0 v2
   is now one email written from the Siro recording of the visit, as the rehash
   rep: it thanks them for having us out, names what they wanted and their main

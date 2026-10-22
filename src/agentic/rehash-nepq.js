@@ -205,6 +205,18 @@ export const REHASH_STAGES = Object.freeze([
   },
 ]);
 
+// 2026-10-21 (Mark, Jim Anderson 8:55): "We are comparing it to the other
+// proposals" got "How do they stack up so far, price and everything else?". The
+// rehash bot never asks a lead to compare: an objection gets the better-price
+// call invite. The words a model reaches for when it asks one anyway.
+export const REHASH_COMPARISON_RX = /\b(?:compare|compares|comparing|compared\s+to|stack(?:s|ing)?\s+up|line(?:s)?\s+up|measure(?:s)?\s+up|look(?:s)?\s+next\s+to|side\s+by\s+side)\b/i;
+
+/** A question asking the lead to compare us with other quotes. Pure. */
+export function isComparisonQuestion(sentence) {
+  const s = String(sentence || '');
+  return s.includes('?') && REHASH_COMPARISON_RX.test(s);
+}
+
 // Our own ask-back to an objection, read back by meaning.
 const ASK_BACK_RX = /\bcompared\s+to\s+what\b|\bhow\s+do\s+(?:they|their|the\s+(?:numbers|quotes?))\s+compare\b|\bwhat\s+part\b[^?]*\bthink\b|\bwhat\s+do\s+you\s+think\s+(?:they|she|he)(?:'|’)?(?:ll|\s+will)\s+want\s+to\s+know\b/i;
 

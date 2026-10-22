@@ -102,7 +102,10 @@ const IN_FLIGHT_STATUSES = new Set(['pending', 'approved', 'executing']);
 // copy's reply answers it; the backstop must not answer it a third time.
 // 2026-10-19 (Mark, ruling 5): a person texted the lead by hand
 // (human_replied): the turn is answered, never "unanswered".
-const HELD_SKIP_REASONS = new Set(['opener_hold', 'duplicate_inbound_text', 'human_replied']);
+// 2026-10-21 (Mark, rehash pause + ownership): John owns the lead, the rep's
+// conversation needed nothing more, the rep kept texting past the restart cap,
+// or a proactive send was dropped while paused.
+const HELD_SKIP_REASONS = new Set(['opener_hold', 'duplicate_inbound_text', 'human_replied', 'rehash_owned', 'conversation_complete', 'rehash_handed_off', 'rehash_paused']);
 
 // 2026-10-19 (Thomas Geary, 10/12): an email reply is held 6–15 minutes on
 // purpose (decideEmailSendDelay, action_payload.email_ready_at). Measured from
@@ -110,7 +113,9 @@ const HELD_SKIP_REASONS = new Set(['opener_hold', 'duplicate_inbound_text', 'hum
 // card. A held email row's clock starts at its ready time instead.
 function heldUntilMs(r) {
   const ready = Date.parse(r?.email_ready_at);
-  const retry = r?.error_message === 'deferred: email_min_delay' ? Date.parse(r?.retry_at) : NaN;
+  // 2026-10-21: a rehash reply held 15 minutes after a rep's manual message
+  // (rehash-pause.js) is in flight until its retry time, like the email delay.
+  const retry = r?.error_message === 'deferred: email_min_delay' || r?.error_message === 'deferred: rehash_paused' ? Date.parse(r?.retry_at) : NaN;
   return Math.max(Number.isFinite(ready) ? ready : -Infinity, Number.isFinite(retry) ? retry : -Infinity);
 }
 

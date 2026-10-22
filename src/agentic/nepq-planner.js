@@ -38,7 +38,7 @@ import { isKnockComplaint } from './do-not-knock.js';
 import { detectDeferral, pendingDeferral, isAcknowledgment, isLeadCloser, isSignOffLine, askedForSpace, POST_DEMO_QUESTIONS } from './post-demo-turn.js';
 import { PURCHASED_ELSEWHERE_RX } from './purchased-elsewhere.js';
 import { bestDealHintUsed } from './rehash.js';
-import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint, isRehashReady, rehashReadyLine, betterPriceReason, betterPriceInvite, betterPriceKindFor, hasBetterPrice, isItemizedAsk, REHASH_BETTER_PRICE_RX } from './rehash-nepq.js';
+import { rehashNepqTurn, bridgedRecently, rehashObjection, BEST_DEAL_RX, PRE_BRIDGE_STAGES, REHASH_STAGES, REHASH_BRIDGE_RX, rehashDealHintMode, rehashHintFor, rehashIfICouldBridge, hasRehashHint, isRehashReady, rehashReadyLine, betterPriceReason, betterPriceInvite, betterPriceKindFor, hasBetterPrice, isItemizedAsk, REHASH_BETTER_PRICE_RX, isComparisonQuestion } from './rehash-nepq.js';
 import { rehashBookingFix, rehashBetterPrice } from './rehash-flags.js';
 import { readRehashTime, pickRehashTime, rehashTimeSlots, clockLabel, rehashDaySlots, slotDayKeys as rehashSlotDayKeys } from './rehash-time.js';
 import { homeownerFromThread, OWNER_ASK_RX } from './homeowner.js';
@@ -2839,6 +2839,7 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
   const signOff = original.match(SIGNOFF_RX);
   let body = signOff ? original.slice(0, signOff.index).trim() : original.trim();
   const withSignOff = (t) => (signOff ? `${t} ${signOff[1].trim()}` : t);
+  let comparisonDropped = false;
 
   // 1. A fixed move: the model wrote its own version of the reference line
   // (Part 7). It goes through every step below and is checked against the
@@ -2897,6 +2898,14 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
     // files a card). The plan's own line is never dropped.
     const ownLine = new Set(splitSentences(`${plan.fixed_line || ''} ${plan.reference_line || ''}`).map(norm));
     drop(s => !ownLine.has(norm(s)) && POST_DEMO_REBUTTAL_RX.test(s), 'rebuttal_dropped');
+    // 2026-10-21 (Mark, ruling 4; Jim Anderson): never a comparison question on
+    // the rehash track, whoever wrote it (the model free-writing a post_demo
+    // turn, a static prompt line, an old KB script). With the better-price
+    // framing on, the invite takes its place below.
+    if (plan.rehash_better_price && sentences.some(isComparisonQuestion)) {
+      drop(s => isComparisonQuestion(s), 'rehash_comparison_dropped');
+      comparisonDropped = true;
+    }
     if (!['handoff', 'rehash_confirm', 'rehash_offer'].includes(plan.step)) {
       drop(s => !ownLine.has(norm(s)) && UNPROMISED_FOLLOW_UP_RX.test(s), 'unpromised_follow_up_dropped');
     }
@@ -2997,6 +3006,12 @@ export function enforceNepqPlan(draft, plan, { allowFigures = false, known = {} 
       body = splitSentences(body).filter(x => !x.includes('?')).join(' ').trim();
       changes.push('rehash_no_question_after_time');
     }
+  }
+  // The comparison question went (above): the objection gets the better-price
+  // call invite instead (betterPriceInvite 'compare'), never another question.
+  if (comparisonDropped && !plan.no_question && !body.includes('?')) {
+    body = [body, betterPriceInvite('compare', null)].filter(Boolean).join(' ').trim();
+    changes.push('rehash_better_price_after_comparison');
   }
   const trackQuestion = statesCallTime ? null : plan.step === 'post_demo_ack' ? plan.post_demo_question : plan.step === 'post_demo' ? plan.rehash_question : null;
   if (trackQuestion && plan.rehash_stage && !plan.no_question && !body.includes('?')) {

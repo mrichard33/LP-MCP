@@ -36,6 +36,12 @@ import { siroModes } from '../siro/config.js';
 import { humanTakeoverMode, takeoverDecision } from '../agentic/human-takeover.js';
 import { rehashDealHintMode } from '../agentic/rehash-nepq.js';
 import { rehashBookingFix, rehashBetterPrice } from '../agentic/rehash-flags.js';
+import { rehashOwned, rehashOwnedMode, ownedDecision } from '../agentic/rehash-owned.js';
+import { rehashPauseMode, pauseDecision, pauseOutcome } from '../agentic/rehash-pause.js';
+import { conversationComplete } from '../agentic/conversation-complete.js';
+import { rehashTeamUserIds } from '../agentic/rehash-state.js';
+import { rehashVoiceMode } from '../agentic/rehash.js';
+import { isPostDemoLead } from '../agentic/post-demo-lead.js';
 import { scoreRun, compareScorecards, combineRuns } from './sim-scoring.js';
 import { memoryTurnLockStore, claimTurn, releaseTurn } from '../agentic/turn-lock-io.js';
 import { turnLockMode } from '../agentic/turn-lock.js';
@@ -124,6 +130,10 @@ const REHASH_LEAD = {
   firstName: 'Monica', lastName: 'Sim', phone: '+17275550177', email: null, postalCode: '33711', tags: ['rehash'],
   lp: { disposition: 'OPPFDN', lastAppointmentDaysAgo: 7, zip: '33711', city: 'Saint Petersburg', address: '400 Oak St' },
 };
+
+// 2026-10-21 (Mark, rehash ownership): John tagged the contact rehash-owned
+// (or GHL U.RCB did on a Rehash Call booking): the bot is out.
+const REHASH_OWNED_LEAD = { ...REHASH_LEAD, tags: ['rehash', 'rehash-owned'] };
 
 // 2026-10-20 (handoff v3): a lead whose visit ran with one decision maker (LP 1Leg).
 const ONE_LEG_LEAD = {
@@ -352,6 +362,11 @@ export const SCENARIOS = Object.freeze({
   // ── 2026-10-21 (Part 2, REHASH_BETTER_PRICE_FRAMING_ENABLED): the reason for the call is a better price ──
   rehash_other_quotes: { title: 'Rehash: "a couple more quotes" gets the better-price offer, not "how do they compare" (Paul, Laura)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Thanks for coming out. We are going to get a couple more quotes'] },
   rehash_call_reason: { title: 'Rehash: every call invitation says why (a better price)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'We are still thinking it over', 'Can I get an itemized estimate? I want to see what each window is costing'] },
+  // ── 2026-10-21 (Mark, Jim Anderson): rehash pause + ownership, no comparison question ──
+  rehash_price_compare_any_attempt: { title: 'Rehash: price, then other proposals, then more quotes: never a comparison question (Jim Anderson)', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['The price is more than we expected', 'We are comparing it to the other proposals that we have received', 'Still looking at the other quotes'] },
+  rehash_paused_after_manual: { title: 'Rehash: John texts by hand, the lead closes ("see you tomorrow"): the bot stays out', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I have a question about the proposal', { manual: 'Jim this is John. We can come by tomorrow at 10am to go over the price, does that work?', team: true }, 'Sounds good, see you tomorrow'] },
+  rehash_pause_open_question: { title: 'Rehash: John texts by hand, the lead asks "what time again?": the bot answers after the pause', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I have a question about the proposal', { manual: 'Jim this is John. We can come by tomorrow to go over the price.', team: true }, 'What time again?'] },
+  rehash_owned_after_booking: { title: 'Rehash: a lead John owns (rehash-owned) gets no bot message', family: 'rehash', persona: REHASH_OWNED_LEAD, channels: ['sms'], turns: ['Any update on the price?'] },
   // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
   rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', family: 'rehash', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
@@ -556,6 +571,10 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
   const lockDeps = { store: lockStore, log: () => {}, warn: () => {} };
   let lastPlanStep = null;
   let lastTurnKey = null;
+  // 2026-10-21 (rehash pause + ownership): the rehash team's manual messages and
+  // a Rehash Call the simulated bot booked, for the send handler's gate.
+  const teamManuals = [];
+  let simRehashCallBooked = false;
   const queue = [...plan.turns];
   let autos = 0;
   for (let i = 0; queue.length; i++) {
@@ -586,6 +605,8 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
         Object.assign(prev, { dropped_bot: prev.bot, bot: null, human_takeover: 'skipped' });
       } else if (prev && decision === 'would_skip') prev.human_takeover = 'would_skip';
       thread.push({ direction: 'outbound', channel: 'sms', text: String(next.manual), type: 'text', timestamp: at, source: 'app', manual: true });
+      // 2026-10-21: a rehash-team user's message (the pause reads only theirs).
+      if (next.team) teamManuals.push({ at, user_id: [...rehashTeamUserIds()][0] });
       transcript.push({ turn: i + 1, customer: '(a person on our team texts the lead)', manual: String(next.manual), bot: null, intent: null, nepq: null, would_do: [], stage: null, seconds: 0, human_takeover_mode: takeoverMode });
       continue;
     }
@@ -603,6 +624,15 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     lastTurnKey = turnKey;
     const claim = await claimTurn({ contactId, turnKey, ownerRule: 'AGENTIC_RESPOND_POST_CHATBOT', channel: 'sms', ownerActionId: `sim-${i}` }, { ...lockDeps, nowMs: Date.parse(at) });
     const context = { ...(realBase || withPersonaLp(minimalContext({ contactId, contact, nowMs: nowMs + i * 60000 }), p)), conversation_recent: mergeRevinTurns(thread.slice(-20), revinTurns) };
+    // 2026-10-21 (Mark): the send handler's rehash gate (rehash-gate-io.js), in
+    // memory. A held turn assumes the 15 quiet minutes pass, unless the script's
+    // next item is another team message (that one restarts the pause).
+    const gate = simRehashGate({ p, thread, teamManuals, inboundAt: at, nextIsTeamManual: !!queue[0]?.team, rehashCallBooked: simRehashCallBooked });
+    if (gate.skip) {
+      if (claim.claimed === true) await releaseTurn({ contactId, turnKey, ownerActionId: `sim-${i}`, outcome: gate.reason }, lockDeps);
+      transcript.push({ turn: i + 1, customer: text, bot: null, error: null, intent: null, nepq: null, would_do: [], stage: null, seconds: 0, rehash_gate: gate, turn_lock: { mode: lockMode, key: turnKey, claimed: claim.claimed } });
+      continue;
+    }
     const t0 = Date.now();
     let generated = null;
     let error = null;
@@ -667,6 +697,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
         : { kind: cb.card === false ? 'would_file_callback_five9' : 'would_file_callback_five9_and_contact_center', reason: `${cb.reason}, ${cb.why}` });
     }
     if (generated?.companion_action) wouldDo.push({ kind: `would_${generated.companion_action.action_type}`, payload: generated.companion_action.action_payload || null });
+    if (generated?.companion_action?.action_type === 'book_appointment' && generated?.rehash) simRehashCallBooked = true;
     // The stage after this turn, as the send handler would record it. A
     // booking companion stands in for the real booking event.
     let stage = null;
@@ -678,6 +709,7 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     }
     transcript.push({
       turn: i + 1, customer: text, bot: reply ? [reply] : null, error,
+      ...(gate.decision !== 'send' || gate.fired ? { rehash_gate: gate } : {}),
       redrafted: !!note, redraft_guard: attempts.find(a => a.guard)?.guard || null, attempts, intent: generated?.intent_class || null, nepq: generated?.nepq_plan || null,
       would_do: wouldDo, stage, seconds: Math.round((Date.now() - t0) / 100) / 10,
       turn_lock: { mode: lockMode, key: turnKey, claimed: claim.claimed, ...(second ? { second } : {}) },
@@ -693,8 +725,40 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     rehash_deal_hint_mode: rehashDealHintMode(), human_takeover_mode: humanTakeoverMode(),
     // 2026-10-21: the two rehash switches (src/agentic/rehash-flags.js).
     rehash_booking_fix: rehashBookingFix() ? 'on' : 'off', rehash_better_price: rehashBetterPrice() ? 'on' : 'off',
+    // 2026-10-21: rehash pause + ownership + voice.
+    rehash_owned_mode: rehashOwnedMode(), rehash_pause_mode: rehashPauseMode(), rehash_voice_mode: rehashVoiceMode(),
     transcript,
   };
+}
+
+/**
+ * The send handler's rehash gate for one simulated inbound (rehash-gate-io.js
+ * without the reads). Returns { decision, skip, reason?, fired? }. Pure.
+ */
+export function simRehashGate({ p, thread = [], teamManuals = [], inboundAt, nextIsTeamManual = false, rehashCallBooked = false }) {
+  const tags = p?.tags || [];
+  const inScope = isPostDemoLead({ tags }) || String(p?.lp?.disposition || '') === 'OPPFDN';
+  if (!inScope) return { decision: 'send', skip: false };
+  const ownedMode = rehashOwnedMode();
+  const nowMs = Date.parse(inboundAt);
+  const owned = rehashOwned({
+    tags, rehashCalendarId: 'sim-rehash-call', nowMs,
+    appointments: rehashCallBooked ? [{ calendar_id: 'sim-rehash-call', start_time: new Date(nowMs + 86_400_000).toISOString(), status: 'new' }] : [],
+    currentLead: { disposition_code: p?.lp?.disposition || null, appointment_date: null },
+  });
+  const od = ownedDecision({ mode: ownedMode, owned });
+  if (od === 'skip') return { decision: 'skip', skip: true, reason: 'rehash_owned', owned_reason: owned.reason, mode: ownedMode };
+  const ownedShadow = od === 'would_skip' ? { owned_would_skip: owned.reason } : {};
+  const pauseMode = rehashPauseMode();
+  const pd = pauseDecision({ manuals: teamManuals, teamUserIds: [...rehashTeamUserIds()], inboundMs: nowMs, nowMs, prior: null });
+  const outcome = pauseOutcome({ mode: pauseMode, decision: pd });
+  if (outcome === 'would_hold') return { decision: 'would_hold', skip: false, mode: pauseMode, ...ownedShadow };
+  if (outcome !== 'hold') return { decision: od === 'would_skip' ? 'would_skip' : 'send', skip: false, ...ownedShadow };
+  if (nextIsTeamManual) return { decision: 'hold', skip: true, reason: 'rehash_paused', mode: pauseMode };
+  // The 15 minutes pass with no newer team message: the thread decides.
+  const verdict = conversationComplete({ thread: thread.map(t => ({ direction: t.direction, text: t.text, manual: !!t.manual })) });
+  if (verdict.complete) return { decision: 'conversation_complete', skip: true, reason: 'conversation_complete', fired: true, completion: verdict.reason, mode: pauseMode };
+  return { decision: 'send', skip: false, fired: true, completion: verdict.reason, mode: pauseMode };
 }
 
 /** Run one scenario on the channels it applies to. */

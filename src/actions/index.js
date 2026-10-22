@@ -1260,6 +1260,10 @@ async function executeSingleActionUntracked(action, batchContext = {}, priorBatc
           // or would have (shadow).
           ...(result?.human_takeover_shadow_would_skip ? { human_takeover_shadow_would_skip: true } : {}),
           ...(result?.manual_at || result?.human_takeover ? { human_takeover: result.human_takeover || { manual_at: result.manual_at, manual_message_id: result.manual_message_id || null, manual_user_id: result.manual_user_id || null } } : {}),
+          // 2026-10-21 (rehash pause + ownership): what the rehash gate decided or would have.
+          ...(result?.rehash_gate ? { rehash_gate: result.rehash_gate } : {}),
+          ...(result?.rehash_owned_would_skip ? { rehash_owned_would_skip: result.rehash_owned_would_skip } : {}),
+          ...(result?.rehash_pause_would_hold ? { rehash_pause_would_hold: result.rehash_pause_would_hold } : {}),
         },
       });
     }

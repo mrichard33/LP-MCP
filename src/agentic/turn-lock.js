@@ -53,7 +53,10 @@ export const WATCHDOG_MIN_AGE_MS = 180 * 1000;
 /** Outcomes that mean a reply reached the lead for that turn. 2026-10-19 (Mark,
  * ruling 5): a person who texted the lead by hand (human_replied) answered the
  * turn too, so no other path and no watchdog (228 / 373) answers it again. */
-export const ANSWERED_OUTCOMES = Object.freeze(new Set(['sent', 'watchdog_recovered', 'human_replied']));
+// 2026-10-21 (Mark, rehash pause + ownership): John owns the lead (rehash_owned),
+// the rep's conversation needed nothing more (conversation_complete), or the rep
+// kept texting past the restart cap (rehash_handed_off): the turn is answered too.
+export const ANSWERED_OUTCOMES = Object.freeze(new Set(['sent', 'watchdog_recovered', 'human_replied', 'rehash_owned', 'conversation_complete', 'rehash_handed_off']));
 
 export const isWatchdogRule = (rule) => WATCHDOG_RULES.has(String(rule || ''));
 

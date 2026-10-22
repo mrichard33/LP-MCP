@@ -239,3 +239,29 @@ test('a booked call\'s confirm is never glued after the model\'s own words (firs
   assert.equal(e.text, "You're all set for tomorrow at 9:30 AM ET. I'll call you at this number then.");
   assert.ok(!e.changes.includes('reference_ask_appended'), e.changes.join());
 });
+
+// 2026-10-21 (Jim Anderson, 5Cp5CiWtQ2zSRlxb2XPL): "We have an opportunity to
+// talk with you at 10am tomorrow. Does that work for you?" at 8:42 ET was booked
+// on Rehash Call for TODAY 10:00 ("You're all set for today at 10:00 AM ET. I'll
+// give you a call then."). That reply came from a build without 69f926c (it
+// reached main at 15:53Z); on this code the day the lead named is the day booked.
+test('Jim: "10am tomorrow. Does that work?" books tomorrow 10:00, never today', () => {
+  const now = Date.parse('2026-10-21T12:48:30Z');
+  const D10 = S('2026-10-21T14:00:00Z', 'Wed, Oct 21', '10:00 AM', 'today', 'Wednesday');
+  const D11 = S('2026-10-21T15:00:00Z', 'Wed, Oct 21', '11:00 AM', 'today', 'Wednesday');
+  const M10 = S('2026-10-22T14:00:00Z', 'Thu, Oct 22', '10:00 AM', 'tomorrow', 'Thursday');
+  const M11 = S('2026-10-22T15:00:00Z', 'Thu, Oct 22', '11:00 AM', 'tomorrow', 'Thursday');
+  const conv = [out('jim this is john … can we have our GM reduce the price at your place tomorrow any time'), out('yes call 7275579775')];
+  const p = planNepqTurn({
+    channel: 'sms', trigger: 'We have an opportunity to talk with you at 10am tomorrow. Does that work for you?', conversation: conv, slots: [], tzLabel: 'ET', firstName: 'Jim',
+    discipline: { booking: { allowed: false, reason: 'x' } }, nowMs: now, postDemo: true, rehashRep: 'John', rehash: true,
+    callSlots: { calendarId: 'cal', rep: 'u1', repName: 'John', offer: [D10, D11], all: [D10, D11, M10, M11] },
+  });
+  assert.equal(p.step, 'rehash_confirm');
+  assert.equal(p.rehash_pick.iso, M10.iso);
+  assert.match(p.reference_line, /tomorrow at 10:00 AM/);
+  assert.doesNotMatch(p.reference_line, /\btoday\b/);
+  // Without a booking, "I'll call you at 10 AM" is a claim on the rehash line.
+  assert.ok(findUnbackedBookingClaim("I'll call you at 10:00 AM tomorrow.", { booked: false, rehash: true }));
+  assert.ok(checkReply("You're all set for today at 10:00 AM ET. I'll give you a call then.", { booked: false, rehash: true }).violations.some((v) => v.code === 'unbacked_booking_claim'));
+});

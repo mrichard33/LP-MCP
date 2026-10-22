@@ -100,6 +100,9 @@ const SUPPORTED_PROVIDERS = new Set(['anthropic', 'openai']);
 const FUNCTION_GROUPS = {
   // decision engine — analysis / scoring / classification (JSON outputs)
   message_analyzer: 'decision_engine',   // src/message-analyzer.js
+  // 2026-10-21 (rehash pause): "is anything left to answer?" after a rehash
+  // rep's manual texts. Analysis, never customer text; one yes/no JSON.
+  conversation_complete: 'decision_engine', // src/agentic/conversation-complete.js
   message_score: 'decision_engine',      // src/message-content-scorer.js (legacy MESSAGE_SCORE_MODEL)
   intent_classifier: 'decision_engine',  // src/knowledge/intent-classifier.js
   // Call Intelligence — structured extraction from a call transcript.

@@ -127,3 +127,43 @@ test('scenario checks: other quotes and the call reason', () => {
   const good = SCENARIO_EXPECTATIONS.rehash_call_reason(R('rehash_call_reason', [T(1, 'If I could get you a better price, would you be open to a quick call with John?')])).map(f => f.code);
   assert.deepEqual(good.filter(c => c === 'call_invite_without_reason' || c === 'vague_call_reason'), []);
 });
+
+// ── 2026-10-21 (Mark, ruling 4; Jim Anderson 8:55): never a comparison question ──
+import { isComparisonQuestion } from '../src/agentic/rehash-nepq.js';
+import { checkReply } from '../src/eval/reply-invariants.js';
+
+test('Jim: price, other proposals, more quotes — no comparison question at any attempt', () => {
+  const conv = [Q];
+  for (const t of ['The price is more than we expected', 'We are comparing it to the other proposals that we have received', 'Still looking at the other quotes']) {
+    const p = plan(t, [...conv]);
+    const line = String(p.fixed_line || p.reference_line || '');
+    assert.equal(line.split(/(?<=[.!?])\s+/).some(isComparisonQuestion), false, `${t} → ${line}`);
+    conv.push(inn(t), out(line || 'ok'));
+  }
+});
+
+test('the guard drops a model-written comparison question and puts the better-price invite in its place', () => {
+  const p = plan('We are comparing it to the other proposals that we have received');
+  const r = enforceNepqPlan('Makes sense. How do they stack up so far, price and everything else?', { ...p, step: 'post_demo', fixed_line: null, reference_line: null });
+  assert.ok(r.changes.includes('rehash_comparison_dropped'), r.changes.join(','));
+  assert.doesNotMatch(r.text, /stack\s+up/i);
+  assert.ok(hasBetterPrice(r.text), r.text);
+  // Off (the rollback): the guard leaves the copy before alone.
+  const p2 = off(() => plan('We are comparing it to the other proposals that we have received'));
+  const r2 = enforceNepqPlan('How do they compare, out of curiosity?', { ...p2, step: 'post_demo', fixed_line: null, reference_line: null });
+  assert.equal(r2.changes.includes('rehash_comparison_dropped'), false);
+});
+
+test('checkReply fails rehash_comparison_question on the rehash path only', () => {
+  const text = 'Thanks, Jim. How do they stack up so far, price and everything else?';
+  assert.ok(checkReply(text, { rehash: true }).violations.some((v) => v.code === 'rehash_comparison_question'));
+  assert.equal(checkReply(text, { rehash: false }).violations.some((v) => v.code === 'rehash_comparison_question'), false);
+  assert.equal(isComparisonQuestion('Smart to compare.'), false, 'a statement is not a question');
+});
+
+test('scenario check: rehash_price_compare_any_attempt', () => {
+  const check = SCENARIO_EXPECTATIONS.rehash_price_compare_any_attempt;
+  const run = (bot) => check({ rehash_better_price: 'on', transcript: [{ turn: 1, bot: [bot] }] }).map((f) => f.code);
+  assert.ok(run('How do they compare to ours?').includes('compare_asked_back'));
+  assert.equal(run('If I could get you a better price, would you be open to a quick call with John?').includes('compare_asked_back'), false);
+});

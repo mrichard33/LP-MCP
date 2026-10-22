@@ -34,6 +34,7 @@ import { enforceOneAsk } from '../agentic/one-ask.js';
 import { isLeadSignOff } from '../agentic/sign-off.js';
 import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX, POST_DEMO_REBUTTAL_RX, UNPROMISED_FOLLOW_UP_RX } from '../agentic/nepq-planner.js';
 import { sentenceAsks } from '../agentic/post-demo-email.js';
+import { isComparisonQuestion } from '../agentic/rehash-nepq.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
 export const INVARIANTS_VERSION = '2026-10-19.1';
@@ -163,7 +164,10 @@ export function checkReply(reply, ctx = {}) {
   // ── context-dependent (skipped when the context is unknown) ───────────
   if (ctx.booked === undefined) skipped.push('booking_claim');
   else {
-    const claim = findUnbackedBookingClaim(text, { booked: !!ctx.booked, held: !!ctx.held, hasAppointment: !!ctx.hasAppointment });
+    // 2026-10-21 (Jim Anderson, "You're all set for today at 10:00 AM ET. I'll
+    // give you a call then."): on the rehash line "I'll call you at <time>" is a
+    // booking claim too (REHASH_CALL_CLAIM_PATTERNS).
+    const claim = findUnbackedBookingClaim(text, { booked: !!ctx.booked, held: !!ctx.held, hasAppointment: !!ctx.hasAppointment, rehash: ctx.rehash === true });
     if (claim) fail('unbacked_booking_claim', claim);
   }
 
@@ -174,6 +178,12 @@ export function checkReply(reply, ctx = {}) {
   // is open, never "right now" (2026-10-09, Monica).
   if (ctx.rehash === undefined) skipped.push('rehash_call_timing');
   else if (ctx.rehash === true && enforceRehashCallTiming(text).changed) fail('call_promised_now_to_rehash_lead', text);
+  // 2026-10-21 (Mark, ruling 4; Jim Anderson): the rehash bot never asks the
+  // lead to compare us with other quotes; an objection gets the better-price invite.
+  if (ctx.rehash === true) {
+    const cmp = String(text).split(/(?<=[.!?])\s+/).find(isComparisonQuestion);
+    if (cmp) fail('rehash_comparison_question', cmp);
+  }
 
   // A hand-off that filed a callback this turn backs whatever call it promises,
   // however it is worded ("Let me have someone from our team call you", the
