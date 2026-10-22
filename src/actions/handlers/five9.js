@@ -216,6 +216,12 @@ const BOOKED_ROUTING_RULE_KEY = 'BOOKED_DIAL_ROUTING';
 // correctly each time"); DISQUALIFIED_FIVE9_AUTO_REMOVE=false is the rollback to
 // approval cards. A notice (no buttons) says what LP said and what came off.
 const DISQUALIFIED_RULE_KEY = 'LP_DISP_DISQUALIFIED';
+// 2026-10-22 (handoff: partner leads leave every Reece Five9 list). A contact an
+// outside partner (Ross) owns in GHL comes off the Reece lists, again after each
+// 6 AM LP load (src/partners/five9-removal.js). Unarmed, keyed on rule
+// PARTNER_FIVE9_REMOVAL, and only while PARTNER_FIVE9_REMOVAL_MODE is still
+// `enforce` at execution: flipping the mode back to log stops queued rows too.
+const PARTNER_REMOVAL_RULE_KEY = 'PARTNER_FIVE9_REMOVAL';
 
 function execAutoApproved(actionType, action) {
   if (actionType === EXEC_AUTO_APPROVED_FIVE9_OP) return true;
@@ -223,6 +229,9 @@ function execAutoApproved(actionType, action) {
     if (isCallbackRearmDelete(action)) return true;
     if (action?.rule_applied === DISQUALIFIED_RULE_KEY) {
       return String(process.env.DISQUALIFIED_FIVE9_AUTO_REMOVE || '').trim().toLowerCase() !== 'false';
+    }
+    if (action?.rule_applied === PARTNER_REMOVAL_RULE_KEY) {
+      return String(process.env.PARTNER_FIVE9_REMOVAL_MODE || '').trim().toLowerCase() === 'enforce';
     }
     return action?.rule_applied === BOOKED_ROUTING_RULE_KEY
       && String(process.env.BOOKED_ROUTING_AUTO_REMOVE || '').trim().toLowerCase() !== 'false';

@@ -70,6 +70,18 @@
 import crypto from 'node:crypto';
 import supabase from './supabase.js';
 import { applyIntakeFilterBatch } from './services/event-intake-filter.js';
+import { trackBackground } from './graceful-shutdown.js';
+
+// 2026-10-22 (the user): "When a lead gets tagged phone team then it should be removed
+// from all Five9 dialing list." The diff below is the one place that sees a tag land,
+// so it hands partner-tag changes to src/partners/five9-removal.js in the background:
+// the inbox worker never waits on GHL or Five9, and a failure never fails the row.
+// The tag needs no intake-filter allowlist entry and no agent_rule: no rule reads it.
+function defaultPartnerTagHook({ contactId, added, removed }) {
+  trackBackground(import('./partners/five9-removal.js')
+    .then((m) => m.partnerTagTrigger({ contactId, added, removed }))
+    .catch((err) => console.warn(`[GhlTag] partner tag trigger for ${contactId}: ${err.message}`)));
+}
 
 function normalizeTag(t) {
   if (typeof t !== 'string') return null;
@@ -145,7 +157,7 @@ function buildEventRow({ contact_id, tag, action, minuteBucket }) {
  *
  * @returns {Promise<object>} summary of what happened
  */
-export async function processTagUpdate({ contact_id, tags, occurred_at }) {
+export async function processTagUpdate({ contact_id, tags, occurred_at }, { partnerTagHook = defaultPartnerTagHook } = {}) {
   const newTags = normalizeTags(tags);
 
   // 1. Look up prior snapshot (primary-key lookup on ghl_contact_id)
@@ -181,8 +193,10 @@ export async function processTagUpdate({ contact_id, tags, occurred_at }) {
     throw new Error(`snapshot upsert failed: ${upsertErr.message}`);
   }
 
-  // 3. First-seen path: bootstrap silently, emit nothing
+  // 3. First-seen path: bootstrap silently, emit nothing (a partner tag already on a
+  // contact we have never seen still takes it off the Five9 lists).
   if (isFirstSeen) {
+    if (partnerTagHook) partnerTagHook({ contactId: contact_id, added: newTags, removed: [] });
     return { bootstrapped: true, tags_recorded: newTags.length, added: 0, removed: 0, events_inserted: 0 };
   }
 
@@ -195,6 +209,7 @@ export async function processTagUpdate({ contact_id, tags, occurred_at }) {
   if (added.length === 0 && removed.length === 0) {
     return { no_diff: true, added: 0, removed: 0, events_inserted: 0 };
   }
+  if (partnerTagHook) partnerTagHook({ contactId: contact_id, added, removed });
 
   // 5. Build diff event rows, keyed on the event's own timestamp
   const minuteBucket = bucketOf(occurred_at);

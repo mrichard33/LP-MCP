@@ -24,6 +24,8 @@ export const NOT_NULL = Object.freeze({
   partner_owner_map: ['partner_name', 'lp_branch_id', 'ghl_user_id'],
   // 2026-10-20: supabase/migrations/20261020230000_partner_owner_assignments.sql.
   partner_owner_assignments: ['ghl_contact_id', 'ghl_user_id'],
+  // 2026-10-22: supabase/migrations/20261022120000_partner_five9_removals.sql.
+  partner_five9_removals: ['ghl_contact_id', 'action', 'mode'],
 });
 
 function notNullViolation(table, rows) {
@@ -113,6 +115,13 @@ export function fakeSupabase(seed = {}, { rpc = {}, files = {} } = {}) {
       lt(c, v) { q.filters.push((r) => r[c] < v); return chain; },
       is(c, v) { q.filters.push((r) => r[c] == v); return chain; },
       not(c, op, v) { q.filters.push((r) => (op === 'is' ? r[c] != v : r[c] !== v)); return chain; },
+      // 2026-10-22: shallow jsonb containment, enough for .contains('action_payload', { group }).
+      contains(c, obj) {
+        q.filters.push(Array.isArray(obj)
+          ? (r) => Array.isArray(r[c]) && obj.every((v) => r[c].includes(v))
+          : (r) => Object.entries(obj).every(([k, v]) => r[c]?.[k] === v));
+        return chain;
+      },
       like(c, pat) { const rx = new RegExp('^' + String(pat).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*') + '$'); q.filters.push((r) => rx.test(String(r[c] ?? ''))); return chain; },
       order(c, o) { q.order = [c, o?.ascending !== false]; return chain; },
       limit(n) { q.limit = n; return chain; },

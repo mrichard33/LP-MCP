@@ -323,3 +323,12 @@ test('a parked row releases the block so its successor can proceed', async () =>
   assert.equal(result.deferred, 0,
     'a parked row must not hold the contact hostage forever');
 });
+
+// 2026-10-22: a partner tag change is handed to the Five9 removal (src/partners/five9-removal.js).
+test('processTagUpdate hands the diff to the partner tag hook, never awaiting it', async () => {
+  reset();
+  selectResults.contact_tag_snapshot = [{ tags: ['dnc'], bootstrapped: true }];
+  const seen = [];
+  await processTagUpdate({ contact_id: 'c1', tags: ['dnc', 'Phone-Team'] }, { partnerTagHook: (x) => seen.push(x) });
+  assert.deepEqual(seen, [{ contactId: 'c1', added: ['phone-team'], removed: [] }]);
+});

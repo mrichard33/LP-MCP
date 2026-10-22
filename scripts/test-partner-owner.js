@@ -78,7 +78,14 @@ function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, kee
   const notes = [];
   const slack = [];
   const posted = new Set();
+  // The Five9 step (2026-10-22): recorded, never real.
+  const five9Calls = [];
+  const partnerFive9 = {
+    ensurePartnerFive9Removal: async (o) => { five9Calls.push({ kind: 'ensure', trigger: o.trigger, contactId: o.contactId, owner: o.contact?.assignedTo }); return { ok: true, outcome: 'logged', mode: 'log', lists: ['L1', 'L2'] }; },
+    releasePartnerFive9: async (o) => { five9Calls.push({ kind: 'release', trigger: o.trigger, contactId: o.contactId }); return { ok: true, outcome: 'released' }; },
+  };
   const deps = {
+    partnerFive9,
     supabase: db,
     ghlFetch,
     addNote: async (id, body) => { notes.push({ id, body }); return { ok: true }; },
@@ -91,7 +98,7 @@ function world({ leads = [lead()], map = MAP, log = [], owner = REECE, opps, kee
     now: () => NOW,
     log: () => {},
   };
-  return { db, deps, contacts, opportunities, writes, notes, slack, tagCalls };
+  return { db, deps, contacts, opportunities, writes, notes, slack, tagCalls, five9Calls };
 }
 
 const logRows = (w) => w.db.tables.partner_owner_log || [];
@@ -277,12 +284,21 @@ test('5. a 1 Leg contact GHL assigned to Ross leaves RFED → skipped_not_ours, 
   assert.equal(r.reason, 'skipped_not_ours');
   assert.equal(w.writes.length, 0);
   assert.equal(w.notes.length, 0);
-  assert.equal(w.slack.length, 0);
+  // 2026-10-22 (Build 2): the owner is still never moved, but the hand-off is seen once.
+  assert.equal(w.slack.length, 1);
+  assert.match(w.slack[0].text, /PARTNER LEAD ASSIGNED → Ross Erstling \(set by GHL\)/);
+  assert.match(w.slack[0].text, /Prospect 470001/);
+  assert.doesNotMatch(w.slack[0].text, /600001/, 'never the LP lead id on a card');
   assert.equal(w.contacts.get(moved.ghl_contact_id).assignedTo, ROSS);
   assert.equal(logRows(w).at(-1).reason, 'skipped_not_ours');
-  // A second pass does not grow the log.
+  assert.equal(logRows(w).at(-1).detail.ghl_set, true);
+  assert.equal(logRows(w).at(-1).detail.five9.outcome, 'logged');
+  // Build 1: Reece stops dialing it.
+  assert.deepEqual(w.five9Calls.map((c) => [c.kind, c.trigger]), [['ensure', 'ghl_set']]);
+  // A second pass does not grow the log, and posts no second card.
   await syncPartnerOwner(moved, { prevRow: lead(), deps: w.deps });
   assert.equal(logRows(w).length, 1);
+  assert.equal(w.slack.length, 1);
 });
 
 test('5b. a 1 Leg contact GHL assigned to Ross with a new RFED lead → noop, no assignment made', async () => {
@@ -343,7 +359,7 @@ test('5r. a branch + rep row overrides the branch-only row', () => {
 });
 
 test('6. owner already correct → noop: no write, no note, no Slack', async () => {
-  const w = world({ owner: ROSS });
+  const w = world({ owner: ROSS, assignments: [ours()] });
   const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
   assert.equal(r.reason, 'noop');
   assert.equal(w.writes.length, 0);
@@ -535,4 +551,55 @@ test('average lag reads LP change → write', () => {
     { created_at: '2026-10-21T15:00:30Z', lp_changed_at: '2026-10-21T15:00:00Z' },
   ]), 60);
   assert.equal(averageLagSeconds([]), null);
+});
+
+// ── 2026-10-22 handoff: Five9 removal + the "set by GHL" card ────────────────
+
+test('8. a GHL-set Ross owner on a new RFED lead → one "set by GHL" card and a Five9 removal; no assignment', async () => {
+  const w = world({ owner: ROSS, tags: ['phone-team'] });
+  const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r.reason, 'noop');
+  assert.equal(w.slack.length, 1);
+  assert.match(w.slack[0].text, /\(set by GHL\)/);
+  assert.match(w.slack[0].text, /GHL made the partner the owner/);
+  assert.equal(w.five9Calls.length, 1);
+  assert.equal(w.five9Calls[0].trigger, 'ghl_set');
+  assert.equal(assignRows(w).length, 0, 'never claimed as ours');
+  assert.equal(logRows(w).at(-1).detail.ghl_set, true);
+  await syncPartnerOwner(lead(), { prevRow: lead(), deps: w.deps });
+  assert.equal(w.slack.length, 1, 'one card per lead, ever');
+});
+
+test('9. our assign also takes the contact off the Reece Five9 lists (after the owner write)', async () => {
+  const w = world();
+  const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r.reason, 'assigned');
+  assert.equal(w.five9Calls.length, 1);
+  assert.deepEqual([w.five9Calls[0].kind, w.five9Calls[0].trigger, w.five9Calls[0].owner], ['ensure', 'owner_sync', ROSS]);
+  assert.equal(logRows(w).at(-1).detail.five9.outcome, 'logged');
+});
+
+test('10. our return releases the Five9 removal', async () => {
+  const moved = lead({ lp_branch_id: 'BOCA' });
+  const w = world({ leads: [moved], owner: ROSS, assignments: [ours()] });
+  const r = await syncPartnerOwner(moved, { prevRow: lead(), deps: w.deps });
+  assert.equal(r.reason, 'returned');
+  assert.deepEqual(w.five9Calls.map((c) => [c.kind, c.trigger]), [['release', 'returned']]);
+  assert.equal(r.five9.outcome, 'released');
+});
+
+test('11. a Five9 step that throws never fails the owner write', async () => {
+  const w = world();
+  w.deps.partnerFive9 = { ensurePartnerFive9Removal: async () => { throw new Error('Five9 down'); }, releasePartnerFive9: async () => ({}) };
+  const r = await syncPartnerOwner(lead(), { prevRow: null, deps: w.deps });
+  assert.equal(r.reason, 'assigned');
+  assert.equal(w.contacts.get('cAAAAAAAAAAAAAAAAAA1').assignedTo, ROSS);
+  assert.equal(r.five9.outcome, 'error');
+});
+
+test('12. a dry run posts nothing and touches no Five9', async () => {
+  const w = world({ owner: ROSS });
+  await syncPartnerOwner(lead(), { prevRow: null, dryRun: true, deps: w.deps });
+  assert.equal(w.slack.length, 0);
+  assert.equal(w.five9Calls.length, 0);
 });

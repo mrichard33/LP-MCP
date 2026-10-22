@@ -446,7 +446,8 @@ test('the roster is unique, complete and shaped', () => {
   // 61 → 62 on 2026-10-19: revin-relink (the Revin webhook's retry / re-link / alert pass).
   // 62 → 63 on 2026-10-20: p2-parity-sweep (every P2 card matches LP).
   // 63 → 64 on 2026-10-20: partner-fast-poll (partner lead ownership, LP branch → GHL owner).
-  assert.equal(JOBS.length, 64);
+  // 64 → 65 on 2026-10-22: partner-five9-sweep (partner-owned contacts off the Reece Five9 lists).
+  assert.equal(JOBS.length, 65);
   for (const j of JOBS) {
     assert.match(j.id, /^[a-z0-9-]+$/, `${j.id} should be a slug`);
     assert.ok(j.label && j.group && j.cadence, `${j.id} needs a label, group and cadence`);
