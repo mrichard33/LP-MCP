@@ -23,16 +23,6 @@
 //   5. current_lead_no_demo  — No Demo / ND / NOC never enter S5.2
 //   0b. current_lead_disqualified — ND / No Demo, checked up front (2026-10-16)
 //
-// 2026-10-21 (Mark): the ONE exception to rule 1. A canvass lead whose CURRENT LP lead
-// is 1Leg may enter S5.2 for the one_leg state: its "I. 1 Leg" branch adds phone-team,
-// which hands the lead to Ross (a NEW RFED lead; the original lead is never touched).
-// Every other rule still runs on ALL the contact's leads (no demo on any lead, no live
-// appointment, Issue waits, No Demo / ND never), and a canvassing CANCEL or no-show
-// (any other state) is still refused. The 1Leg route (rule 231
-// LP_DISP_1LEG_TO_ONELEG) carries no canvassing tag exclusion, so this gate was the
-// only thing keeping canvass 1 Leg leads out; the cancel / no-show rules 171 / 227 /
-// 271 / 295 keep active-entry:canvassing.
-//
 // SCOPE (user, 2026-10-02): only APPOINTMENT_DISRUPTION.* and
 // APPOINTMENT_FRICTION.ghost_after_booking. The other APPOINTMENT_FRICTION
 // states are pre-demo worries ("not sure about the timing") and need a live
@@ -61,8 +51,6 @@ export const S52_TAGS = Object.freeze(['active-s5.2', 'active-w5.2', 's52-task-c
 export const CANVASSING_TAGS = Object.freeze(['active-entry:canvassing']);
 export const LIVE_APPOINTMENT_DISPOSITIONS = Object.freeze(['Set', 'Cnf', 'Verif', 'Issue']);
 export const NO_DEMO_DISPOSITIONS = Object.freeze(['No Demo', 'ND', 'NOC']);
-export const ONE_LEG_STATE = 'APPOINTMENT_DISRUPTION.one_leg';
-export const ONE_LEG_DISPOSITION = '1Leg';
 /** 2026-10-07: a text from the lead this recent means they are mid-conversation. */
 export const MID_CONVERSATION_MS = 2 * 60 * 60 * 1000;
 const MAX_PROSPECTS = 5; // a phone on more prospects than this is a data problem
@@ -109,14 +97,10 @@ export function isLiveAppointmentLead(lead, nowMs = Date.now()) {
  * `tags` the contact's live GHL tags.
  * @returns {{ allow: boolean, reason: string, detail?: object }}
  */
-export function evaluateS52Entry({ leads, tags, notes = [], lastInboundMs = null, nowMs = Date.now(), stateCode = null } = {}) {
+export function evaluateS52Entry({ leads, tags, notes = [], lastInboundMs = null, nowMs = Date.now() } = {}) {
   const tagSet = lowerSet(tags);
   const canvass = CANVASSING_TAGS.find((t) => tagSet.has(t));
-  // The canvass 1 Leg exception (Mark, 2026-10-21): only for the one_leg state and a
-  // current lead that is 1Leg. The checks below still decide.
-  const canvassOneLeg = Boolean(canvass) && norm(stateCode) === ONE_LEG_STATE
-    && norm(pickCurrentLead(Array.isArray(leads) ? leads : [])?.disposition_code) === ONE_LEG_DISPOSITION;
-  if (canvass && !canvassOneLeg) return { allow: false, reason: 'canvassing', detail: { tag: canvass } };
+  if (canvass) return { allow: false, reason: 'canvassing', detail: { tag: canvass } };
 
   // 2026-10-16 (Mark, handoff v3.4 Fix 2): ND and No Demo are DISQUALIFIED — an
   // end state, never a rescue. Checked up front, not only through the late
@@ -157,7 +141,7 @@ export function evaluateS52Entry({ leads, tags, notes = [], lastInboundMs = null
   if (NO_DEMO_DISPOSITIONS.includes(disp)) {
     return { allow: false, reason: 'current_lead_no_demo', detail: { lp_lead_id: current.lp_lead_id ?? null, disposition: disp } };
   }
-  return { allow: true, reason: 'ok', detail: { current_lp_lead_id: current?.lp_lead_id ?? null, current_disposition: disp || null, ...(canvassOneLeg ? { canvass_one_leg: true } : {}) } };
+  return { allow: true, reason: 'ok', detail: { current_lp_lead_id: current?.lp_lead_id ?? null, current_disposition: disp || null } };
 }
 
 // ─── live LP → lp_leads-shaped rows ───────────────────────────────
@@ -297,10 +281,10 @@ export async function loadS52GateInputs(contactId, deps = {}) {
 }
 
 /** Load + decide for one contact. Read failures block. */
-export async function checkS52Entry(contactId, deps = {}, { stateCode = null } = {}) {
+export async function checkS52Entry(contactId, deps = {}) {
   const inputs = await loadS52GateInputs(contactId, deps);
   if (inputs.error) return { allow: false, reason: inputs.error, detail: { error: inputs.detail } };
-  return { ...evaluateS52Entry({ ...inputs, nowMs: deps.nowMs ?? Date.now(), stateCode }), inputs };
+  return { ...evaluateS52Entry({ ...inputs, nowMs: deps.nowMs ?? Date.now() }), inputs };
 }
 
 /**
@@ -312,7 +296,7 @@ export async function gateS52Enrollment(action, deps = {}) {
   const payload = action?.action_payload || {};
   if (!isS52Target(payload) || !isGatedState(payload.state_code)) return null;
   const contactId = action.target_id;
-  const verdict = await checkS52Entry(contactId, deps, { stateCode: payload.state_code });
+  const verdict = await checkS52Entry(contactId, deps);
   if (verdict.allow) {
     console.log(`[S52Gate] ${contactId} allowed into S5.2 (${payload.state_code}, current ${verdict.detail?.current_disposition || '?'})`);
     return null;

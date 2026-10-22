@@ -1357,12 +1357,6 @@ inventory read. A partner GHL put there (rule 3b) is still never moved, but post
 off | log (default: records `mode='log'` rows only) | enforce; the executor runs the rows unarmed only while it is still
 enforce. `POST /n8n/admin/partner-owner/five9-sweep {dry_run}` lists every partner-owned contact and the lists it would
 leave (dry run default). The real fix is LP excluding partner-owned leads from its export (ask LP).
-**A canvass 1 Leg lead may enter S5.2 (Mark, 2026-10-21).** `evaluateS52Entry({ stateCode })` lets `active-entry:canvassing`
-through ONLY for state `APPOINTMENT_DISRUPTION.one_leg` with a current lead in 1Leg; every other rule still runs on all
-leads (no demo, no live appointment, Issue waits, ND / No Demo / NOC never), and a canvass cancel or no-show is still
-refused. No agent_rules change: rule 231 `LP_DISP_1LEG_TO_ONELEG` never excluded canvassing (the gate did), and 171 /
-227 / 271 / 295 are the cancel and no-show rules, which keep `active-entry:canvassing`.
-
 **A 1 Leg contact is offered a phone presentation, both decision makers on the call (Mark, handoff v3, 2026-10-20).**
 Only a contact whose OPEN objection state is `APPOINTMENT_DISRUPTION.one_leg` (rule `LP_DISP_1LEG_TO_ONELEG`) gets it:
 `phonePresentationActive` (`src/agentic/one-leg-presentation.js`; SMS, not post-demo, not rehash) passes the real
