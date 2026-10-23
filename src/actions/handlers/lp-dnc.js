@@ -30,6 +30,12 @@
  * No prospect ID = clean skip with GroupMe alert (mirrors lp-lead.js
  * pattern). Action is marked completed so it doesn't churn retries.
  *
+ * 2026-10-23 — no echo cards. A contact carrying `lp-dnc` (LP_DISP_DNC: the
+ * DNC came from LP) is `origin_lp_skip`: no LP call, no card, prospect id or
+ * not. LP's "already set to supplied value" is `already_set_in_lp`: tag + a
+ * one-line note, no card. The SKIP card stays for a GHL-origin DNC, and the
+ * FAILED card for every real error.
+ *
  * Action payload shape:
  *   {
  *     dnc_code: "P",        // Required. One of C/M/T/E/P, or "CLEAR"
@@ -89,7 +95,49 @@ function hasDncTag(contact, code) {
   return tags.includes(`lp-dnc:${code.toLowerCase()}`);
 }
 
-export async function executeUpdateLPDNCStatus(action) {
+// 2026-10-23 (lLiY0ptM6dZiRAdx34dA, LP prospect 350405) — a lead that arrives
+// from LP already DNC gets `lp-dnc` / `stage:dnc` from LP_DISP_DNC, which then
+// sets GHL DND and fires TAG_DNC_SMS_OPTOUT and RECONCILE_LP_DNC_ON_LINK. Each of
+// those queued a push back to LP: two "LP DNC SKIP" cards (no prospect id yet)
+// and one "LP DNC Pushed" card for a C that LP answered "already set to supplied
+// value". An LP → GHL → LP echo, three cards, nothing new. `lp-dnc` means the
+// DNC came FROM LP, so there is nothing to push.
+// NOT `stage:dnc`, though LP_DISP_DNC sets it too: GHL's U.STOP Customer Replied
+// Stop adds `stage:dnc` with `dnc-sms` on a customer's own STOP, and that STOP
+// must still reach LP. Only rule 14 adds `lp-dnc` (every GHL workflow that names
+// it only reads it, HL mirror 2026-10-23).
+export const LP_ORIGIN_DNC_TAGS = ['lp-dnc'];
+
+export function dncOriginatedInLP(contact) {
+  const tags = (contact?.tags || []).map(t => String(t).toLowerCase());
+  return LP_ORIGIN_DNC_TAGS.some(t => tags.includes(t));
+}
+
+// lp-client's updateDncStatus marks LP's "Current DNC status is already set to
+// supplied value" reply as `already_set: true`; the message test covers a
+// response that reaches us without the flag.
+export function lpAlreadySet(lpResponse) {
+  if (lpResponse?.already_set === true) return true;
+  const message = String(lpResponse?.Message ?? lpResponse?.message ?? '');
+  return /already set to supplied value/i.test(message);
+}
+
+const DEFAULT_DEPS = {
+  ghlFetch,
+  lpUpdateDncStatus,
+  sendGroupMeMessage,
+  addGHLNote,
+  applyGHLTag,
+  removeGHLTags,
+  resolveContactInfo,
+};
+
+// The executor calls handler(action, context); `deps` is the third argument so
+// the tests can swap the network out without colliding with that context.
+export async function executeUpdateLPDNCStatus(action, _context, deps = {}) {
+  const {
+    ghlFetch, lpUpdateDncStatus, sendGroupMeMessage, addGHLNote, applyGHLTag, removeGHLTags, resolveContactInfo,
+  } = { ...DEFAULT_DEPS, ...deps };
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
@@ -134,7 +182,9 @@ export async function executeUpdateLPDNCStatus(action) {
 
   // ─── CLEAR path (Phase 2) — re-entry = new consent ─────────────────
   if (isClear) {
-    return await clearLPDNC({ contactId, ghlContact, payload, empId, prospectId, lpLeadId });
+    return await clearLPDNC({ contactId, ghlContact, payload, empId, prospectId, lpLeadId }, {
+      lpUpdateDncStatus, sendGroupMeMessage, addGHLNote, applyGHLTag, removeGHLTags, resolveContactInfo,
+    });
   }
 
   // ─── Idempotency guard (push only) ─────────────────────────────────
@@ -143,6 +193,23 @@ export async function executeUpdateLPDNCStatus(action) {
     return {
       action: 'already_pushed',
       contact_id: contactId,
+      dnc_code: code,
+    };
+  }
+
+  // ─── LP-origin DNC: nothing to push back (2026-10-23) ──────────────
+  // `lp-dnc` means LP is where the DNC came from. No LP call and
+  // no card, with or without a prospect id; the code tag is written so the
+  // next rule that queues this push stops at the idempotency guard above.
+  if (dncOriginatedInLP(ghlContact)) {
+    await applyGHLTag(contactId, `lp-dnc:${code.toLowerCase()}`).catch(err =>
+      console.warn(`[LP-DNC] tag writeback failed (non-blocking): ${err.message}`));
+    console.log(`[LP-DNC] Skip: contact ${contactId} DNC came from LP (lp-dnc tag), nothing to push for ${code}`);
+    return {
+      action: 'origin_lp_skip',
+      contact_id: contactId,
+      lp_prospect_id: prospectId || null,
+      lp_lead_id: lpLeadId || null,
       dnc_code: code,
     };
   }
@@ -209,6 +276,24 @@ export async function executeUpdateLPDNCStatus(action) {
   } catch (err) {
     console.warn(`[LP-DNC] tag writeback failed (non-blocking): ${err.message}`);
   }
+
+  // ─── LP already had it: a no-op, not news (2026-10-23) ─────────────
+  // "Current DNC status is already set to supplied value" — LP changed
+  // nothing, so no card. The tag above still stops the next push.
+  if (lpAlreadySet(lpResponse)) {
+    await addGHLNote(contactId, `[LP DNC v1.0] LP already had DNC ${code} — no change.`).catch(() => {});
+    console.log(`[LP-DNC] DNC ${code} already set in LP for contact ${contactId} (prospect ${prospectId}), no card`);
+    return {
+      action: 'already_set_in_lp',
+      contact_id: contactId,
+      lp_prospect_id: prospectId,
+      dnc_code: code,
+      dnc_label: DNC_LABEL[code],
+      emp_id: empId,
+      lp_response: lpResponse,
+    };
+  }
+
   await addGHLNote(contactId,
     `[LP DNC v1.0] DNC pushed to Lead Perfection\n` +
     `Code: ${code} (${DNC_LABEL[code]})\n` +
@@ -256,7 +341,9 @@ export async function executeUpdateLPDNCStatus(action) {
 // Compliance: a clear only ever runs off an audited consent.reestablished
 // event (the audit trail). This function never deletes DNC history — the
 // consent event + GHL note ARE the record of why the DNC was lifted.
-async function clearLPDNC({ contactId, ghlContact, payload, empId, prospectId, lpLeadId }) {
+async function clearLPDNC({ contactId, ghlContact, payload, empId, prospectId, lpLeadId }, {
+  lpUpdateDncStatus, sendGroupMeMessage, addGHLNote, applyGHLTag, removeGHLTags, resolveContactInfo,
+}) {
   const source = payload.source || payload.lead_source || payload.reason || 'inbound';
   const phone = ghlContact.phone ? String(ghlContact.phone) : undefined;
 
