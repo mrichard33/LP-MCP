@@ -33,7 +33,9 @@ The repo and the database could not say whether they agreed.
    say so in the file header with the line `-- applied by hand first: <name> <YYYY-MM-DD>`. Without
    it, the PR's drift check sets the pending file aside and reads the hand-made objects as drift; with
    it, statements on objects the file declares are a notice, anything else still fails (2026-10-15,
-   the system-health tables).
+   the system-health tables). A function the file declares counts too, with the
+   `set check_function_bodies = off` line `db diff` puts before it (2026-10-23: n8n's LightFire
+   aged-lead block, applied by hand and recorded by `20261023110000_lf_aged_lead_suppress.sql`).
 5. **One database, one ledger.** Reece-Dashboard, n8n, window-calculator and the AI OS loads put their
    LP-project DDL in THIS folder, in a PR to this repo. DDL for the HL project goes in
    `HL-MCP/supabase/migrations/`. Nothing else writes schema anywhere.

@@ -271,3 +271,57 @@ test('the system-health migration carries the marker', () => {
   assert.ok(HAND_APPLIED_MARKER.test(sql));
   assert.ok(statementDeclared('create table "public"."health_checks" ( "check_id" text )', declaredObjects(sql)));
 });
+
+// 2026-10-23: n8n's LightFire aged-lead block (lf_aged_lead_suppress + a new
+// lf_aged_already_sent body) was applied by hand, and every PR's drift step
+// failed on 18 statements. The old split cut the function body at its inner
+// `);` and left a bare `$function$` no file could declare, and a function was
+// not a declarable object at all. This is the real diff text from that run.
+import { splitDriftStatements } from './check-migrations.js';
+
+const LF_DRIFT = readFileSync(path.join(ROOT, 'scripts/fixtures/drift-2026-10-23-lf-aged.sql'), 'utf8');
+const LF_FILE_NAME = '20261023110000_lf_aged_lead_suppress.sql';
+const LF_FILE = { name: LF_FILE_NAME, sql: readFileSync(path.join(ROOT, MIGRATIONS_DIR, LF_FILE_NAME), 'utf8') };
+
+test('splitDriftStatements keeps a dollar-quoted function body whole', () => {
+  const stmts = splitDriftStatements(LF_DRIFT);
+  assert.equal(stmts.length, 17); // the 18 CI counted, less the bare `$function$` fragment
+  assert.ok(!stmts.includes('$function$'));
+  const fn = stmts.find((s) => s.startsWith('CREATE OR REPLACE FUNCTION public.lf_aged_already_sent'));
+  assert.ok(fn && fn.endsWith('$function$'));
+  assert.deepEqual(splitDriftStatements('a;\nb; c\n;\n'), ['a', 'b; c']);
+});
+
+test('the dollar-aware split leaves the pinned noise hash matching', () => {
+  const sql = readFileSync(path.join(ROOT, 'scripts/fixtures/drift-v-supabase-freshness.sql'), 'utf8');
+  const { remaining, ignored } = filterDrift(sql);
+  assert.deepEqual(remaining, []);
+  assert.equal(ignored.length, 1);
+});
+
+test('the marked lf_aged migration declares its table and its function', () => {
+  assert.ok(HAND_APPLIED_MARKER.test(LF_FILE.sql));
+  const d = declaredObjects(LF_FILE.sql);
+  assert.ok(d.tables.has('lf_aged_lead_suppress'));
+  assert.deepEqual([...d.functions], ['lf_aged_already_sent']);
+});
+
+test('with the marked migration pending, the 2026-10-23 drift is fully recorded', () => {
+  const { remaining } = filterDrift(LF_DRIFT);
+  const { drift, recorded } = splitHandApplied(remaining, [LF_FILE]);
+  assert.deepEqual(drift, []);
+  assert.deepEqual(recorded, [{ name: LF_FILE_NAME, count: 17 }]);
+});
+
+test('without the marker, or for a function the file does not declare, it is still drift', () => {
+  const { remaining } = filterDrift(LF_DRIFT);
+  const unmarked = { ...LF_FILE, sql: LF_FILE.sql.replace(/^-- applied by hand first.*\n/m, '') };
+  assert.equal(splitHandApplied(remaining, [unmarked]).drift.length, 17);
+  const other = [
+    'CREATE OR REPLACE FUNCTION public.some_other_fn(x int) RETURNS int LANGUAGE sql AS $function$ select 1 $function$',
+    'grant execute on function "public"."some_other_fn"(integer) to "anon"',
+  ];
+  assert.deepEqual(splitHandApplied(other, [LF_FILE]).drift, other);
+  // `set check_function_bodies = off` belongs to a file only when it declares a function.
+  assert.deepEqual(splitHandApplied(['set check_function_bodies = off'], [HAND_FILE]).drift, ['set check_function_bodies = off']);
+});
