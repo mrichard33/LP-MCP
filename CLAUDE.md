@@ -913,6 +913,15 @@ Seven rulings. Each change is behind its own flag in `src/mode-registry.js`; the
   `scripts/build-f0-four-step-seed.mjs`), seeded INACTIVE; `nurture-prompt-selector.js` reads version 2 only in four_step
   and version 1 otherwise (`f0FormulaAllows`). Go-live: activate the v2 rows (the UPDATE in the seed's header), then flip
   the mode. `siro_lead_presentation { preview_f0_position, formula: 'four_step' }` previews them while inactive.
+  **The texts are the Reece Team's too (the user, 2026-10-23; `F0_TEXT_VOICE` team (default) | rep).** The email was
+  the team's and the texts John's ("If I could …", "- John"), so one conversation came from two senders and the bot read
+  as John while John texted the lead himself. Team = version-3 rows (`F.0-P[1-5]-<variant>-V3`, variant_label
+  `four-step-team`, `sql/seeds/2026-10-23_f0_v2_four_step_team_voice.sql`, seeded INACTIVE): "we", never "I"; the call
+  is with `{{siro.call_with}}` (the follower first, else the custom value, else "our team"); position 5 signs
+  " - Reece Team". `f0FormulaAllows`: four_step + team reads version 3, rep version 2, v1 neither. `checkF0Copy`
+  formula 'four_step' voice 'team' fails `first_person`, `signed_as_person`, `signature_in_body`, `call_names_other`
+  and, at position 5, `missing_signature`. Go-live: activate the V3 rows (the UPDATE in the seed's header) with the
+  `F0_FORMULA_MODE=four_step` flip. Rollback: `F0_TEXT_VOICE=rep`.
 - **7. No sensitive detail from Siro in any text.** `dropSensitiveDetail` (`src/siro/text-guards.js`, re-exported by
   presentation-facts.js) drops the clause about a death or loss, an illness or the hospital, divorce, a lost job, debt or
   "can't afford", or age, at render time in every bot-facing PRESENTATION line and in `<visit_facts>` (the GHL demo note,
@@ -950,7 +959,7 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   subject ≤ 60, preheader ≤ 90 and not the first sentence, body 120–180 words; never money, offer talk or the word
   "deal" (not even the hint), an exclamation, "founder", "your rep", the sales rep named twice or following up, a
   footer / address / unsubscribe line, a sensitive detail, a quote of the rep or Siro's draft copied. The thank-you
-  opener is allowed. Signed "The Reece Team" since 2026-10-22 (V1, `F0_EMAIL_VOICE=rep`, carries no signature). One re-write, then `suppressed_low_conf`: a quiet exit to
+  opener is allowed. Signed "The Reece Team" by the template since 2026-10-23 (no signature in the body, V1 or V2). One re-write, then `suppressed_low_conf`: a quiet exit to
   position 1, never a fixed email.
 - **The greeting name is cleaned, never the raw field (2026-10-22).** The live preview opened "Hi A," because GHL's
   first name was "a" (LP: "AJ / Anita") and any non-empty GHL name won. `greetingName` (`f0-context.js`): a couple's first
@@ -961,13 +970,17 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   (2026-10-15) → `REHASH_TEAM_USER_NAMES` / the GHL user, else the `rehash_rep_name` custom value, else "Reece Team".
 - **The email is the Reece Team's; the call is with the rehash rep (Mark, 2026-10-22; replaces "written as John, the
   rehash rep", 2026-10-21).** Written and signed as the Reece Team ("we", never "I"); the body ends on the call invite
-  (a conditional offer and a quick call with John, in its own words: the varied close above) and the line "The Reece Team". The rep is the GHL
+  (a conditional offer and a quick call with John, in its own words: the varied close above), with NO sign-off: the GHL
+  template is the email's one signature, "The Reece Team / Reece Windows & Doors" (the user, 2026-10-23; the template had
+  signed `{{custom_values.rehash_rep_name}}` under the body's own "The Reece Team", so every email read signed twice by
+  two senders). Any line after the call question fails `signature_in_body` (or `signed_as_person`). The rep is the GHL
   custom value `rehash_rep_name` FIRST (`resolveEmailRepFirst`; a blank, a failed read or a merge tag is no name), then
   the follower, else the invite is "a quick call with our team" (`{{siro.call_with}}`); never guessed. Prompt
   `F.0-P0-email-V2` (`sql/seeds/2026-10-22_f0_v2_email_prompt_team_voice.sql`, run after the deploy); `checkF0Copy`
-  voice 'team' fails `first_person`, `signed_as_person`, `missing_signature`, `call_names_other`.
-  `F0_EMAIL_VOICE` team (default) | rep: rep reads V1 (left active for this one-variable rollback) and its checks. GHL
-  step 0f From Name = Reece Team. The five texts keep their voice.
+  voice 'team' fails `first_person`, `signed_as_person`, `signature_in_body`, `call_names_other`.
+  `F0_EMAIL_VOICE` team (default) | rep: rep reads V1 (left active for this one-variable rollback) and its checks; a
+  rollback also puts the template's signature line back to `{{custom_values.rehash_rep_name}}`. GHL step 0f From Name =
+  Reece Team. The Four-Step texts are the Reece Team's too since 2026-10-23 (`F0_TEXT_VOICE`, ruling 6 above).
 - **`F0_EMAIL_MODE` off|shadow|live, default shadow, decides the email ALONE** (the user, 2026-10-21: the email and the
   texts go live independently): `F0_V2_MODE=off` and the global `NURTURE_SHADOW_MODE` still stop it, but the `F.0`
   entry in `NURTURE_SHADOW_WORKFLOWS` governs the texts only. Shadow: drafts + an email card in #contact-rehash (all

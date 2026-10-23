@@ -98,6 +98,8 @@ export function asksPositionZero(raw) {
 // value rehash_rep_name; with no name, a call "with our team". The texts keep
 // their voice. F0_EMAIL_VOICE=rep restores the 2026-10-21 email (written as
 // John) and its checks.
+// The signature is the GHL template's (2026-10-23); the name is kept so a
+// sign-off the model writes into the body anyway is recognised and refused.
 export const F0_TEAM_SIGNATURE = 'The Reece Team';
 export const F0_TEAM_CALL_FALLBACK = 'our team';
 export const F0_EMAIL_PROMPT_VERSION = Object.freeze({ team: 2, rep: 1 });

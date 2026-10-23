@@ -265,15 +265,24 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   // first, else the custom value, never guessed: "Reece Team" when none.
   const emailVoice = email ? modes.f0EmailVoice : null;
   const teamEmail = emailVoice === 'team';
+  // 2026-10-23 (the user): the Four-Step texts are the Reece Team's too, so the
+  // email and the texts come from one sender. The texts' call is still with
+  // the follower first (2026-10-15), else the custom value; "Reece Team"
+  // (none found) is no person to call with: "a quick call with our team".
+  const textVoice = !email && modes.f0Formula === 'four_step' ? modes.f0TextVoice : null;
+  const teamText = textVoice === 'team';
   const rehashRepFirst = teamEmail
     ? (await resolveEmailRepFirst(request.contact_id, { env, deps })) || ''
     : await resolveRehashRepFirst(request.contact_id, { env, deps });
+  const textCallWith = teamText ? (rehashRepFirst && rehashRepFirst !== 'Reece Team' ? cleanRepFirst(rehashRepFirst) : null) : null;
   const followupTextLive = modes.followupText === 'live';
   const vars = {
     ...presentationTemplateVars(facts, { followupTextLive }),
     rehash_rep_first_name: rehashRepFirst,
     ...(email ? { email_voice: emailVoice } : {}),
     ...(teamEmail ? { call_with: rehashRepFirst || F0_TEAM_CALL_FALLBACK } : {}),
+    ...(textVoice ? { text_voice: textVoice } : {}),
+    ...(teamText ? { call_with: textCallWith || F0_TEAM_CALL_FALLBACK } : {}),
     days_since_demo: Number.isFinite(age) ? String(Math.floor(age / 24)) : '',
     earlier_closes: earlierClosesLine(earlierOutbound(context?.conversation_recent || [])),
     recording_id: facts?.recording_id || '',

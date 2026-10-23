@@ -30,6 +30,7 @@ const OSL = ['off', 'shadow', 'live'];
 const OL = ['off', 'live'];
 export const F0_FORMULAS = ['v1', 'four_step'];
 export const F0_EMAIL_VOICES = ['team', 'rep'];
+export const F0_TEXT_VOICES = ['team', 'rep'];
 
 // 2026-10-19: a bot-gate run may try SIRO_CONTEXT_MODE, SIRO_FOLLOWUP_TEXT_MODE
 // and F0_FORMULA_MODE without Railway (src/simulator/sim-overrides.js). Outside
@@ -59,6 +60,11 @@ export function siroModes(env = process.env) {
     // rehash_rep_name (prompt F.0-P0-email-V2); rep = the 2026-10-21 email
     // written as the rehash rep (F.0-P0-email-V1). A typo is team.
     f0EmailVoice: pick(env.F0_EMAIL_VOICE, F0_EMAIL_VOICES, 'team'),
+    // The Four-Step texts' voice (the user, 2026-10-23): team = written as the
+    // Reece Team, the call with the rehash rep, the last text signed
+    // " - Reece Team" (version-3 rows); rep = written as the rep (version 2).
+    // Only the four_step formula reads it. A typo is team.
+    f0TextVoice: pick(env.F0_TEXT_VOICE, F0_TEXT_VOICES, 'team'),
   };
 }
 

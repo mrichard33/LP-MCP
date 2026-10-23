@@ -298,6 +298,11 @@ export const MODES = Object.freeze([
     goLive: 'live by Mark\'s ruling (2026-10-22): the F.0 v2 email is the Reece Team\'s; rep is the rollback',
     note: 'F.0 v2 position-0 email voice (src/siro/f0-email.js): team = written and signed as "The Reece Team" ("we", never "I"), the call invite names the rep from the GHL custom value rehash_rep_name (else the follower, else "our team"), prompt F.0-P0-email-V2; rep = the 2026-10-21 email written as the rehash rep, prompt F.0-P0-email-V1 and its checks. The texts are unchanged.',
   }),
+  m('F0_TEXT_VOICE', 'bot', 'enum', ['team', 'rep'], 'team', { live: ['team'], off: ['rep'] }, {
+    since: '2026-10-23', decider: 'the user', evidence: { table: 'agentic_messages' },
+    goLive: 'live by the user\'s ruling (2026-10-23): the F.0 Four-Step texts are the Reece Team\'s, like the email; rep is the rollback. Activate the version-3 rows with the F0_FORMULA_MODE=four_step flip',
+    note: 'F.0 v2 Four-Step text voice (src/siro/f0-context.js): team = written as the Reece Team ("we", never "I"), the call with the rehash rep ({{siro.call_with}}, else "our team"), the last text signed " - Reece Team", prompt rows version 3 (four-step-team); rep = written as the rehash rep, version-2 rows. Read only with F0_FORMULA_MODE=four_step.',
+  }),
   m('F0_TEST_LINKS', 'bot', 'choice', ['', '<testContactId>:<realLpLeadId>,…'], '', {}, {
     since: '2026-10-21', decider: 'Mark', evidence: { table: 'agentic_messages' },
     goLive: 'empty = off; set per test contact ("testContactId:realLpLeadId,…"), only contacts tagged aios-test are linked',

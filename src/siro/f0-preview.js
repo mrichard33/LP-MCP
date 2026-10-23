@@ -82,6 +82,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
       formula: fourStep ? 'four_step' : 'v1', slots, firstName: fourStep ? (f0.vars?.first_name || null) : (context?.lead?.first_name || null),
       followupText: f0.vars.followup_text_line ? f0.facts?.followup_text || null : null,
       earlierMessages: f0.earlierMessages || [],
+      voice: f0.vars.text_voice || 'rep', callWith: f0.vars.call_with || null,
     });
     return { out, safety, f0Failures, slots };
   };
@@ -91,7 +92,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
     retried = await attempt({
       ...prompt,
       system_prompt: `${prompt.system_prompt}\n\nIMPORTANT: A previous attempt failed these checks: ${[...first.safety.failures, ...first.f0Failures].join(', ')}.` +
-        (first.f0Failures.length ? `\n\n${f0RetryNote(first.f0Failures, { position: pos, formula: email ? 'email' : fourStep ? 'four_step' : 'v1', voice: f0.vars.email_voice || 'rep' })}` : ''),
+        (first.f0Failures.length ? `\n\n${f0RetryNote(first.f0Failures, { position: pos, formula: email ? 'email' : fourStep ? 'four_step' : 'v1', voice: (email ? f0.vars.email_voice : f0.vars.text_voice) || 'rep' })}` : ''),
     });
   }
   const final = retried || first;
@@ -127,7 +128,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
     would_generate: !interrupt,
     prompt_code: prompt.prompt_code,
     formula: fourStep ? 'four_step' : 'v1',
-    ...(fourStep ? { objection_type: f0.vars.objection_type, story_angle: f0.vars.story_angle, slots: final.slots } : {}),
+    ...(fourStep ? { objection_type: f0.vars.objection_type, story_angle: f0.vars.story_angle, slots: final.slots, voice: f0.vars.text_voice || null, call_with: f0.vars.call_with || null } : {}),
     recording_id: f0.recordingId,
     rep_first_name: f0.vars.rehash_rep_first_name,
     text: final.out?.sms_body || null,
