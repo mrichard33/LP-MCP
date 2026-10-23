@@ -167,7 +167,7 @@ test('checkF0Copy email: every rule fails on its own', () => {
     [BODY, { preheader: 'Thank you for having us out and for showing Alex around the house.' }, 'preheader_repeats_body'],
     ['Hi James,\n\nThank you for having us out. If I could make the numbers work better for you both, would you be open to a quick call with John?', {}, 'body_length'],
     [swap('Hi James,', 'Hello there,'), {}, 'first_name_not_first'],
-    [swap('If I could make the numbers work better for you both, would you be open to a quick call with John?', 'Would you be open to a quick call with John?'), {}, 'no_if_i_could'],
+    [swap('If I could make the numbers work better for you both, would you be open to a quick call with John?', 'Would you be open to a quick call with John?'), {}, 'no_conditional_offer'],
     [BODY, { slots: { ...SLOTS, hesitation: 'they want a pool and a new roof' } }, 'slot_ungrounded:hesitation'],
     [BODY, { slots: { ...SLOTS, reframe: null } }, 'slot_missing:reframe'],
     [BODY, { facts: null }, 'no_visit_facts'],

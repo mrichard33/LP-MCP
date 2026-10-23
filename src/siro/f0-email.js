@@ -8,6 +8,9 @@
  * ("What we saw at your home, <name>"): nothing of that copy carries over but
  * its job (thank them for the visit, reflect what was found, set up the call).
  *
+ * 2026-10-22 (Mark): the email is now written and signed as the Reece Team;
+ * the call invite still names the rehash rep (F0_EMAIL_VOICE, below).
+ *
  * One rule, one home: the position, the mode, the hold cap and the output
  * shape live here; the copy checks are checkF0Copy formula 'email'
  * (f0-copy-checks.js); the orchestrator and the preview only call these.
@@ -88,6 +91,20 @@ export function asksPositionZero(raw) {
   if (raw === null || raw === undefined || raw === '') return false;
   const n = Number(raw);
   return Number.isFinite(n) && Math.floor(n) === 0;
+}
+
+// 2026-10-22 (Mark): the email is written and signed as the Reece Team ("we",
+// never "I") and invites a call with the rehash rep named by the GHL custom
+// value rehash_rep_name; with no name, a call "with our team". The texts keep
+// their voice. F0_EMAIL_VOICE=rep restores the 2026-10-21 email (written as
+// John) and its checks.
+export const F0_TEAM_SIGNATURE = 'The Reece Team';
+export const F0_TEAM_CALL_FALLBACK = 'our team';
+export const F0_EMAIL_PROMPT_VERSION = Object.freeze({ team: 2, rep: 1 });
+
+/** F0_EMAIL_VOICE team|rep, default team (a typo is team). */
+export function f0EmailVoice(env = process.env) {
+  return siroModes(env).f0EmailVoice;
 }
 
 /** F0_EMAIL_MODE off|shadow|live, default shadow (a typo is shadow). */
