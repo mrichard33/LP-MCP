@@ -34,7 +34,9 @@ export async function leadsByMarketFor({ from, to, subSources = [] }, { supabase
   const wanted = new Set((subSources || []).filter(Boolean));
   const out = {};
   for (const r of data || []) {
-    if (!r.market) continue;
+    // A real market only: leads created include OUT_OF_AREA / UNASSIGNED, which
+    // are not offices (issued leads never landed there), so they carry no cost.
+    if (!r.market || !/_MKT$/.test(r.market)) continue;
     if (wanted.size && !wanted.has(r.lp_sub_source)) continue;
     out[r.market] = (out[r.market] || 0) + Number(r.raw || 0);
   }

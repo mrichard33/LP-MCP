@@ -119,6 +119,15 @@ test('the issued basis for a slice is its whole calendar month, not the days the
   assert.deepEqual(rows.map((r) => [r.market, r.amount]), [['STPET_MKT', 100]]);
 });
 
+test('by source: leads created in OUT_OF_AREA / UNASSIGNED carry no cost (2026-10-23)', async () => {
+  const { leadsByMarketFor } = await import('../src/marketing/allocation-io.js');
+  const supabase = { rpc: async () => ({ data: [
+    { market: 'ORL_MKT', lp_sub_source: 'HomeBuddy', raw: 28 }, { market: 'OUT_OF_AREA', lp_sub_source: 'HomeBuddy', raw: 4 },
+    { market: 'UNASSIGNED', lp_sub_source: 'HomeBuddy', raw: 2 }, { market: 'JAX_MKT', lp_sub_source: 'Modernize', raw: 9 },
+  ], error: null }) };
+  assert.deepEqual(await leadsByMarketFor({ from: '2026-09-01', to: '2026-09-30', subSources: ['HomeBuddy'] }, { supabase }), { ORL_MKT: 28 });
+});
+
 // 2026-10-14, the user: a call-center cost and a software cost, each split among all offices.
 import { costCategory, COST_CATEGORIES, OFFICE_MARKETS } from '../src/marketing/allocation.js';
 import { SPLIT_OPTIONS, splitChoice, splitLabel, marketsForSplit, subSourcesForSplit } from '../src/marketing/slack-review.js';
