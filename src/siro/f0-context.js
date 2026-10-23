@@ -135,10 +135,12 @@ export async function resolveRehashRepFirst(contactId, { env = process.env, deps
 /**
  * A rep's first name fit to print, or null: the first word of the value,
  * letters only. A merge tag ("{{custom_values.rehash_rep_name}}"), a blank or
- * anything else is no name, so a tag can never reach a draft. Pure.
+ * anything else is no name, so a tag can never reach a draft; nor is "Reece". Pure.
  */
 export function cleanRepFirst(raw) {
   const first = repFirstName(String(raw ?? '').trim());
+  // "Reece" is the company, never a person (2026-10-23: "a quick call with Reece").
+  if (/^reece$/i.test(first || '')) return null;
   return first && /^\p{L}[\p{L}'’-]*$/u.test(first) ? first : null;
 }
 
@@ -266,15 +268,17 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   const emailVoice = email ? modes.f0EmailVoice : null;
   const teamEmail = emailVoice === 'team';
   // 2026-10-23 (the user): the Four-Step texts are the Reece Team's too, so the
-  // email and the texts come from one sender. The texts' call is still with
-  // the follower first (2026-10-15), else the custom value; "Reece Team"
-  // (none found) is no person to call with: "a quick call with our team".
+  // email and the texts come from one sender, and they name ONE rep: the
+  // email's (resolveEmailRepFirst: the custom value first, then a rehash-team
+  // follower). The follower-first read printed "a quick call with Reece" for a
+  // lead whose follower was a "Reece …" user (2026-10-23). None found: "a quick
+  // call with our team". Rep voice keeps the follower-first read (the rollback).
   const textVoice = !email && modes.f0Formula === 'four_step' ? modes.f0TextVoice : null;
   const teamText = textVoice === 'team';
-  const rehashRepFirst = teamEmail
+  const rehashRepFirst = teamEmail || teamText
     ? (await resolveEmailRepFirst(request.contact_id, { env, deps })) || ''
     : await resolveRehashRepFirst(request.contact_id, { env, deps });
-  const textCallWith = teamText ? (rehashRepFirst && rehashRepFirst !== 'Reece Team' ? cleanRepFirst(rehashRepFirst) : null) : null;
+  const textCallWith = teamText ? rehashRepFirst || null : null;
   const followupTextLive = modes.followupText === 'live';
   const vars = {
     ...presentationTemplateVars(facts, { followupTextLive }),
