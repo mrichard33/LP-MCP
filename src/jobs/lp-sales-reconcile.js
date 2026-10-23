@@ -143,7 +143,7 @@ async function walkEach(fetch, idOf, label, onPage) {
     const page = await walker.next(); // throws on a hard failure: a truncated list is not a complete one
     if (page.done) break;
     await onPage(page.items);
-    if (++pages % 20 === 0) console.log(`${label} ${pages} pages read`);
+    pages++;
   }
 }
 
@@ -189,25 +189,38 @@ export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn
     }));
   };
 
-  // 1. Every lead LP lists as entered in the period. LP's date filter reads
-  //    `dateentered`, LP 136 reads `entrydate`; they differ by a day at most
-  //    (lead 571626: entered 8/31 15:10, entry date 9/1), so two days either side.
-  await walkEach(
-    ({ PageSize, StartIndex }) => d.getLeads({
-      startdate: addDays(period.from, -2), enddate: addDays(period.to, 2), options: 0, PageSize, StartIndex,
-    }).then(extractArray),
-    (r) => r?.cst_id ?? null, '[SalesReconcile:leads]',
-    async (items) => {
-      stats.lp_prospects += items.length;
-      for (const p of items) {
-        for (const l of getField(p, 'leads', 'Leads') || []) {
-          const ed = String(getField(l, 'entrydate', 'EntryDate') || '').slice(0, 10);
-          if (ed >= period.from && ed <= period.to) stats.lp_leads_in_period++;
-        }
+  // 1. Every lead LP lists as entered in the period, ONE DAY AT A TIME. LP's
+  //    paging is unreliable deep into a long window: on 2026-10-23 a month-long
+  //    walk fell back to one row per call at row 11,385 on one pass and stopped
+  //    at row 251 on the next (a page and a row probe disagreed). A day is a few
+  //    pages. LP's filter reads `dateentered`, LP 136 reads `entrydate`; they
+  //    differ by a day at most (lead 571626: entered 8/31 15:10, entry date
+  //    9/1), so the days run from the day before to the day after.
+  const onPage = async (items) => {
+    stats.lp_prospects += items.length;
+    for (const p of items) {
+      for (const l of getField(p, 'leads', 'Leads') || []) {
+        const ed = String(getField(l, 'entrydate', 'EntryDate') || '').slice(0, 10);
+        if (ed >= period.from && ed <= period.to) stats.lp_leads_in_period++;
       }
-      await runPool(items, handle);
-    },
-  );
+    }
+    await runPool(items, handle);
+  };
+  stats.days_failed = [];
+  for (let dayIso = addDays(period.from, -1); dayIso <= addDays(period.to, 1); dayIso = addDays(dayIso, 1)) {
+    try {
+      await walkEach(
+        ({ PageSize, StartIndex }) => d.getLeads({
+          startdate: dayIso, enddate: addDays(dayIso, 1), options: 0, PageSize, StartIndex,
+        }).then(extractArray),
+        (r) => r?.cst_id ?? null, `[SalesReconcile:leads ${dayIso}]`, onPage,
+      );
+      console.log(`[SalesReconcile] ${dayIso} read: ${stats.lp_prospects} customers so far, ${stats.resynced} re-synced, ${stats.jobs_marked_deleted} jobs gone from LP`);
+    } catch (err) {
+      stats.days_failed.push(dayIso);
+      console.warn(`[SalesReconcile] day ${dayIso} read failed: ${err.message}`);
+    }
+  }
 
   console.log(`[SalesReconcile] phase 1 (leads entered): ${JSON.stringify({ ...stats, samples: stats.samples.slice(0, 5) })}`);
 
@@ -247,7 +260,8 @@ export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn
     .is('lp_deleted_at', null)
     .limit(20000);
   if (oErr) console.warn(`[SalesReconcile] stored-lead read failed: ${oErr.message}`);
-  const unseen = (ours || []).filter((r) => !seenLeads.has(String(r.lp_lead_id))).slice(0, MAX_ID_CHECKS());
+  // A day LP could not list would make every lead of that day look unseen.
+  const unseen = stats.days_failed.length ? [] : (ours || []).filter((r) => !seenLeads.has(String(r.lp_lead_id))).slice(0, MAX_ID_CHECKS());
   stats.leads_unseen = (ours || []).filter((r) => !seenLeads.has(String(r.lp_lead_id))).length;
   await runPool(unseen, async (r) => {
     stats.leads_checked_by_id++;
