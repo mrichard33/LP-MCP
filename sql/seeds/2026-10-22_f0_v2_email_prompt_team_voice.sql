@@ -13,10 +13,14 @@
 -- it on makes F0_EMAIL_VOICE=rep a one-variable rollback.
 --
 -- The model reads CALL WITH ({{siro.call_with}}: "John", or "our team" when no
--- name was found) and ends the body with the line "The Reece Team". checkF0Copy
--- formula 'email', voice 'team' fails a first-person email, a person's
--- signature, a missing "The Reece Team" line and an invite naming anyone else
--- (one re-write, then suppressed_low_conf).
+-- name was found) and ends the body on the call invite. 2026-10-23 (the user):
+-- the GHL template is the ONE signature ("The Reece Team / Reece Windows &
+-- Doors"), so the body carries no sign-off; before, the body's "The Reece Team"
+-- sat above the template's {{custom_values.rehash_rep_name}}. checkF0Copy
+-- formula 'email', voice 'team' fails a first-person email, any sign-off in the
+-- body (signature_in_body / signed_as_person) and an invite naming anyone else
+-- (one re-write, then suppressed_low_conf). Re-running this seed updates the
+-- copy in place.
 --
 -- Run AFTER the code that reads F0_EMAIL_VOICE is deployed (the old code would
 -- pick this row with the old checks). Inserted ACTIVE; re-running this seed
@@ -31,12 +35,12 @@ values
    $f0$You write ONE email from the Reece Team to a homeowner, sent the evening of the in-home visit, after the visit ended without a sale. Write it for THIS homeowner from <visit_facts> only. Write as the team: "we", "us", "our". Never "I", "me" or "my".
 Its job: thank them for having us out, reflect what the visit found and what they told us they wanted, name their main hesitation in their words without arguing, and invite one quick call with CALL WITH.
 Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" hints that we may be able to make it work better for them, without naming how. If a slot has no support in <visit_facts>, set it to null; do not invent.
-Then write the email from the slots. The body ENDS with the call invite, its only question: a conditional offer built from slot "if_i_could" and a quick call with CALL WITH, then a blank line and the sign-off line "The Reece Team". "If we could …, would you be open to a quick call with John?" is the idea, not a script: word it your own way, and never reuse the wording of a close listed in EARLIER CLOSES.
+Then write the email from the slots. The body ENDS with the call invite, its only question: a conditional offer built from slot "if_i_could" and a quick call with CALL WITH. Nothing comes after it: no sign-off and no name, because the email template signs it "The Reece Team, Reece Windows & Doors". "If we could …, would you be open to a quick call with John?" is the idea, not a script: word it your own way, and never reuse the wording of a close listed in EARLIER CLOSES.
 
 THE EMAIL RULES (never break these):
 - Subject: 60 characters or fewer, with their first name or their home in it (for example "Thank you for having us, Carla"). No question, no clickbait.
 - Preheader: 90 characters or fewer. It is never the body's first sentence.
-- Body: plain text, 120 to 180 words, 3 or 4 short paragraphs separated by a blank line, starting "Hi [FIRST NAME],". The last line of the body is exactly "The Reece Team", on its own after the call invite. No other sign-off ("Best,", "Thanks,"), no person's name or signature, no footer, address, phone, link or unsubscribe line: the template adds the footer.
+- Body: plain text, 120 to 180 words, 3 or 4 short paragraphs separated by a blank line, starting "Hi [FIRST NAME],". The body ENDS on the call invite. No sign-off of any kind ("The Reece Team", "Best,", "Thanks,"), no person's name or signature, no footer, address, phone, link or unsubscribe line: the template adds the signature and the footer.
 - Voice: the Reece Team. "We", "us", "our" throughout, in the subject, preheader, body and P.S. Never "I", "me", "my" or "myself".
 - The call invite names CALL WITH exactly as given and nobody else. If CALL WITH is "our team", write "a quick call with our team".
 - P.S.: one optional line, never an offer and never a question. Leave it "" when there is nothing worth adding.
@@ -65,10 +69,11 @@ You also told us that after just taking on the new AC, you want the numbers to f
 What stayed with us is how much you want that entry sealed up before the next storm season, so the hallway stays dry and you stop fighting the bugs at the door. That is the kind of project we like to get right.
 
 There may be a way to make the numbers work better for you. Would you be open to a quick call with John to see?
-
-The Reece Team
 - GOOD ps: ""
 - BAD, written as one person and signed by them: "I wanted to reach out myself about your front door. Best, John"
+- BAD, a sign-off the template already adds: "… a quick call with John to see?
+
+The Reece Team"
 - BAD, the call with someone other than CALL WITH: "Would you be open to a quick call with Alex?"
 - BAD, an exclamation, a price, a day and the person who came out following up: "Thanks for having us! Alex will follow up with you Thursday about the $11,000 quote."
 - BAD, a sensitive detail: "Hi James, we were so sorry to hear about your wife."
@@ -83,10 +88,10 @@ EARLIER CLOSES (never reuse their wording):
 
 {{siro.visit_facts}}
 
-Fill the four slots from <visit_facts> first, then write the email from the slots only, as the Reece Team, ending with the line "The Reece Team".
+Fill the four slots from <visit_facts> first, then write the email from the slots only, as the Reece Team, ending on the call invite (no sign-off: the template signs).
 Return JSON only: {"subject": "…", "preheader": "…", "body": "…", "ps": "…", "slots": {"hesitation": "…"|null, "affirm": "…"|null, "reframe": "…"|null, "if_i_could": "…"|null}}$f0$,
    $f0${"type":"object","required":["subject","preheader","body","ps","slots"],"properties":{"subject":{"type":"string"},"preheader":{"type":"string"},"body":{"type":"string"},"ps":{"type":"string"},"slots":{"type":"object","required":["hesitation","affirm","reframe","if_i_could"],"properties":{"hesitation":{"type":["string","null"]},"affirm":{"type":["string","null"]},"reframe":{"type":["string","null"]},"if_i_could":{"type":["string","null"]}}}}}$f0$::jsonb, 2000, 0.7, true, 2, $f0$email-team$f0$,
-   $f0$F.0 v2 position-0 email in the Reece Team voice (Mark, 2026-10-22): signed "The Reece Team", the call invite names the rehash rep (custom value rehash_rep_name). Read with F0_EMAIL_VOICE=team; rep reads F.0-P0-email-V1.$f0$)
+   $f0$F.0 v2 position-0 email in the Reece Team voice (Mark, 2026-10-22): the template signs "The Reece Team" (2026-10-23), the call invite names the rehash rep (custom value rehash_rep_name). Read with F0_EMAIL_VOICE=team; rep reads F.0-P0-email-V1.$f0$)
 on conflict (prompt_code) do update set
   workflow_code = excluded.workflow_code,
   channel = excluded.channel,

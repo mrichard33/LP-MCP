@@ -194,9 +194,11 @@ function emailFailures(body, { subject = '', preheader = '', ps = '', salesRepFi
   return fail;
 }
 
-// The Reece Team email (Mark, 2026-10-22): signed "The Reece Team" on the line
-// after the call invite, written as "we", never "I", and the invite names the
-// resolved rehash rep (or "our team" when no name was found).
+// The Reece Team email (Mark, 2026-10-22): written as "we", never "I", and the
+// invite names the resolved rehash rep (or "our team" when no name was found).
+// 2026-10-23 (the user): the GHL template signs it ("The Reece Team / Reece
+// Windows & Doors"), so the body ends on the call question with no sign-off;
+// before, the body's "The Reece Team" sat above the template's "John".
 const TEAM_SIGNATURE_RX = new RegExp(`^${escRx(F0_TEAM_SIGNATURE)}\\.?$`, 'i');
 const FIRST_PERSON_I_RX = /\bI(?:['’](?:m|ve|d|ll))?\b/;
 const FIRST_PERSON_OBJ_RX = /\b(?:me|my|mine|myself)\b/i;
@@ -218,10 +220,10 @@ export function splitTeamSignature(body) {
 function teamVoiceFailures(body, { subject = '', preheader = '', ps = '', callWith = null, salesRepFirstName = null } = {}) {
   const fail = [];
   const { content, signature } = splitTeamSignature(body);
-  if (!TEAM_SIGNATURE_RX.test(signature)) {
-    const person = signature && !/\breece\b/i.test(signature)
+  if (signature) {
+    const person = !TEAM_SIGNATURE_RX.test(signature) && !/\breece\b/i.test(signature)
       && (SIGN_OFF_WORD_RX.test(signature) || signature.split(/\n/).some(l => PERSON_LINE_RX.test(l.trim())));
-    fail.push(person ? 'signed_as_person' : 'missing_signature');
+    fail.push(person ? 'signed_as_person' : 'signature_in_body');
   }
   const all = [subject, preheader, content, ps].filter(Boolean).join('\n');
   if (FIRST_PERSON_I_RX.test(all) || FIRST_PERSON_OBJ_RX.test(all)) fail.push('first_person');
@@ -343,7 +345,8 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     emoji: 'No emoji.',
     em_dash: 'No dashes like — or –.',
     generic_opener: 'Do not open with "thanks for having us" or "just checking in".',
-    missing_signature: teamEmail ? 'End the body with the line "The Reece Team" on its own, after the call invite, and nothing else.' : 'Sign with the rep first name at the very end.',
+    missing_signature: 'Sign with the rep first name at the very end.',
+    signature_in_body: 'End the body on the call question. No sign-off and no name after it: the template signs the email.',
     not_personalized: 'Name one specific thing from their visit.',
     empty: 'Write the message.',
     rep_quoted: 'Never quote the rep ("your rep said").',
@@ -353,7 +356,7 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     first_name_not_first: 'Start the text with their first name.',
     no_conditional_offer: 'Before the call question, offer to make it work better for them, in your own words (for example "if there\'s a way to …", "we may be able to …"). It does not have to say "If I could".',
     close_repeated: 'The close repeats one we already sent this lead. Word the call question a new way, and do not use "if I could" or "if we could" again.',
-    no_call_question: teamEmail ? 'End the email on one question asking for a quick call with <CALL WITH>, in your own words, then the line "The Reece Team".' : 'End with one question asking for a quick call with <rep first name>, in your own words.',
+    no_call_question: teamEmail ? 'End the email on one question asking for a quick call with <CALL WITH>, in your own words, and nothing after it.' : 'End with one question asking for a quick call with <rep first name>, in your own words.',
     'slot_missing:hesitation': 'Fill the hesitation slot from <visit_facts>.',
     'slot_missing:reframe': 'Fill the reframe slot from <visit_facts>.',
     'slot_ungrounded:hesitation': position === 3 ? 'Slot 1 must come from what the home means to them in <visit_facts>.' : 'The hesitation slot must restate their hesitation from <visit_facts>, in their words.',
@@ -370,7 +373,7 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     sales_rep_named_twice: 'Name the person who visited at most once.',
     no_visit_facts: 'There is no visit on file.',
     first_person: 'Write as the Reece Team: "we", "us", "our". Never "I", "me" or "my".',
-    signed_as_person: 'Sign as the Reece Team, never as a person: the last line is exactly "The Reece Team".',
+    signed_as_person: 'Never sign as a person, and write no sign-off at all: the body ends on the call question and the template signs the email.',
     call_names_other: 'The call invite names only the rep given in CALL WITH.',
     email_output: 'Answer as JSON: {"subject", "preheader", "body", "ps", "slots": {"hesitation", "affirm", "reframe", "if_i_could"}}.',
   };

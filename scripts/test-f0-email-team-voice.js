@@ -2,6 +2,9 @@
  * F.0 v2 email in the Reece Team voice — scripts/test-f0-email-team-voice.js (Mark, 2026-10-22)
  * Run: node --test scripts/test-f0-email-team-voice.js
  *
+ * 2026-10-23 (the user): the GHL template is the email's one signature ("The
+ * Reece Team / Reece Windows & Doors"), so the body ends on the call question.
+ *
  * The ruling: the email is written and signed as the Reece Team ("we", never
  * "I"), and the call invite names the rehash rep from the GHL custom value
  * rehash_rep_name (else the follower, else "our team"). F0_EMAIL_VOICE=rep is
@@ -42,9 +45,7 @@ We understand you want your grandson to look over the numbers before you commit 
 
 What stayed with us is how much you want the home protected and looking its best when the family visits for Christmas. Getting those rotting windows replaced before then is exactly the kind of project we like to get right.
 
-If we could make the numbers work better for you both, would you be open to a quick call with John?
-
-The Reece Team`;
+If we could make the numbers work better for you both, would you be open to a quick call with John?`;
 const SLOTS = {
   hesitation: 'you want your grandson to look over the numbers',
   affirm: 'that makes complete sense',
@@ -134,7 +135,7 @@ test('rep voice and the texts keep the follower first; no email vars on a text',
 test('checkF0Copy team: the Reece Team email passes', () => {
   const words = splitTeamSignature(BODY).content.split(/\s+/).filter(Boolean).length;
   assert.ok(words >= 120 && words <= 180, `body is ${words} words`);
-  assert.equal(splitTeamSignature(BODY).signature, F0_TEAM_SIGNATURE);
+  assert.equal(splitTeamSignature(BODY).signature, '', 'the body ends on the call question');
   assert.deepEqual(checkF0Copy(BODY, opts()), []);
 });
 
@@ -151,15 +152,18 @@ test('checkF0Copy team: a first-person draft fails', () => {
   assert.ok(checkF0Copy(BODY.replace('If we could', 'If I could'), opts()).includes('first_person'));
 });
 
-test('checkF0Copy team: signed as a person, no signature, or the invite names someone else', () => {
-  const signed = (sig) => BODY.replace(/The Reece Team$/, sig);
+test('checkF0Copy team: any sign-off in the body fails (the template signs), or the invite names someone else', () => {
+  const signed = (sig) => `${BODY}\n\n${sig}`;
   assert.ok(checkF0Copy(signed('John'), opts()).includes('signed_as_person'));
   assert.ok(checkF0Copy(signed('Best,\nJohn'), opts()).includes('signed_as_person'));
   assert.ok(checkF0Copy(signed('- John Manieri'), opts()).includes('signed_as_person'));
-  assert.ok(checkF0Copy(signed(''), opts()).includes('missing_signature'));
-  // "Best," before the team line: the autofix would strip the whole paragraph.
-  assert.ok(checkF0Copy(signed('Best,\nThe Reece Team'), opts()).includes('missing_signature'));
-  assert.deepEqual(checkF0Copy(signed('The Reece Team.'), opts()), []);
+  // 2026-10-23: the team's own name in the body would print twice with the template's.
+  for (const sig of [F0_TEAM_SIGNATURE, 'The Reece Team.', 'Best,\nThe Reece Team', 'Reece Windows & Doors']) {
+    const fails = checkF0Copy(signed(sig), opts());
+    assert.ok(fails.includes('signature_in_body') && !fails.includes('missing_signature'), `${sig}: ${JSON.stringify(fails)}`);
+  }
+  assert.deepEqual(checkF0Copy(BODY, opts()), [], 'no sign-off passes');
+  assert.ok(!checkF0Copy(BODY, opts()).includes('missing_signature'));
   const other = (who) => BODY.replace('a quick call with John?', `a quick call with ${who}?`);
   assert.ok(checkF0Copy(other('Alex'), opts()).includes('call_names_other'));
   assert.ok(checkF0Copy(other('Maria'), opts()).includes('call_names_other'));
@@ -169,19 +173,22 @@ test('checkF0Copy team: signed as a person, no signature, or the invite names so
 });
 
 test('the re-write note speaks to the team voice', () => {
-  const note = f0RetryNote(['first_person', 'signed_as_person', 'missing_signature', 'call_names_other', 'no_conditional_offer', 'no_call_question'], { position: 0, formula: 'email', voice: 'team' });
+  const note = f0RetryNote(['first_person', 'signed_as_person', 'signature_in_body', 'call_names_other', 'no_conditional_offer', 'no_call_question'], { position: 0, formula: 'email', voice: 'team' });
   assert.match(note, /Never "I", "me" or "my"/);
-  assert.match(note, /exactly "The Reece Team"/);
-  assert.match(note, /End the body with the line "The Reece Team"/);
+  assert.match(note, /write no sign-off/);
+  assert.match(note, /End the body on the call question\. No sign-off/);
+  assert.match(note, /template signs the email/);
+  assert.doesNotMatch(note, /line "The Reece Team"/);
   assert.match(note, /CALL WITH/);
   assert.match(note, /in your own words/);
   // The texts' signature note is unchanged.
   assert.match(f0RetryNote(['missing_signature'], { position: 5 }), /rep first name/);
 });
 
-test('the email output keeps the team line and carries no merge tag', () => {
+test('the email output ends on the call question, no signature paragraph, no merge tag', () => {
   const out = f0EmailOutput({ ...EMAIL, body: BODY, slots: SLOTS });
-  assert.match(out.body_html, /<p>The Reece Team<\/p>$/);
+  assert.match(out.body_html, /quick call with John\?<\/p>$/);
+  assert.doesNotMatch(out.body_html, /Reece Team/);
   noTags(out);
 });
 
@@ -204,7 +211,8 @@ test('the V2 seed: active, version 2, CALL WITH, and its example passes the team
   assert.doesNotMatch(sql, /active = excluded\.active/);
   assert.doesNotMatch(sql, /REP FIRST NAME/);
   const ex = sql.match(/- GOOD body:\n([\s\S]*?)\n- GOOD ps:/)[1];
-  assert.match(ex, /\n\nThe Reece Team$/);
+  assert.match(ex, /quick call with John to see\?$/, 'the example ends on the call question: the template signs');
+  assert.match(sql, /BAD, a sign-off the template already adds/);
   const { content } = splitTeamSignature(ex);
   const words = content.split(/\s+/).filter(Boolean).length;
   assert.ok(words >= 120 && words <= 180, `example is ${words} words`);
@@ -234,8 +242,8 @@ test('preview: team voice reads V2 and checks the team rules; no merge tag in th
     });
     assert.equal(res.voice, 'team');
     assert.equal(res.call_with, 'John');
-    assert.match(res.body, /quick call with John\?\n\nThe Reece Team$/);
-    for (const f of ['first_person', 'signed_as_person', 'missing_signature', 'call_names_other', 'no_conditional_offer']) {
+    assert.match(res.body, /quick call with John\?$/);
+    for (const f of ['first_person', 'signed_as_person', 'signature_in_body', 'call_names_other', 'no_conditional_offer']) {
       assert.ok(!(Array.isArray(res.checks.f0) && res.checks.f0.includes(f)), `${f}: ${JSON.stringify(res.checks)}`);
     }
     noTags({ subject: res.subject, preheader: res.preheader, body: res.body, ps: res.ps });

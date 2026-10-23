@@ -112,12 +112,18 @@ nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
     lead, suppressed, F0_EMAIL_MODE off, prompt not active): go to 0g quietly.
     Timeout with an id → in approval too long: go to 0g (no email).
 0f. **Send email** with the branded template: subject `{{contact.ai_email_subject_draft}}`,
-    preheader **AI Email Preview Draft** (`C8mSMxWqXGr1HvxrImyx`, `{{contact.ai_email_preheader_draft}}`), body `{{contact.ai_email_body_draft}}`
+    preheader **AI Email Preview Draft** (`C8mSMxWqXGr1HvxrImyx`, merge tag `{{contact.ai_email_preview_draft}}`:
+    the field key GHL gave it; `{{contact.ai_email_preheader_draft}}` never existed), body `{{contact.ai_email_body_draft}}`
     (HTML paragraphs), P.S. `{{contact.ai_email_ps_draft}}` (the Template A / B
     branch as S4.5: an empty P.S. means no P.S. block). **From Name: Reece Team**
-    (was the rehash rep, John, until 2026-10-22); keep the From email as it is. The
-    body ends with the line "The Reece Team", so the template adds no personal
-    signature. The template's footer reads only "Protecting families since 1972"
+    (was the rehash rep, John, until 2026-10-22); keep the From email as it is.
+    **The template is the email's ONE signature (2026-10-23), in BOTH Template A and B:**
+    replace the `{{custom_values.rehash_rep_name}}` line with the plain text
+    `The Reece Team`, and keep `Reece Windows & Doors` under it. The body ends on the
+    call question with no sign-off (checked in code), so the email reads
+    "… a quick call with John?" then "The Reece Team / Reece Windows & Doors". Do not
+    change the custom value `rehash_rep_name` itself: the call invite and the rehash
+    reply bot read it. The template's footer reads only "Protecting families since 1972"
     (fix the trust band in the template; the model never writes a footer, an
     address or an unsubscribe line). Then **Webhook POST**
     `/api/agentic/messages/engagement` with `generation_id = {{contact.ai_msg_generation_id}}`,
