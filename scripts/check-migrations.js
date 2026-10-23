@@ -213,10 +213,41 @@ function statementHash(stmt) {
   return createHash('sha256').update(stmt).digest('hex').slice(0, 16);
 }
 
-/** Split `db diff` output into statements, whitespace-collapsed. */
+/**
+ * Split `db diff` output into statements, whitespace-collapsed.
+ *
+ * 2026-10-23: a split only OUTSIDE a dollar quote. n8n's lf_aged_already_sent
+ * body (applied by hand that morning) holds `);` + newline, so the old split cut
+ * it in two and left a bare `$function$` statement no migration could declare.
+ * Text with no dollar quote splits exactly as before, so the pinned noise hashes
+ * still match.
+ */
 export function splitDriftStatements(sql) {
-  return String(sql)
-    .split(/;\s*(?:\n|$)/)
+  const text = String(sql);
+  const parts = [];
+  let start = 0;
+  let quote = null;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '$') {
+      const tag = /^\$[A-Za-z_]*\$/.exec(text.slice(i));
+      if (tag) {
+        if (quote === null) quote = tag[0];
+        else if (tag[0] === quote) quote = null;
+        i += tag[0].length - 1;
+        continue;
+      }
+    }
+    if (ch === ';' && quote === null) {
+      const rest = /^;\s*?(\n|$)/.exec(text.slice(i));
+      if (rest) {
+        parts.push(text.slice(start, i));
+        start = i + 1;
+      }
+    }
+  }
+  parts.push(text.slice(start));
+  return parts
     .map((s) => s.replace(/--[^\n]*/g, ' ').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 }
@@ -275,10 +306,11 @@ export function declaredObjects(sql) {
   // Comments out; dollar-quoted DO bodies stay, because a guarded ADD
   // CONSTRAINT lives inside one.
   const text = String(sql).replace(/--[^\n]*/g, ' ');
-  const out = { tables: new Set(), views: new Set(), indexes: new Set(), constraints: new Set(), columns: new Set() };
+  const out = { tables: new Set(), views: new Set(), indexes: new Set(), constraints: new Set(), columns: new Set(), functions: new Set() };
   const name = String.raw`((?:"?public"?\.)?"?[a-z_][a-z0-9_]*"?)`;
   for (const m of text.matchAll(new RegExp(String.raw`create\s+table\s+(?:if\s+not\s+exists\s+)?${name}`, 'gi'))) out.tables.add(ident(m[1]));
   for (const m of text.matchAll(new RegExp(String.raw`create\s+(?:or\s+replace\s+)?view\s+${name}`, 'gi'))) out.views.add(ident(m[1]));
+  for (const m of text.matchAll(new RegExp(String.raw`create\s+(?:or\s+replace\s+)?function\s+${name}\s*\(`, 'gi'))) out.functions.add(ident(m[1]));
   for (const m of text.matchAll(new RegExp(String.raw`create\s+(?:unique\s+)?index\s+(?:concurrently\s+)?(?:if\s+not\s+exists\s+)?${name}`, 'gi'))) out.indexes.add(ident(m[1]));
   for (const m of text.matchAll(new RegExp(String.raw`constraint\s+${name}`, 'gi'))) out.constraints.add(ident(m[1]));
   for (const m of text.matchAll(new RegExp(String.raw`alter\s+table\s+(?:if\s+exists\s+)?${name}\s+add\s+column\s+(?:if\s+not\s+exists\s+)?${name}`, 'gi'))) {
@@ -294,6 +326,13 @@ export function statementDeclared(stmt, d) {
   const created = (t) => d.tables.has(t) || d.views.has(t);
   let m;
   if ((m = new RegExp(String.raw`^create\s+or\s+replace\s+view\s+${q}`).exec(s))) return d.views.has(m[1]);
+  // 2026-10-23: a hand-applied FUNCTION (n8n's lf_aged_already_sent). `db diff`
+  // prefixes any function with this setting, so it is the file's when the file
+  // declares a function.
+  const fns = d.functions ?? new Set();
+  if ((m = new RegExp(String.raw`^create\s+(?:or\s+replace\s+)?function\s+${q}\s*\(`).exec(s))) return fns.has(m[1]);
+  if ((m = new RegExp(String.raw`^(?:grant|revoke)\s+[a-z ,]+\s+on\s+function\s+${q}`).exec(s))) return fns.has(m[1]);
+  if (/^set\s+check_function_bodies\s*=\s*off$/.test(s)) return fns.size > 0;
   if ((m = new RegExp(String.raw`^create\s+(?:unique\s+)?index\s+"?([a-z0-9_]+)"?\s+on\s+(?:only\s+)?${q}`).exec(s))) return created(m[2]) || d.indexes.has(m[1]);
   if ((m = new RegExp(String.raw`^(?:create|alter)\s+sequence\s+${q}`).exec(s))) {
     const seq = /^(.+)_[a-z0-9]+_seq$/.exec(m[1]);
