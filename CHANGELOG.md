@@ -9,6 +9,10 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 F.0 v2: every unsold demo gets an email (the user).
 
+- **F.0 v2 go-live, rules side.** The 10-21 objection split (no O.0 routing for
+  a rehash lead) is now applied, and every rule that takes a lead out of F.0
+  also takes it out of v2 (`sql/seeds/2026-10-23_f0_v2_enrollment_switch.sql`).
+  New OPPFDN leads move to v2 once Railway's F.0 modes are live.
 - **The day-4 and day-11 emails pass their checks.** Their prompts now require
   an offer sentence ("We may be able to …") before the call question and a
   question opening that no earlier message used. Before, the day-11 preview
