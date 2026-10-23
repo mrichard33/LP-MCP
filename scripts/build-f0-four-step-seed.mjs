@@ -364,7 +364,16 @@ const FOLLOWUP_EMAIL_SEED = /f0_v2_followup_emails\.sql$/.test(String(out || '')
 const EMAIL_FOLLOWUP_RULES = EMAIL_TEAM_SYSTEM.slice(EMAIL_TEAM_SYSTEM.indexOf('THE EMAIL RULES'), EMAIL_TEAM_SYSTEM.indexOf('\n\nReturn JSON only'));
 const TEAM_RETURN = 'Return JSON only: {"subject", "preheader", "body", "ps", "slots": {"hesitation", "affirm", "reframe", "if_i_could"}}. Every slot is a string or null; "ps" may be "".';
 const SLOTS_STEP = `Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" hints that we may be able to make it work better for them, without naming how. If a slot has no support in <visit_facts>, set it to null; do not invent.`;
-const FOLLOWUP_CLOSE = `The body ENDS with the call invite, its only question: a quick call with CALL WITH, with the hint from slot "if_i_could" that we may be able to make it work better for them. Nothing comes after it: no sign-off and no name, because the email template signs it "The Reece Team, Reece Windows & Doors". Our earlier messages already invited a call: word this close differently from every close in EARLIER CLOSES (never their opening words, and never "if we could" when one of them used it).`;
+// 2026-10-23 (the user): the first day-11 preview closed "Would a quick call
+// with John …?" with no offer before it, the same four opening words as a text
+// before it, and failed close_repeated, no_conditional_offer and the
+// if_i_could slot; live, that lead gets the static email. The close is now two
+// required sentences, and the question must open with words no earlier close
+// opened with.
+const FOLLOWUP_CLOSE = `The body ENDS with two sentences, in this order:
+1. The offer, built from slot "if_i_could": a sentence that says we may be able to make it work better for them, using that slot's own words and opening with words like "We may be able to", "There may be a way to", "If there is a way to" or "We would like to see if we can". This sentence is REQUIRED: an email without it is rejected.
+2. The call invite, the email's only question: a short call with CALL WITH. Our earlier messages already invited a call, so this question must not open with the same first four words as any close in EARLIER CLOSES (check each one), and never says "if we could" when one of them did. Fresh openers to pick from: "How about a short call with …", "Could … walk you through …", "Is a short call with … worth …", "Would it help to have … go over …".
+Nothing comes after the question: no sign-off and no name, because the email template signs it "The Reece Team, Reece Windows & Doors".`;
 const NOT_FIRST = `Earlier messages already thanked them for the visit and asked about a call. Do not thank them for having us out again and do not repeat what an earlier message said.`;
 
 const FOLLOWUPS = [
@@ -386,11 +395,12 @@ What usually happens is that the size of the decision starts to catch up with wh
 
 Your proposal was built for that door and that entry, nothing more and nothing less. When homeowners look at it again next to what the leaks keep costing them, the decision usually gets simpler.
 
-There may be a way to make the numbers sit better with you. Would a quick call with John to see be worth fifteen minutes?
+There may be a way to make the numbers sit better with you. How about a short call with John to see?
 - GOOD ps: ""
 - BAD, thanking them for the visit again: "Thank you again for having us out last week."
 - BAD, pressure: "Prices go up next month, so now is the time to decide."
-- BAD, the same close as an earlier message: "If we could make it work, would you be open to a quick call with John?" after the evening email already asked exactly that.`,
+- BAD, the same close as an earlier message: "If we could make it work, would you be open to a quick call with John?" after the evening email already asked exactly that.
+- BAD, no offer before the call: "Would a quick call with John be a good way to go over it?"`,
   },
   {
     code: 'F.0-P7-email-V2', position: 7, label: 'email-team-day11', ghl: 8,
@@ -412,11 +422,12 @@ On your HOA, we handle the paperwork and the approval as part of the project, at
 
 On installation, a door like yours usually takes a day, and we take care of the permit, the crew and the final inspection, so you are not managing any of it.
 
-We might be able to make this work better for you. Would it help to have John go over anything else on a quick call?
+We may be able to make this work better for you. Could John walk you through anything else on a short call?
 - GOOD ps: ""
 - BAD, the questions written as questions: "Is now the right time? How long does it take?"
 - BAD, an invented fact: "Your insurance will drop by $2,000 a year."
-- BAD, financing or a price: "With our financing it can cost less than $100 a month."`,
+- BAD, financing or a price: "With our financing it can cost less than $100 a month."
+- BAD, no offer before the call: "Would a quick call with John be a good way to go over it?"`,
   },
 ];
 
