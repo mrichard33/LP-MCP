@@ -233,3 +233,13 @@ test('bot gate scoring: an owned lead\'s answer-only reply passes; a question ba
   // Answer mode off: any reply to an owned lead still fails, as before.
   assert.equal(SCENARIO_EXPECTATIONS.rehash_owned_after_booking(run([{ turn: 1, bot: ['Sure thing.'], rehash_gate: { answer_only: 'question' } }], 'shadow'))[0].code, 'reply_sent_to_owned_lead');
 });
+
+test('bot gate scoring: the rehash gate\'s own skip is not no_reply (gate run 2026-10-23, email only)', async () => {
+  const { scoreResult } = await import('../src/simulator/sim-scoring.js');
+  const base = { scenario: 'rehash_owned_email_only', channel: 'sms', rehash_owned_mode: 'live', rehash_owned_answer_mode: 'live' };
+  const skipped = scoreResult({ ...base, transcript: [{ turn: 1, customer: 'Turkokim@gmail.com', bot: null, rehash_gate: { mode: 'live', skip: true, reason: 'rehash_owned' } }] });
+  assert.equal(skipped.pass, true, JSON.stringify(skipped.failures));
+  // Silence the gate did not choose is still a missing reply.
+  const silent = scoreResult({ ...base, scenario: 'discovery', transcript: [{ turn: 1, customer: 'hi', bot: null }] });
+  assert.deepEqual(silent.failures.map((f) => f.code), ['no_reply']);
+});

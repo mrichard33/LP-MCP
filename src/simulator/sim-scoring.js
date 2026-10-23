@@ -54,7 +54,7 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // 2026-10-22.5 (Mark; Kendig): door_plus_slider, a front door + a slider must book and never hear the minimum.
 // 2026-10-23.1 (Mark; Kim Turko): an owned rehash lead may get the answer-only reply to a direct
 // question (no question back, no time); rehash_owned_direct_question / _email_only / _change_request.
-export const SCORING_VERSION = '2026-10-23.1';
+export const SCORING_VERSION = '2026-10-23.2';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -783,7 +783,11 @@ export function scoreResult(result) {
     // path, is silent on purpose (Phase 1, 2026-10-18).
     const lockSkipped = t.refire === true || t.turn_lock?.skipped === true
       // 2026-10-19 (ruling 5): a person's own text, and the reply it dropped.
-      || !!t.manual || t.human_takeover === 'skipped';
+      || !!t.manual || t.human_takeover === 'skipped'
+      // 2026-10-23: the rehash gate's own skip (an owned lead's email-only reply,
+      // a team pause) is silent on purpose; each rehash_owned_* / pause scenario
+      // checks whether that silence was right.
+      || t.rehash_gate?.skip === true;
     if (!texts.length && t.intent !== 'LP_NOTE_DQ' && !smsStop && !lockSkipped) failures.push({ code: 'no_reply', detail: t.error || t.outcome || 'no reply', turn: t.turn });
     // Whether THIS turn booked: a recorded booking in the turn's effects.
     // A move of the same appointment (the cancel flow's reschedule) counts:
