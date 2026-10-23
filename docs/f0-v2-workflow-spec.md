@@ -25,6 +25,89 @@ Anything else for F.0 (a text at 1, the email at 2, a 7) answers
 (logged `[F0] legacy position 0`). `agentic_messages.sequence_position` stores the
 GHL number; `generated_meta.internal_position` the inside one.
 
+## Build changes against the live workflow (version 29, the user, 2026-10-23)
+
+Read from the HL mirror on 2026-10-23 (17:00 ET): "F.0  Post-Appointment Follow-Up v2",
+`07559309-9f55-4adf-8eff-9e5e3e5c3979`, version 29. Steps are named as they are in
+GHL. Only these change; everything else stays as built. The rule (the user): every
+email is written from the visit when the data is there; the static email is the
+fallback. No approval step.
+
+### A. Three new email templates
+
+- **F.0 Static Email 1**, **F.0 Static Email 3** and **F.0 Static Email 4**: subject,
+  preheader, body and P.S. from `docs/f0-v2-static-emails.md`.
+- Same branding as "Template A - With PS" / "Template B - No PS": From Name **Reece
+  Team**, signature "The Reece Team / Reece Windows & Doors", footer "Protecting
+  families since 1972" + address + Unsubscribe.
+- Check that Template A and B sign "The Reece Team" (not
+  `{{custom_values.rehash_rep_name}}`), per the 2026-10-23 ruling (0f below).
+
+### B. The evening email: the fallback (3 edits)
+
+1. **New step before "Generation Request to LP-MCP"**: Remove Tag `f0-email-fallback`.
+2. **New If/Else "Fallback?" right after "Wait 5 Minutes"**, before "Email Hold?":
+   contact has tag `f0-email-fallback`?
+   - Yes → Send email **F.0 Static Email 1** → Remove Tag `f0-email-fallback` → Go to
+     "SMS START – Set Position 2".
+   - No → "Email Hold?" (unchanged).
+3. **"Suppressed (Skip)"** (under "Generated?"): add If/Else "Draft waiting?" on
+   **AI Msg Generation ID**.
+   - Has a value → send **F.0 Static Email 1** → Go to "SMS START – Set Position 2"
+     (a draft exists but was never released).
+   - Empty → Go to "SMS START – Set Position 2", as today (a real stop: sold, a reply,
+     a DQ, an opt-out).
+
+### C. The day-4 and day-11 emails: new branches in the text loop
+
+1. **New If/Else "Email Due?"** on the "More Texts" branch, between "Last Text?" and
+   "Wait Next Hours", on **AI Msg Sequence Position**:
+   - **= 3** (text 2 just sent; LP-MCP's wait is 48h) → the day-4 path.
+   - **= 5** (text 4 just sent; LP-MCP's wait is 168h) → the day-11 path.
+   - None → "Wait Next Hours" (unchanged).
+2. **Day-4 path**: Wait 24 hours → the follow-up email block (position **7**, **F.0
+   Static Email 3**) → Wait 24 hours → Go to "Position +1".
+3. **Day-11 path**: Wait 72 hours → the follow-up email block (position **8**, **F.0
+   Static Email 4**) → Wait 96 hours → Go to "Position +1".
+4. **The follow-up email block** (once per path). It never writes **AI Msg Sequence
+   Position**: the text loop owns that field.
+   1. If/Else "OK to email?": tag `pause-workflow` OR tag `rehash-owned` → go to step 7
+      (no email).
+   2. Update fields: **AI Msg Send Ready** = No. Remove Tag `f0-email-fallback`.
+   3. Webhook POST `https://lp-mcp-production.up.railway.app/api/agentic/nurture/generate`,
+      headers as "Generation Request to LP-MCP" (`Authorization: Bearer
+      {{custom_values.message_engine_token}}`, `Content-Type: application/json`), custom
+      data: `contact_id = {{contact.id}}`, `workflow_code = F.0`,
+      **`sequence_position = 7`** (day 4) or **`8`** (day 11), typed as a number, not
+      the field, `channel = email`, `enrollment_reason = {{contact.enrollment_reason}}`.
+   4. Wait 5 minutes.
+   5. If/Else: tag `f0-email-fallback` → send **F.0 Static Email 3** (day 4) or **F.0
+      Static Email 4** (day 11) → Remove Tag `f0-email-fallback` → step 7.
+   6. If/Else **AI Msg Send Ready** = Yes → "Check for P.S." → Template A / B → "Post
+      Email Sent to LP MCP" (`generation_id = {{contact.ai_msg_generation_id}}`,
+      `event = email_sent`), as the evening email. Else, **AI Msg Generation ID** has a
+      value → the static email. Else (a real stop) → nothing.
+   7. Always: Update fields: clear **Next Wait Hours** (LP-MCP may write a hold for a
+      recent reply; the text loop must not read it), and clear **AI Email Subject
+      Draft**, **AI Email Body Draft**, **AI Email Preview Draft**, **AI Email PS Draft**
+      and **AI Msg Generation ID** (as "Clear Email Drafts").
+
+Schedule after the change: email day 0 evening, text 1 day 1, text 2 day 3, **email
+day 4**, text 3 day 5, text 4 day 8, **email day 11**, text 5 day 15.
+
+### D. Unchanged
+
+The entry gate, "SMS Pause Gate", "Wait for Rehash Release", "Owned or Won?" and the
+O.0 / S5.1 hand-offs, and "Suppressed (Retry)" → END.
+
+### E. Railway, in one batch (no approval step)
+
+`F0_EMAIL_MODE=live`, `F0_V2_MODE=live`, `NURTURE_SHADOW_WORKFLOWS=none`,
+`F0_FORMULA_MODE=four_step`,
+`NURTURE_WORKFLOW_IDS=F.0:07559309-9f55-4adf-8eff-9e5e3e5c3979,S4.5:f99fba97-6d2f-4fd6-966c-b5e5e36f8938`.
+The prompt rows for positions 7 and 8 are already in (`sql/seeds/2026-10-23_f0_v2_followup_emails.sql`,
+applied 2026-10-23). Pause the old F.0 the same day.
+
 ## Steps
 
 1. **Trigger**: as F.0 today (P1 stage → "7. Appointment Completed", and the
@@ -72,31 +155,8 @@ GHL number; `generated_meta.internal_position` the inside one.
 10. **Pause gate** (existing "Pause Workflow Active?"): a reply parks the contact;
     the reply path owns the conversation (it reads the same Siro visit).
 11. **Wait** `{{contact.ai_msg_next_wait_hours}}` hours. `0` → exit (position 6, the fifth text, is terminal).
-    **Two more emails ride inside two of these waits** (the user, 2026-10-23: written
-    from the visit when the data is there, the static email only as a fallback):
-    - Position 3 (text 2 just sent, a 48h wait): wait 24h → the pause gate → contact
-      has no `rehash-owned` tag → **the follow-up email at GHL position 7** → wait 24h. (Day 4.)
-    - Position 5 (text 4 just sent, a 168h wait): wait 72h → the same checks → **the
-      follow-up email at GHL position 8** → wait 96h. (Day 11.)
-    Each follow-up email is the same block as the evening email, with its own number
-    and NEVER touching `AI Msg Sequence Position` (the text loop owns that field):
-    a. Reset `AI Msg Send Ready` = No; remove tag `f0-email-fallback`.
-    b. Webhook POST `/api/agentic/nurture/generate`, same header, body
-       `contact_id = {{contact.id}}`, `workflow_code = F.0`, `sequence_position = 7`
-       (day 4) or `8` (day 11), `channel = email`. LP-MCP writes it from the visit
-       (prompt rows `F.0-P6-email-V2` / `F.0-P7-email-V2`), with the same checks and the
-       same draft fields as the evening email.
-    c. If the contact has `f0-email-fallback` → send **Static Email 3** (day 4) or
-       **Static Email 4** (day 11) → remove the tag → go on.
-    d. Else wait for `AI Msg Send Ready` = Yes, timeout 2h. Yes → send with the same
-       branded template as 0f (Template A / B) + the engagement webhook (`email_sent`).
-       Timeout with an id → send the static email. Timeout with no id → a real stop
-       (sold, a reply, a DQ…): send nothing.
-    Every other position waits as before. The exits below cover both emails, and a
-    contact whose text was suppressed has already left at step 7, so these emails
-    only reach a lead still in the sequence.
-    Schedule: email day 0 evening, text 1 day 1, text 2 day 3, email 2 day 4, text 3
-    day 5, text 4 day 8, email 3 day 11, text 5 day 15.
+    **Two more emails ride inside two of these waits** (day 4 and day 11): see "Build
+    changes against the live workflow" above, section C.
 12. **Update** `AI Msg Sequence Position` + 1, clear the previous message values,
     and **Fire Self for Next Cycle** (as S4.5).
 
@@ -130,18 +190,15 @@ nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
     it → wait that many hours → go back to 0a's reset and 0b. LP-MCP holds in 2h
     steps while the recording is not in yet, up to `F0_EMAIL_HOLD_CAP_ET` (08:30 ET
     the day after the demo).
-0d. **If the contact has the tag `f0-email-fallback`** (the user, 2026-10-23: every
-    unsold demo gets an email): send **Static Email 1** (`docs/f0-v2-static-emails.md`,
-    same From Name and signature as 0f), **remove the tag**, then go to 0g. LP-MCP adds
-    the tag when no AI email will go out and nothing says the lead should get none:
-    no recording by 08:30, F0_EMAIL_MODE or F0_V2_MODE off, the email prompt not
-    active, or a draft that failed (model error, copy checks, writeback). It never
-    adds it for a real stop (sold, a newer lead, rebooked, a DQ, an opt-out, a reply).
-    The tag replaces `f0-no-recording` (never built in GHL).
-0e. **Wait for condition** `AI Msg Send Ready` = Yes, timeout to 09:15 ET the next
-    day. Timeout with `AI Msg Generation ID` empty → a real stop: go to 0g quietly.
-    Timeout with an id (a draft that never reached Yes) → send **Static Email 1**,
-    then go to 0g.
+0d. **The fallback** (the user, 2026-10-23: every unsold demo gets an email): see
+    "Build changes against the live workflow" above, section B. LP-MCP adds the tag
+    `f0-email-fallback` when no AI email will go out and nothing says the lead should
+    get none (no recording by 08:30, F0_EMAIL_MODE or F0_V2_MODE off, the email prompt
+    not active, or a draft that failed); never for a real stop (sold, a newer lead,
+    rebooked, a DQ, an opt-out, a reply). The tag replaces `f0-no-recording` (never
+    built in GHL).
+0e. **"Generated?"** (`AI Msg Send Ready` = Yes, checked once after the 5-minute
+    wait): Yes → 0f. Its "Suppressed (Skip)" branch: section B.3 above.
 0f. **Send email** with the branded template: subject `{{contact.ai_email_subject_draft}}`,
     preheader **AI Email Preview Draft** (`C8mSMxWqXGr1HvxrImyx`, merge tag `{{contact.ai_email_preview_draft}}`:
     the field key GHL gave it; `{{contact.ai_email_preheader_draft}}` never existed), body `{{contact.ai_email_body_draft}}`
