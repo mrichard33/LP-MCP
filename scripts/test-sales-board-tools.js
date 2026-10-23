@@ -148,7 +148,9 @@ test('every tool registers and defaults to dry run', async () => {
   registerSalesBoardTools({ tool: (name, _d, schema) => { tools[name] = schema; } });
   // 2026-10-03: sale_p2_backstop_run added (the Sale → P2 backfill).
   // 2026-10-04: sale_contact_backstop_run added (a GHL contact for every LP sale).
-  assert.deepEqual(Object.keys(tools).sort(), ['announce_missed_sale', 'post_office_power_ranking', 'post_ops_alert', 'sale_contact_backstop_run', 'sale_p2_backstop_run']);
+  // 2026-10-23: lp_sales_reconcile_run added (our LP copy = LP for a period, so Lead Cost = LP 136).
+  assert.deepEqual(Object.keys(tools).sort(), ['announce_missed_sale', 'lp_sales_reconcile_run', 'post_office_power_ranking', 'post_ops_alert', 'sale_contact_backstop_run', 'sale_p2_backstop_run']);
+  assert.equal(tools.lp_sales_reconcile_run.dry_run.parse(undefined), true);
   assert.equal(tools.sale_contact_backstop_run.dry_run.parse(undefined), true);
   assert.equal(tools.post_office_power_ranking.dry_run.parse(undefined), true);
   assert.equal(tools.announce_missed_sale.dry_run.parse(undefined), true);

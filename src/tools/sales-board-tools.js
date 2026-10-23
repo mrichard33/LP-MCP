@@ -51,6 +51,7 @@ import {
 import { runSaleP2Backstop } from '../p2-sale-backstop.js';
 import { runSaleContactBackstop } from '../services/lp-sale-contact-backstop.js';
 import { sendAlertMessage } from '../alert-state.js';
+import { startSalesReconcile } from '../jobs/lp-sales-reconcile.js';
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 
@@ -199,6 +200,22 @@ export function makePostOpsAlert(deps = {}) {
 }
 
 export function registerSalesBoardTools(server, deps = {}) {
+  // 2026-10-23: make lp_leads / lp_jobs match LP for a period (reversed sales,
+  // deleted jobs, sold leads never synced) so Lead Cost matches LP 136 to the
+  // penny. Starts in the background; read job_runs (job_id lp-sales-reconcile).
+  server.tool(
+    'lp_sales_reconcile_run',
+    'Re-read from LP every lead entered and every job changed in a period and fix our copy (lp_leads / lp_jobs) where '
+      + 'it differs: re-sync changed prospects, mark jobs LP deleted, mark leads LP deleted. Starts in the background; '
+      + 'the counts land in job_runs (job_id lp-sales-reconcile). Dry run by default (counts only, writes nothing).',
+    {
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('first day (default: first of last month)'),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('last day (default: today)'),
+      dry_run: z.boolean().optional().default(true).describe('true (default) counts only; false writes'),
+    },
+    async (args) => text(startSalesReconcile({ from: args.from, to: args.to, dryRun: args.dry_run !== false })),
+  );
+
   server.tool(
     'post_ops_alert',
     'Post one message to #ops-alerts through the system\'s own Slack bot (the operational alarm channel; Slack only, '

@@ -315,6 +315,7 @@ import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from
 import { registerFive9SnapshotRoutes, startFive9ConfigSnapshotScheduler } from './jobs/five9-config-snapshot.js';
 import { registerOpsRoutes } from './routes/ops.js';  // 2026-10-15 System Health 1.6
 import { registerFreshnessRefreshRoutes, startFreshnessRefreshScheduler } from './jobs/freshness-refresh.js';
+import { registerSalesReconcileRoutes, startSalesReconcileScheduler } from './jobs/lp-sales-reconcile.js';
 // 2026-09-18 — daily watch on the LP↔GHL link write path. The leak this
 // catches has been closed twice before and reopened unnoticed both times.
 import { registerLinkLeakRoutes, startLinkLeakScheduler } from './jobs/link-leak-monitor.js';
@@ -957,6 +958,7 @@ registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
 registerOpsRoutes(app, authenticate);  // 2026-10-15 System Health: incident ack/snooze/close/run + check runs
 registerFreshnessRefreshRoutes(app);
+registerSalesReconcileRoutes(app, authenticate); // 2026-10-23 — make lp_leads/lp_jobs match LP for a period (Lead Cost = LP 136 to the penny)
 registerLinkLeakRoutes(app);
 registerLeadLeakRoutes(app);
 registerInboundCaptureRoutes(app);
@@ -1025,6 +1027,7 @@ const server = app.listen(PORT, async () => {
   startScorecardValidateScheduler();
   startFive9ConfigSnapshotScheduler();
   startFreshnessRefreshScheduler();
+  startSalesReconcileScheduler();
   startLinkLeakScheduler();
   startP2UnresolvableScheduler();
   startTagHygieneScheduler();

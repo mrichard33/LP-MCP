@@ -156,6 +156,15 @@ export const JOBS = Object.freeze([
     isEnabled: (env) => String(env.FRESHNESS_REFRESH_ENABLED || 'false').toLowerCase() === 'true',
   },
   {
+    id: 'lp-sales-reconcile',
+    label: 'LP sales reconcile (Lead Cost = LP 136)',
+    group: 'sync',
+    cadence: 'daily 01:00 ET',
+    enabledEnv: 'LP_SALES_RECONCILE_ENABLED',
+    enabledDefault: true,
+    isEnabled: (env) => String(env.LP_SALES_RECONCILE_ENABLED || 'true').toLowerCase() !== 'false',
+  },
+  {
     id: 'link-leak-monitor',
     label: 'LP↔GHL link leak monitor',
     group: 'sync',
