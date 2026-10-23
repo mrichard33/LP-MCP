@@ -1103,7 +1103,7 @@ Her appointment read "Kim Turko - Rehash Call - Kim Turko", status new, no note.
   a refusal falls back to a contact note named for the appointment. Never the description (the lead sees it).
 - Calendar description: `scripts/set-rehash-calendar-description.js` (dry run; `--apply` writes `PUT /calendars/{id}`).
 Gate: `rehash_owned_answer_mode`; scenarios `rehash_owned_direct_question`, `rehash_owned_email_only`,
-`rehash_owned_change_request` (`SCORING_VERSION` 2026-10-23.1). Tests: `scripts/test-rehash-owned.js`,
+`rehash_owned_change_request` (`SCORING_VERSION` 2026-10-23.2: a rehash-gate skip is not `no_reply`). Tests: `scripts/test-rehash-owned.js`,
 `scripts/test-rehash-call-booking.js`.
 
 ## Revin: every text it sends or receives, one thread per contact (2026-10-19)
