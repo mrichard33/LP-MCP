@@ -729,7 +729,7 @@ export function buildF0ApprovalCard({ request, context, generationId, output, pr
   // email's gate is "AI Msg Send Ready" (the texts' is "AI SMS Send Ready").
   if (isF0EmailRequest(request)) {
     return [
-      `${test}✅ F.0 POST-DEMO EMAIL READY — please review (position 1, the evening of the demo)`,
+      `${test}✅ F.0 POST-DEMO EMAIL READY — please review (position ${request.ghl_position ?? 1}${Number(request.sequence_position) === 6 ? ', day 4' : Number(request.sequence_position) === 7 ? ', day 11' : ', the evening of the demo'})`,
       `${first}${phone ? ` · ${phone}` : ''} · ${prospectLabel(context?.lp?.prospect_id)}`,
       `Prompt: ${prompt?.prompt_code || 'unknown'}`,
       '',

@@ -44,10 +44,11 @@ export function previewF0Position({ preview_f0_position: p, numbering = 'ghl', c
     if ((p === 0) !== (ch === 'email') || p > 5) return { error: 'internal numbering: 0 is the email (channel "email"); 1-5 are texts (channel "sms")' };
     return { position: p, channel: ch };
   }
-  const ch = p === 1 ? 'email' : 'sms';
-  if (channel && channel !== ch) return { error: 'position 1 is the email; positions 2-6 are the texts' };
+  // 2026-10-23: 7 and 8 are the day-4 and day-11 emails.
+  const ch = [1, 7, 8].includes(p) ? 'email' : 'sms';
+  if (channel && channel !== ch) return { error: 'positions 1, 7 and 8 are the emails; positions 2-6 are the texts' };
   const mapped = f0InternalPosition({ channel: ch, sequence_position: p });
-  if (mapped.error || mapped.legacy) return { error: 'position 1 is the email; positions 2-6 are the texts (numbering "internal" for the old 0-5)' };
+  if (mapped.error || mapped.legacy) return { error: 'positions 1, 7 and 8 are the emails; positions 2-6 are the texts (numbering "internal" for the old 0-5)' };
   return { position: mapped.position, channel: ch };
 }
 
@@ -122,11 +123,11 @@ export function registerSiroTools(server) {
 
   server.tool(
     'siro_lead_presentation',
-    'The PRESENTATION block exactly as the reply writer sees it for a lead (from the newest matched Siro recording), optionally the GHL demo-note text (include_note) and a DRY RUN of one F.0 v2 touch in the workflow numbering (preview_f0_position 1 = the post-demo email: subject, preheader, body, P.S.; 2-6 = the texts; numbering "internal" keeps the old 0 = email, 1-5 = texts for one release) (prompt selected, copy-check result, interrupt; nothing is written to GHL or agentic_messages; needs ghl_contact_id). Mark\'s evidence before flipping SIRO_CONTEXT_MODE, SIRO_DEMO_NOTE_MODE or F.0. An empty block means no matched, processed recording, not that there was no visit.',
+    'The PRESENTATION block exactly as the reply writer sees it for a lead (from the newest matched Siro recording), optionally the GHL demo-note text (include_note) and a DRY RUN of one F.0 v2 touch in the workflow numbering (preview_f0_position 1 = the post-demo email: subject, preheader, body, P.S.; 2-6 = the texts; 7 / 8 = the day-4 / day-11 emails; numbering "internal" keeps the old 0 = email, 1-5 = texts for one release) (prompt selected, copy-check result, interrupt; nothing is written to GHL or agentic_messages; needs ghl_contact_id). Mark\'s evidence before flipping SIRO_CONTEXT_MODE, SIRO_DEMO_NOTE_MODE or F.0. An empty block means no matched, processed recording, not that there was no visit.',
     {
       lp_lead_id: z.string().optional(), lp_prospect_id: z.string().optional(), ghl_contact_id: z.string().optional(),
       include_note: z.boolean().optional(),
-      preview_f0_position: z.number().int().min(0).max(6).optional().describe('The F.0 workflow position: 1 = the post-demo email, 2-6 = the texts. With numbering "internal": 0 = the email, 1-5 = the texts.'),
+      preview_f0_position: z.number().int().min(0).max(8).optional().describe('The F.0 workflow position: 1 = the post-demo email, 2-6 = the texts, 7 = the day-4 email, 8 = the day-11 email. With numbering "internal": 0 = the email, 1-5 = the texts.'),
       numbering: z.enum(['ghl', 'internal']).optional().describe('ghl (default, what the workflow sends since 2026-10-21) or internal (the old numbering, kept for one release).'),
       channel: z.enum(['sms', 'email']).optional().describe('F.0 preview channel. Optional: the position decides it; when given it must match.'),
       formula: z.enum(['v1', 'four_step']).optional().describe('F.0 preview formula (default: Railway\'s F0_FORMULA_MODE). four_step reads the version-2 Four-Step prompts even while they are inactive.'),

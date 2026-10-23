@@ -14,8 +14,10 @@ F.0 v2: every unsold demo gets an email (the user).
   `f0-email-fallback`, and the workflow sends the static email instead of
   nothing. A real stop (sold, a newer lead, rebooked, a DQ, an opt-out, a reply)
   still sends nothing, and a failed text is still skipped. `src/siro/f0-email.js`.
-- **Two static emails between the texts**, day 4 and day 11, from the old F.0
-  emails, reworded as the Reece Team (`docs/f0-v2-static-emails.md`; a GHL build).
+- **Two more emails between the texts**, day 4 and day 11, written from the
+  visit like the first email; the old F.0 Emails 3 and 4, reworded as the Reece
+  Team, are their static fallbacks (`docs/f0-v2-static-emails.md`; a GHL build).
+  Run `sql/seeds/2026-10-23_f0_v2_followup_emails.sql` after the deploy.
 - **No approval step**: F.0 v2 goes live without a shadow week.
 
 Rehash Call booking fixes (Mark, from the Kim Turko review). Each has its own

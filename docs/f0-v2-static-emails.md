@@ -6,8 +6,12 @@ writes or edits them. Where they go in the workflow: `docs/f0-v2-workflow-spec.m
 - **Static Email 1** is the fallback for the AI post-demo email. It goes when the contact has the tag
   `f0-email-fallback` (no Siro recording, the AI email off, or a draft that failed) or when a draft never reached
   Send Ready. LP-MCP adds the tag (`emailFallbackTag`, `src/siro/f0-email.js`).
-- **Static Email 3** goes on day 4 and **Static Email 4** on day 11, between the texts, to every lead still in the
-  sequence.
+- **Static Email 3** (day 4) and **Static Email 4** (day 11) are the fallbacks for the two follow-up emails between
+  the texts. Those are written from the visit too (GHL positions 7 and 8, prompt rows `F.0-P6-email-V2` /
+  `F.0-P7-email-V2`); the static one goes only when LP-MCP tags `f0-email-fallback` or a draft never reached Send Ready.
+
+The rule (the user, 2026-10-23): write every email personalized when the visit data is there; the static email is
+only the fallback.
 
 They come from the old F.0 emails (the user's "F.0 Email and SMS Templates", Emails 1, 3 and 4), reworded so the
 lead hears one sender:
@@ -59,7 +63,7 @@ same care as if it were our own.
 
 ---
 
-## Static Email 3: day 4
+## Static Email 3: the day-4 fallback
 
 **Subject:** "We need to think about it": what that usually means
 **Preheader:** You're not the first homeowner to say this after a visit.
@@ -102,7 +106,7 @@ If you would like us to walk through that section with you, just reply to this e
 
 ---
 
-## Static Email 4: day 11
+## Static Email 4: the day-11 fallback
 
 **Subject:** The 4 questions you probably have right now
 **Preheader:** After more than 50 years doing this, we've noticed a pattern.

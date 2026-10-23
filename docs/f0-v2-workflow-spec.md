@@ -72,17 +72,31 @@ GHL number; `generated_meta.internal_position` the inside one.
 10. **Pause gate** (existing "Pause Workflow Active?"): a reply parks the contact;
     the reply path owns the conversation (it reads the same Siro visit).
 11. **Wait** `{{contact.ai_msg_next_wait_hours}}` hours. `0` → exit (position 6, the fifth text, is terminal).
-    **Two static emails ride inside two of these waits** (the user, 2026-10-23; copy in
-    `docs/f0-v2-static-emails.md`, same From Name and signature as 0f):
+    **Two more emails ride inside two of these waits** (the user, 2026-10-23: written
+    from the visit when the data is there, the static email only as a fallback):
     - Position 3 (text 2 just sent, a 48h wait): wait 24h → the pause gate → contact
-      has no `rehash-owned` tag → send **Static Email 3** → wait 24h. (Day 4.)
-    - Position 5 (text 4 just sent, a 168h wait): wait 72h → the same checks → send
-      **Static Email 4** → wait 96h. (Day 11.)
+      has no `rehash-owned` tag → **the follow-up email at GHL position 7** → wait 24h. (Day 4.)
+    - Position 5 (text 4 just sent, a 168h wait): wait 72h → the same checks → **the
+      follow-up email at GHL position 8** → wait 96h. (Day 11.)
+    Each follow-up email is the same block as the evening email, with its own number
+    and NEVER touching `AI Msg Sequence Position` (the text loop owns that field):
+    a. Reset `AI Msg Send Ready` = No; remove tag `f0-email-fallback`.
+    b. Webhook POST `/api/agentic/nurture/generate`, same header, body
+       `contact_id = {{contact.id}}`, `workflow_code = F.0`, `sequence_position = 7`
+       (day 4) or `8` (day 11), `channel = email`. LP-MCP writes it from the visit
+       (prompt rows `F.0-P6-email-V2` / `F.0-P7-email-V2`), with the same checks and the
+       same draft fields as the evening email.
+    c. If the contact has `f0-email-fallback` → send **Static Email 3** (day 4) or
+       **Static Email 4** (day 11) → remove the tag → go on.
+    d. Else wait for `AI Msg Send Ready` = Yes, timeout 2h. Yes → send with the same
+       branded template as 0f (Template A / B) + the engagement webhook (`email_sent`).
+       Timeout with an id → send the static email. Timeout with no id → a real stop
+       (sold, a reply, a DQ…): send nothing.
     Every other position waits as before. The exits below cover both emails, and a
-    contact whose text was suppressed has already left at step 7, so a static email
-    only reaches a lead still in the sequence.
-    Schedule: email day 0 evening, text 1 day 1, text 2 day 3, Email 3 day 4, text 3
-    day 5, text 4 day 8, Email 4 day 11, text 5 day 15.
+    contact whose text was suppressed has already left at step 7, so these emails
+    only reach a lead still in the sequence.
+    Schedule: email day 0 evening, text 1 day 1, text 2 day 3, email 2 day 4, text 3
+    day 5, text 4 day 8, email 3 day 11, text 5 day 15.
 12. **Update** `AI Msg Sequence Position` + 1, clear the previous message values,
     and **Fire Self for Next Cycle** (as S4.5).
 
@@ -158,7 +172,9 @@ approve any messaging before it goes out").** Skip the shadow week below. Set, i
 batch: `F0_EMAIL_MODE=live`, `F0_V2_MODE=live`, `NURTURE_SHADOW_WORKFLOWS=none` (unset
 or empty reads as `F.0`), `F0_FORMULA_MODE=four_step`,
 `NURTURE_WORKFLOW_IDS=F.0:07559309-9f55-4adf-8eff-9e5e3e5c3979,S4.5:f99fba97-6d2f-4fd6-966c-b5e5e36f8938`.
-The prompt rows (email V2, texts V3) must be active first. Pause the old F.0 the same
+The prompt rows (email V2, texts V3) must be active first, and
+`sql/seeds/2026-10-23_f0_v2_followup_emails.sql` run after the deploy (the day-4 and
+day-11 emails, inserted active). Pause the old F.0 the same
 day. With the email off (`F0_EMAIL_MODE=off`), Static Email 1 goes to everyone.
 
 **Railway, after the merge (no default changes anything):**

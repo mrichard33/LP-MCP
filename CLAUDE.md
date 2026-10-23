@@ -958,9 +958,14 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   `f0-email-fallback` (one place, a throw included) and the workflow sends the static Reece Team email
   (`docs/f0-v2-static-emails.md`, a GHL template; LP-MCP never writes it). A real stop (sold, a newer lead, rebooked,
   rehash ended, a team-note DQ, the two-no stop, a person texting, a recent reply, DNC / stop-bot, rehash_owned,
-  wrong_active_workflow) sends nothing. A failed TEXT is still skipped. The workflow also sends two static emails
-  between the texts (day 4 and day 11). No approval step (the user, 2026-10-23): F.0 v2 goes live without the shadow
-  week. Tests: `scripts/test-f0-email.js`.
+  wrong_active_workflow) sends nothing. A failed TEXT is still skipped. **Two more emails between the texts, written
+  from the visit the same way (the user: "write personalized when the data is available and use the static as a
+  fallback")**: GHL positions 7 (day 4) and 8 (day 11) by email → internal 6 and 7 (`F0_FOLLOWUP_EMAIL_POSITIONS`,
+  `f0InternalPosition`; `isF0EmailRequest` covers 0, 6 and 7, `isF0FollowupEmail` the last two), prompt rows
+  `F.0-P6-email-V2` / `F.0-P7-email-V2` (`sql/seeds/2026-10-23_f0_v2_followup_emails.sql`, ACTIVE, built by the
+  four-step seed script from the evening email's rules), the same checks, the same fallback tag (static Email 3 / 4).
+  No approval step (the user, 2026-10-23): F.0 v2 goes live without the shadow week. Tests: `scripts/test-f0-email.js`,
+  `scripts/test-f0-followup-emails.js`.
 - **The email**: the model fills the four Four-Step slots from `<visit_facts>` (which, for the email, also carries
   `visited_by`, the sales rep who came out, and is built whatever `F0_FORMULA_MODE` says) and returns
   `{ subject, preheader, body, ps, slots }`; `f0EmailOutput` turns the plain body into escaped `<p>` paragraphs for

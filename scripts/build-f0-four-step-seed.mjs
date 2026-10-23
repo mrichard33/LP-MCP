@@ -2,6 +2,7 @@
 // and the position-0 email row (Mark, 2026-10-21): node scripts/build-f0-four-step-seed.mjs sql/seeds/2026-10-21_f0_v2_email_prompt.sql
 // and its Reece Team version (Mark, 2026-10-22): node scripts/build-f0-four-step-seed.mjs sql/seeds/2026-10-22_f0_v2_email_prompt_team_voice.sql
 // and the texts in the Reece Team voice (the user, 2026-10-23): node scripts/build-f0-four-step-seed.mjs sql/seeds/2026-10-23_f0_v2_four_step_team_voice.sql
+// and the day-4 / day-11 emails (the user, 2026-10-23): node scripts/build-f0-four-step-seed.mjs sql/seeds/2026-10-23_f0_v2_followup_emails.sql
 import fs from 'node:fs';
 
 const out = process.argv[2];
@@ -348,6 +349,127 @@ on conflict (prompt_code) do update set
 `;
   fs.writeFileSync(out, header);
   console.log('1 row (F.0-P0-email-V2)');
+  process.exit(0);
+}
+
+// ── the day-4 and day-11 emails, Reece Team voice (the user, 2026-10-23) ─────
+// "Write personalized when the data is available and use the static as a
+// fallback." Two more emails between the texts, written from the visit like
+// the evening email (same rules, same checks: checkF0Copy formula 'email',
+// voice 'team'); each takes the job of one old static email (docs/f0-v2-
+// static-emails.md, which the workflow sends when LP-MCP tags
+// f0-email-fallback). GHL sends them as positions 7 and 8; the rows carry the
+// internal 6 and 7. The rules and the reply shape are the evening email's.
+const FOLLOWUP_EMAIL_SEED = /f0_v2_followup_emails\.sql$/.test(String(out || ''));
+const EMAIL_FOLLOWUP_RULES = EMAIL_TEAM_SYSTEM.slice(EMAIL_TEAM_SYSTEM.indexOf('THE EMAIL RULES'), EMAIL_TEAM_SYSTEM.indexOf('\n\nReturn JSON only'));
+const TEAM_RETURN = 'Return JSON only: {"subject", "preheader", "body", "ps", "slots": {"hesitation", "affirm", "reframe", "if_i_could"}}. Every slot is a string or null; "ps" may be "".';
+const SLOTS_STEP = `Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" hints that we may be able to make it work better for them, without naming how. If a slot has no support in <visit_facts>, set it to null; do not invent.`;
+const FOLLOWUP_CLOSE = `The body ENDS with the call invite, its only question: a quick call with CALL WITH, with the hint from slot "if_i_could" that we may be able to make it work better for them. Nothing comes after it: no sign-off and no name, because the email template signs it "The Reece Team, Reece Windows & Doors". Our earlier messages already invited a call: word this close differently from every close in EARLIER CLOSES (never their opening words, and never "if we could" when one of them used it).`;
+const NOT_FIRST = `Earlier messages already thanked them for the visit and asked about a call. Do not thank them for having us out again and do not repeat what an earlier message said.`;
+
+const FOLLOWUPS = [
+  {
+    code: 'F.0-P6-email-V2', position: 6, label: 'email-team-day4', ghl: 7,
+    intro: `You write ONE email from the Reece Team to a homeowner, sent about four days after the in-home visit, which ended without a sale. Write it for THIS homeowner from <visit_facts> only. Write as the team: "we", "us", "our". Never "I", "me" or "my". ${NOT_FIRST}
+Its job (the "we need to think about it" email): almost every homeowner says they need to think it over after a visit, and that is fair. Name that gently, in their situation: the size of the decision catching up with what they saw at the visit. Remind them, from <visit_facts>, of the problem they showed us and what they said they wanted, and that their proposal was built for their home, nothing more. No pressure, no urgency.
+${SLOTS_STEP}
+Then write the email from the slots. ${FOLLOWUP_CLOSE}`,
+    example: `EXAMPLE (the shape to aim for; use THIS lead's facts and THIS lead's CALL WITH, never the example's):
+- GOOD subject: "Carla, about thinking it over"
+- GOOD preheader: "Most homeowners need a few days after a visit, and that is fair"
+- GOOD body:
+Hi Carla,
+
+After a visit like ours, almost everyone tells us they need to think it over. That is completely fair. It is your home, and a new front door is a real decision, especially with the new AC just behind you.
+
+What usually happens is that the size of the decision starts to catch up with what you saw that day: the rain getting in around the frame and the bugs finding their way in every summer. Neither of those has gone anywhere since.
+
+Your proposal was built for that door and that entry, nothing more and nothing less. When homeowners look at it again next to what the leaks keep costing them, the decision usually gets simpler.
+
+There may be a way to make the numbers sit better with you. Would a quick call with John to see be worth fifteen minutes?
+- GOOD ps: ""
+- BAD, thanking them for the visit again: "Thank you again for having us out last week."
+- BAD, pressure: "Prices go up next month, so now is the time to decide."
+- BAD, the same close as an earlier message: "If we could make it work, would you be open to a quick call with John?" after the evening email already asked exactly that.`,
+  },
+  {
+    code: 'F.0-P7-email-V2', position: 7, label: 'email-team-day11', ghl: 8,
+    intro: `You write ONE email from the Reece Team to a homeowner, sent about eleven days after the in-home visit, which ended without a sale. Write it for THIS homeowner from <visit_facts> only. Write as the team: "we", "us", "our". Never "I", "me" or "my". ${NOT_FIRST}
+Its job (the "questions you probably have" email): a week or two after a visit, most homeowners have the same few questions. Answer two or three of them for THIS home, picked from what <visit_facts> says matters to them: whether now is the right time, the HOA, how long installation takes, the building code. Write each as a short lead-in and an answer ("On your HOA, ..."), never as a question with a question mark: the call invite is the email's only question. Use ONLY these facts in the answers, plus <visit_facts>: we handle the HOA paperwork and approval as part of the project, at no extra cost; installation usually takes one to two days, depending on the job; we handle the permits, the scheduling, the crew and the final inspection; every product meets or exceeds the building code for the area. On timing, only they can decide; never claim prices, insurers or codes are about to change.
+${SLOTS_STEP}
+Then write the email from the slots and the answers. ${FOLLOWUP_CLOSE}`,
+    example: `EXAMPLE (the shape to aim for; use THIS lead's facts and THIS lead's CALL WITH, never the example's):
+- GOOD subject: "Carla, a few answers about your front door"
+- GOOD preheader: "What most homeowners want to know a week or two after a visit"
+- GOOD body:
+Hi Carla,
+
+A week or two after a visit, most homeowners have the same few questions. Here are the ones that fit your front door.
+
+On timing, only you can decide that, and with the new AC just done it makes sense to want the numbers to fit first. The rain around the frame and the bugs at the door will still be there until the entry is sealed.
+
+On your HOA, we handle the paperwork and the approval as part of the project, at no extra cost.
+
+On installation, a door like yours usually takes a day, and we take care of the permit, the crew and the final inspection, so you are not managing any of it.
+
+We might be able to make this work better for you. Would it help to have John go over anything else on a quick call?
+- GOOD ps: ""
+- BAD, the questions written as questions: "Is now the right time? How long does it take?"
+- BAD, an invented fact: "Your insurance will drop by $2,000 a year."
+- BAD, financing or a price: "With our financing it can cost less than $100 a month."`,
+  },
+];
+
+if (FOLLOWUP_EMAIL_SEED) {
+  const header = `-- F.0 v2 day-4 and day-11 emails, Reece Team voice (the user, 2026-10-23) — agentic_messaging_prompts.
+--
+-- Ruling (the user, 2026-10-23): "write personalized when the data is available
+-- and use the static as a fallback." Besides the evening email, F.0 v2 sends two
+-- more emails between the texts, written from the Siro visit like the first:
+--   F.0-P6-email-V2  the day-4 email ("we need to think about it"); GHL position 7
+--   F.0-P7-email-V2  the day-11 email (the questions homeowners ask); GHL position 8
+-- The rows carry the internal positions 6 and 7 (src/siro/f0-email.js,
+-- f0InternalPosition). Same rules, reply shape and checks as F.0-P0-email-V2
+-- (checkF0Copy formula 'email', voice 'team'); read while F0_EMAIL_VOICE=team.
+-- When no email can be written (no recording, a failed draft, F0_EMAIL_MODE off,
+-- these rows inactive), LP-MCP tags f0-email-fallback and the workflow sends the
+-- static Email 3 / Email 4 instead (docs/f0-v2-static-emails.md).
+--
+-- Run AFTER the deploy that maps positions 7 and 8 (before it, the route answers
+-- unsupported_position and these rows are never read). Inserted ACTIVE (the user,
+-- 2026-10-23: no approval step); re-running this seed updates the copy in place
+-- and never changes active. To stop them: set active = false (the workflow then
+-- sends the static emails).
+-- Built by scripts/build-f0-four-step-seed.mjs.
+
+insert into public.agentic_messaging_prompts
+  (prompt_code, workflow_code, channel, sequence_position, objection_filter,
+   system_prompt, user_prompt_template, output_schema, max_tokens, temperature, active, version, variant_label, notes)
+values
+`;
+  const rows = FOLLOWUPS.map((f) => `  (${q(f.code)}, 'F.0', 'email', ${f.position}, null,
+   ${q([f.intro, '', EMAIL_FOLLOWUP_RULES, '', TEAM_RETURN, '', f.example].join('\n'))},
+   ${q(EMAIL_TEAM_USER)},
+   ${q(EMAIL_SCHEMA)}::jsonb, 2000, 0.7, true, 2, ${q(f.label)},
+   ${q(`F.0 v2 ${f.position === 6 ? 'day-4' : 'day-11'} email in the Reece Team voice (the user, 2026-10-23), GHL position ${f.ghl}. The static fallback is docs/f0-v2-static-emails.md.`)})`);
+  const footer = `
+on conflict (prompt_code) do update set
+  workflow_code = excluded.workflow_code,
+  channel = excluded.channel,
+  sequence_position = excluded.sequence_position,
+  objection_filter = excluded.objection_filter,
+  system_prompt = excluded.system_prompt,
+  user_prompt_template = excluded.user_prompt_template,
+  output_schema = excluded.output_schema,
+  max_tokens = excluded.max_tokens,
+  temperature = excluded.temperature,
+  version = excluded.version,
+  variant_label = excluded.variant_label,
+  notes = excluded.notes,
+  updated_at = now();
+`;
+  fs.writeFileSync(out, header + rows.join(',\n') + footer);
+  console.log(`${rows.length} rows (${FOLLOWUPS.map(f => f.code).join(', ')})`);
   process.exit(0);
 }
 

@@ -40,6 +40,12 @@
 import { siroModes } from './config.js';
 
 export const F0_EMAIL_POSITION = 0;
+// 2026-10-23 (the user): two more emails between the texts, written from the
+// visit like the first one, with the static email as the fallback. GHL sends
+// them as 7 (day 4) and 8 (day 11); inside LP-MCP they are 6 and 7, after the
+// texts' 1-5. Their prompt rows carry sequence_position 6 / 7.
+export const F0_FOLLOWUP_EMAIL_POSITIONS = Object.freeze({ 7: 6, 8: 7 });
+export const F0_EMAIL_POSITIONS = Object.freeze([F0_EMAIL_POSITION, ...Object.values(F0_FOLLOWUP_EMAIL_POSITIONS)]);
 export const F0_EMAIL_CHANNEL = 'email';
 export const F0_EMAIL_FALLBACK_TAG = 'f0-email-fallback';
 
@@ -62,12 +68,17 @@ export const F0_EMAIL_BODY_WORDS = Object.freeze({ min: 120, max: 180 });
 const HOUR_MS = 3_600_000;
 const ET = 'America/New_York';
 
-/** The request is the F.0 position-0 email. Pure. */
+/** The request is one of F.0's emails (internal 0, 6 or 7). Pure. */
 export function isF0EmailRequest(req) {
   return req?.workflow_code === 'F.0'
-    && Number(req?.sequence_position) === F0_EMAIL_POSITION
+    && F0_EMAIL_POSITIONS.includes(Number(req?.sequence_position))
     && req?.channel === F0_EMAIL_CHANNEL
     && req?.sequence_position !== '' && req?.sequence_position != null;
+}
+
+/** The request is a follow-up email (day 4 or day 11), not the evening one. Pure. */
+export function isF0FollowupEmail(req) {
+  return isF0EmailRequest(req) && Number(req.sequence_position) !== F0_EMAIL_POSITION;
 }
 
 /** The fallback tag for an email outcome, or null when no email should go. Pure. */
@@ -90,6 +101,7 @@ export function allowsPositionZero({ workflow_code, channel } = {}) {
  * prompt rows, FOUR_STEP_WAIT_HOURS, the P1-P5 copy rules and P5's terminal
  * step are unchanged. Applied ONCE, where the generate route parses an F.0
  * request. A bare 0 by email is the legacy number (logged by the caller).
+ * Email 7 and 8 are the follow-up emails (2026-10-23) → 6 and 7.
  * Pure.
  * @returns {{ position: number, ghlPosition: number, legacy: boolean } | { error: 'unsupported_position' }}
  */
@@ -99,6 +111,7 @@ export function f0InternalPosition({ channel, sequence_position } = {}) {
   const i = Number.isFinite(n) && Math.floor(n) === n ? n : NaN;
   if (channel === F0_EMAIL_CHANNEL && i === 1) return { position: F0_EMAIL_POSITION, ghlPosition: 1, legacy: false };
   if (channel === F0_EMAIL_CHANNEL && i === 0) return { position: F0_EMAIL_POSITION, ghlPosition: 0, legacy: true };
+  if (channel === F0_EMAIL_CHANNEL && F0_FOLLOWUP_EMAIL_POSITIONS[i] != null) return { position: F0_FOLLOWUP_EMAIL_POSITIONS[i], ghlPosition: i, legacy: false };
   if (channel === 'sms' && i >= 2 && i <= 6) return { position: i - 1, ghlPosition: i, legacy: false };
   return { error: 'unsupported_position' };
 }
