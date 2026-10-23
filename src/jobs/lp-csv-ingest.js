@@ -828,8 +828,8 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     const warned = Array.isArray(extraDetail.warnings) && extraDetail.warnings.length > 0;
     await done(warned ? 'succeeded_with_warnings' : 'success',
       { snapshot_id: snapshotId, detail: { ...extraDetail, control_totals: controlTotals, fact_rows: factRows, ...(netProjection ? { net_projection: netProjection } : {}) } });
-    // Report 133 is the commission basis (Canvass / MVP 15%, Previous
-    // Customer / Referral 1% of net): recompute them now rather than at 02:30
+    // Report 133 is the commission basis (Canvass / MVP / LeadPilotData 15% of
+    // net): recompute them now rather than at 02:30
     // ET tomorrow (the user, 2026-10-19). Background and best-effort; the
     // nightly is the backstop. Dynamic import, like the projection above.
     if (reportType === 'job_status_ytd') {

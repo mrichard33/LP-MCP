@@ -45,6 +45,17 @@ test('commission: FTMYR Sep MVP calculated = 0.15 × 14,916; expired rules and n
   assert.ok(!rows.some((r) => r.lp_sub_sources[0] === 'Lead Gurus'), 'no rule → no row');
 });
 
+test('commission: a rule ended before it starts writes nothing (Previous Customer / Referral retired 2026-10-23)', () => {
+  // The user, 2026-10-23: "Previous customer and Customer Referral we can leave blank." The seed ends the
+  // rule with effective_to before effective_from rather than deleting it.
+  const retired = RULES.map((r) => (r.id === 'r-ref' ? { ...r, effective_to: '2025-12-31' } : r));
+  for (const month of ['2026-01-01', '2026-09-01', '2027-03-01']) {
+    const rows = buildCommissionRows({ month, rules: retired, dollars: DOLLARS });
+    assert.ok(!rows.some((r) => r.source_ref.startsWith('r-ref|')), month);
+    assert.ok(rows.some((r) => r.lp_sub_sources[0] === 'MVP Marketing'), `${month}: other rules unchanged`);
+  }
+});
+
 test('commission: recompute is idempotent, updates a moved net, zeroes a vanished basis, allocates direct', async () => {
   const supabase = fakeSupabase({ marketing_cost_rules: RULES, marketing_vendors: [], marketing_expenses: [], marketing_expense_allocations: [] }, { rpc: { mkt_sales_dollars: async () => DOLLARS } });
   const r1 = await recomputeCalculatedCosts('2026-09', { supabase });

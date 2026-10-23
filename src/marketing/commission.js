@@ -2,8 +2,9 @@
  * Calculated (commission-style) marketing costs — src/marketing/commission.js
  * (handoff D2 + D8, §7.4).
  *
- * Canvass + Canvass Sticky 15% of net · MVP Marketing 15% of net · Previous
- * Customer + Customer Referral 1% of net. The rates live in
+ * Canvass + Canvass Sticky 15% of net · MVP Marketing 15% of net · LeadPilotData
+ * 15% of net. Previous Customer + Customer Referral carry no cost since 2026-10-23
+ * (the user: "leave blank"; the rule is ended, not deleted). The rates live in
  * marketing_cost_rules; net comes from report 133 through mkt_sales_dollars
  * (never 136). One marketing_expenses row per (rule, market, sub-source,
  * month): cost_type 'calculated', source_system 'commission_rule', approved,
