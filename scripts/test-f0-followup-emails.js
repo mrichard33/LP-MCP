@@ -14,7 +14,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
-const { f0InternalPosition, isF0EmailRequest, isF0FollowupEmail, F0_EMAIL_POSITIONS } = await import('../src/siro/f0-email.js');
+const { f0InternalPosition, isF0EmailRequest, isF0FollowupEmail, F0_EMAIL_POSITIONS, closeQuestion, f0EmailOutput } = await import('../src/siro/f0-email.js');
 const { splitTeamSignature } = await import('../src/siro/f0-copy-checks.js');
 const { previewF0Position } = await import('../src/tools/siro-tools.js');
 const { runNurtureGeneration } = await import('../src/nurture/nurture-orchestrator.js');
@@ -93,4 +93,20 @@ test('the seed: two active rows at 6 and 7, the evening email\'s rules, examples
     assert.doesNotMatch(content, /\bI\b|\b(?:me|my)\b/);
     assert.doesNotMatch(ex, /!|\bdeal\b|founder|—|\$\d/i);
   }
+});
+
+// 2026-10-23 (the user): the day-11 preview dropped the "?" on its call invite
+// and would have gone out as the static email.
+test('a dropped closing "?" is put back; a statement is left alone', () => {
+  const day11 = 'Thanks for your time.\n\nIf we could make it work better for you, would you be open to a quick call with John to walk through it with both of you';
+  assert.equal(closeQuestion(day11).text, `${day11}?`);
+  assert.equal(closeQuestion(`${day11}.`).text, `${day11}?`);
+  assert.deepEqual(closeQuestion(`${day11}?`), { text: `${day11}?`, changed: false });
+  assert.deepEqual(closeQuestion('We will be here when you are ready.'), { text: 'We will be here when you are ready.', changed: false });
+  assert.deepEqual(closeQuestion('We will be here when you are ready'), { text: 'We will be here when you are ready', changed: false });
+  const out = f0EmailOutput({ subject: 'S', preheader: 'P', body: day11, slots: {} });
+  assert.equal(out.email_plain_body, `${day11}?`);
+  assert.equal(out.question_mark_restored, true);
+  assert.match(out.body_html, /both of you\?<\/p>$/);
+  assert.equal(f0EmailOutput({ subject: 'S', preheader: 'P', body: `${day11}?`, slots: {} }).question_mark_restored, undefined);
 });

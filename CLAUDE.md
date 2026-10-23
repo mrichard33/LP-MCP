@@ -978,7 +978,8 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   subject ≤ 60, preheader ≤ 90 and not the first sentence, body 120–180 words; never money, offer talk or the word
   "deal" (not even the hint), an exclamation, "founder", "your rep", the sales rep named twice or following up, a
   footer / address / unsubscribe line, a sensitive detail, a quote of the rep or Siro's draft copied. The thank-you
-  opener is allowed. Signed "The Reece Team" by the template since 2026-10-23 (no signature in the body, V1 or V2). One re-write, then `suppressed_low_conf`: the static email
+  opener is allowed. A closing question the model left without its "?" gets it back first (`closeQuestion`, 2026-10-23: the
+  day-11 preview would have gone static over it). Signed "The Reece Team" by the template since 2026-10-23 (no signature in the body, V1 or V2). One re-write, then `suppressed_low_conf`: the static email
   goes instead (2026-10-23, above).
 - **The greeting name is cleaned, never the raw field (2026-10-22).** The live preview opened "Hi A," because GHL's
   first name was "a" (LP: "AJ / Anita") and any non-empty GHL name won. `greetingName` (`f0-context.js`): a couple's first
