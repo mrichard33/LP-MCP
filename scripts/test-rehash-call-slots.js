@@ -151,13 +151,16 @@ test('the model may not name a time the calendar did not give', () => {
   assert.ok(!good.changes.includes('backup_line'), good.changes.join(','));
 });
 
-test('rehashCallBooking: that slot, the Rehash Call calendar, the rep, status new', () => {
+// 2026-10-23 (Mark, Kim Turko review): a Rehash Call is created confirmed
+// (REHASH_CALL_AUTO_CONFIRM, default on); off restores 'new'.
+test('rehashCallBooking: that slot, the Rehash Call calendar, the rep, status confirmed', () => {
   const b = rehashCallBooking({ slot: ALL[1], calendarId: CAL, rep: JOHN, env: {} });
   assert.equal(b.action_type, 'book_appointment');
   assert.deepEqual(
     [b.action_payload.calendar_id, b.action_payload.start_time, b.action_payload.assigned_user_id, b.action_payload.status, b.action_payload.duration_minutes, b.action_payload.rehash_call],
-    [CAL, ALL[1].iso, JOHN, 'new', 15, true],
+    [CAL, ALL[1].iso, JOHN, 'confirmed', 15, true],
   );
+  assert.equal(rehashCallBooking({ slot: ALL[1], calendarId: CAL, rep: JOHN, env: { REHASH_CALL_AUTO_CONFIRM: 'off' } }).action_payload.status, 'new');
 });
 
 test('the pre-booking re-check reads the same rep and offers call times 30 minutes out', async () => {

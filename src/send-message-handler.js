@@ -336,6 +336,7 @@ import { findNewerInbound, findAnsweredDuplicateInbound } from './agentic/burst-
 import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from './agentic/human-takeover.js';
 import { newestManualOutbound, lastInboundAt } from './services/human-takeover-io.js';
 import { runRehashGate } from './services/rehash-gate-io.js';
+import { writeOwnedAnswerForSend } from './services/rehash-owned-answer-io.js';
 import { rehashPauseMode } from './agentic/rehash-pause.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
@@ -2441,7 +2442,7 @@ const rehashGateShadowMarks = new Map();
  * same row), and `rehash` (true when the contact is in rehash: the pause then
  * replaces the human-takeover check). Never throws: a gate that fails sends.
  */
-async function checkRehashGate({ action, payload, contactId, channel, sourceEventMeta, replyContext, proactive }, deps = {}) {
+async function checkRehashGate({ action, payload, contactId, channel, sourceEventMeta, replyContext, proactive, inboundText = null, answerable = false }, deps = {}) {
   try {
     const tags = await (deps.fetchContactTags || fetchContactTags)(contactId);
     const p = sourceEventMeta?.payload || {};
@@ -2450,6 +2451,7 @@ async function checkRehashGate({ action, payload, contactId, channel, sourceEven
     const gate = await (deps.runRehashGate || runRehashGate)({
       contactId, actionId: action?.id ?? null, channel, tags, fromNumber: replyContext?.fromNumber || null,
       inboundAt, proactive, priorPause: payload?.rehash_pause || null, messageId: p.message_id || null,
+      inboundText, answerable,
     });
     if (gate?.shadow && action?.id != null) rehashGateShadowMarks.set(String(action.id), gate.shadow);
     if (gate?.verdict === 'skip') {
@@ -2459,7 +2461,7 @@ async function checkRehashGate({ action, payload, contactId, channel, sourceEven
       await stampActionPayload(action?.id, { rehash_pause: gate.pause });
       return { rehash: true, result: { deferred: true, reason: gate.reason, retry_at: gate.retryAt, contact_id: contactId, channel, rehash_pause: gate.pause } };
     }
-    return { rehash: gate?.rehash === true, firedPause: gate?.firedPause || null };
+    return { rehash: gate?.rehash === true, firedPause: gate?.firedPause || null, answerOnly: gate?.answerOnly || null, tags };
   } catch (err) {
     console.warn(`[RehashGate] ${contactId} gate threw (sending): ${String(err?.message || err).slice(0, 160)}`);
     return { rehash: false };
@@ -3643,8 +3645,26 @@ async function executeSendMessageInner(action, context, turnState = { held: null
   // team holds this reply 15 minutes, then the thread decides (REHASH_PAUSE_MODE).
   // Both default to shadow: the reply goes and the row says what live would do.
   const proactiveSend = !turnClaimScope({ ruleApplied: action.rule_applied || 'manual', sourceEventType: sourceEventMeta?.event_type || null, triggerId: payload.trigger_id || null }).claims;
-  const rehashGate = await checkRehashGate({ action, payload, contactId, channel, sourceEventMeta, replyContext, proactive: proactiveSend });
+  // 2026-10-23 (Kim Turko review): only an AI-written reply to the lead's own
+  // text may become an owned lead's short answer. A rule's fixed text (the
+  // post-booking email ask, a nudge) is proactive and stays skipped.
+  const ownedInboundText = context.message_text || context.messageText || context.body || context.message_preview || null;
+  const ownedAnswerable = !proactiveSend && !message && !!payload.requires_ai_generation && !!ownedInboundText;
+  const rehashGate = await checkRehashGate({ action, payload, contactId, channel, sourceEventMeta, replyContext, proactive: proactiveSend, inboundText: ownedInboundText, answerable: ownedAnswerable });
   if (rehashGate.result) return rehashGate.result;
+
+  // ── An owned rehash lead's direct question: a short answer, nothing else ──
+  // (Mark, 2026-10-23.) Written here from our approved FAQ answers and held to
+  // the answer-only rules (src/agentic/rehash-owned-answer.js), then sent like
+  // a provided message: no reply writer, so no companion action (no booking,
+  // cancel, reschedule, email ask or tag) can ride on it. A move or cancel
+  // request gets "Got it, I'll let John know." and a #contact-rehash card.
+  let ownedAnswer = null;
+  if (rehashGate.answerOnly && ownedAnswerable) {
+    ownedAnswer = await writeOwnedAnswerForSend({ contactId, channel, kind: rehashGate.answerOnly.kind, text: ownedInboundText });
+    message = ownedAnswer.message;
+    console.log(`[SendMessage] 💬 owned rehash lead ${contactId}: answer only (${ownedAnswer.kind}${ownedAnswer.used_fallback ? `, backup line: ${ownedAnswer.reason}` : ''})`);
+  }
 
   // Livechat replies are generated with SMS constraints (short,
   // conversational, one question) — the widget is a chat surface.
@@ -3667,7 +3687,7 @@ async function executeSendMessageInner(action, context, turnState = { held: null
   // as fallbackUsed: the fingerprint is filed at the send, outside the
   // requires_ai_generation block where the trigger is resolved. Stays null on a
   // pre-generated send, where no inbound was read here.
-  let replyTriggerMessage = null;
+  let replyTriggerMessage = ownedAnswer ? ownedInboundText : null;
 
   // 2026-10-16 (the user) — a follow-up hold that ended (rule 331) has no inbound
   // to answer, so the reply writer below refused it (no_trigger_message) and the
@@ -5066,6 +5086,15 @@ async function executeSendMessageInner(action, context, turnState = { held: null
         used_fallback: followUpCheckIn.used_fallback,
         fallback_reason: followUpCheckIn.fallback_reason,
         label: followUpCheckIn.follow_up?.label || null,
+      },
+    } : {}),
+    // 2026-10-23 — an owned rehash lead's answer-only reply (Kim Turko review).
+    ...(ownedAnswer ? {
+      rehash_owned_answer: {
+        kind: ownedAnswer.kind,
+        used_fallback: !!ownedAnswer.used_fallback,
+        fallback_reason: ownedAnswer.reason || null,
+        change_card: ownedAnswer.notified?.reason || null,
       },
     } : {}),
     send_method: sendMethod,

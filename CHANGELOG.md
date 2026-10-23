@@ -5,6 +5,35 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-10-23
+
+Rehash Call booking fixes (Mark, from the Kim Turko review). Each has its own
+switch, so any one can be undone alone.
+
+- **After a Rehash Call is booked, the bot only answers direct questions.** Kim
+  booked a call, then got the email ask and, after replying with just her email,
+  "Where are you at with it?". Now, once John owns the lead: nothing proactive
+  (no email ask, no nudge); a direct question ("What does the warranty cover?")
+  gets a 1-2 sentence answer with no question back, no times and nothing booked;
+  "can we move it to 2?" gets "Got it, I'll let John know." and a card in
+  #contact-rehash; anything else gets no reply. John's 15-minute pause still
+  applies. Needs `REHASH_OWNED_MODE=live` and `REHASH_OWNED_ANSWER_MODE=live`
+  (default shadow). `src/agentic/rehash-owned-answer.js`.
+- **No post-booking email ask after a Rehash Call.**
+- **The title is "Reece Best-Offer Call: {First Last}".** Kim's read
+  "Kim Turko - Rehash Call - Kim Turko". The calendar itself is still called
+  "Rehash Call". `REHASH_CALL_TITLE_MODE` (default on).
+- **A Rehash Call is created Confirmed.** Every other calendar is still created
+  New. `REHASH_CALL_AUTO_CONFIRM` (default on).
+- **Every Rehash Call gets an internal note for the rep.** It starts
+  "Booked by Reece Chatbot" (GHL's API cannot set Booked By), then the call
+  time, the rep on the visit, the demo date and a short summary of the
+  conversation, under 700 characters. It is an appointment note, never the
+  description the lead can see. `REHASH_CALL_NOTES_MODE` (default live).
+- **The Rehash Call calendar description** can be set with
+  `node scripts/set-rehash-calendar-description.js --apply` (dry run without
+  `--apply`), or pasted by hand in GHL.
+
 ## 2026-10-22
 
 - **A landlord is never turned away.** "I need new windows on a house I rent

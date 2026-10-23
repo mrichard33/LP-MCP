@@ -52,7 +52,9 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // 2026-10-22.4 (Mark): one_leg_phone_presentation now expects the NORMAL offer: the phone
 // presentation is for phone-team contacts only.
 // 2026-10-22.5 (Mark; Kendig): door_plus_slider, a front door + a slider must book and never hear the minimum.
-export const SCORING_VERSION = '2026-10-22.5';
+// 2026-10-23.1 (Mark; Kim Turko): an owned rehash lead may get the answer-only reply to a direct
+// question (no question back, no time); rehash_owned_direct_question / _email_only / _change_request.
+export const SCORING_VERSION = '2026-10-23.1';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -129,6 +131,27 @@ function rehashPickFailures(r) {
   if (pick && pick.nepq?.step !== 'rehash_confirm') out.push({ code: 'named_time_not_booked', detail: `step ${pick.nepq?.step || 'none'}`, turn: pick.turn });
   if (!wouldDo(r).some(w => w.kind === 'would_book_appointment' && w.payload?.rehash_call === true)) out.push({ code: 'rehash_call_not_booked', detail: 'no Rehash Call booking' });
   if (pick && replies(pick).some(x => x.includes('?'))) out.push({ code: 'question_after_booking', detail: replies(pick).join(' '), turn: pick.turn });
+  return out;
+}
+
+/**
+ * An owned rehash lead (REHASH_OWNED_MODE live): no reply at all, or, with
+ * REHASH_OWNED_ANSWER_MODE live, only the answer-only reply to a direct question
+ * or a move/cancel request: no question back, no clock time (2026-10-23).
+ */
+function ownedLeadFailures(r) {
+  if (r.rehash_owned_mode !== 'live') return [];
+  const out = [];
+  for (const t of r.transcript || []) {
+    const said = replies(t);
+    if (!said.length) continue;
+    if (r.rehash_owned_answer_mode !== 'live' || !t.rehash_gate?.answer_only) {
+      out.push({ code: 'reply_sent_to_owned_lead', detail: said.join(' '), turn: t.turn });
+      continue;
+    }
+    if (said.some(x => x.includes('?'))) out.push({ code: 'question_in_owned_answer', detail: said.join(' '), turn: t.turn });
+    if (clockCount(said.join(' '))) out.push({ code: 'time_in_owned_answer', detail: said.join(' '), turn: t.turn });
+  }
   return out;
 }
 
@@ -481,10 +504,24 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     const last = (r.transcript || []).at(-1);
     return replies(last).length ? [] : [{ code: 'open_question_not_answered_after_pause', detail: last?.rehash_gate?.reason || 'no reply', turn: last?.turn }];
   },
-  // Checked only when the run had REHASH_OWNED_MODE live.
-  rehash_owned_after_booking: (r) => {
+  // Checked only when the run had REHASH_OWNED_MODE live. Since 2026-10-23 a
+  // direct question may get an answer-only reply (REHASH_OWNED_ANSWER_MODE live).
+  rehash_owned_after_booking: (r) => ownedLeadFailures(r),
+  rehash_owned_direct_question: (r) => {
+    if (r.rehash_owned_mode !== 'live' || r.rehash_owned_answer_mode !== 'live') return ownedLeadFailures(r);
+    const last = (r.transcript || []).at(-1);
+    return replies(last).length ? ownedLeadFailures(r) : [{ code: 'owned_question_not_answered', detail: last?.rehash_gate?.reason || 'no reply', turn: last?.turn }];
+  },
+  rehash_owned_email_only: (r) => {
     if (r.rehash_owned_mode !== 'live') return [];
     return (r.transcript || []).filter(t => replies(t).length).map(t => ({ code: 'reply_sent_to_owned_lead', detail: replies(t).join(' '), turn: t.turn }));
+  },
+  rehash_owned_change_request: (r) => {
+    if (r.rehash_owned_mode !== 'live' || r.rehash_owned_answer_mode !== 'live') return ownedLeadFailures(r);
+    const last = (r.transcript || []).at(-1);
+    const text = replies(last).join(' ');
+    if (!/let .+ know/i.test(text)) return [{ code: 'owned_change_request_not_passed_on', detail: text || 'no reply', turn: last?.turn }];
+    return ownedLeadFailures(r);
   },
   rehash_call_reason: (r) => {
     const out = rehashLaneFailures(r);

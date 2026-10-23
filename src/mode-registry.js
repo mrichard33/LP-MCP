@@ -256,6 +256,22 @@ export const MODES = Object.freeze([
     goLive: '24h of shadow: every rehash.owned_would_skip names a contact with the rehash-owned tag, an upcoming Rehash Call or an LP Cnf / Issue / Reset visit',
     note: 'John owns a rehash lead once a Rehash Call is booked, LP has the visit set, or the rehash-owned tag is on: live sends no bot message, no F.0 touch, no #contact-rehash card, and closes the bot\'s promised call.',
   }),
+  m('REHASH_OWNED_ANSWER_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
+    since: '2026-10-23', decider: 'Mark',
+    evidence: { events: ['rehash.owned_answer_only', 'rehash.owned_skip'] },
+    goLive: 'Mark, 2026-10-23 (Kim Turko review): live with REHASH_OWNED_MODE=live, after simulate_bot_conversation + run_bot_eval show the rehash booking rate did not drop',
+    note: 'An owned rehash lead (REHASH_OWNED_MODE=live) gets a 1-2 sentence answer to a direct question, no question back, no times, no companion action; a move or cancel request gets "Got it, I\'ll let John know." and a #contact-rehash card; anything else no reply. Shadow: the skip event carries would_answer_only. Rollback: off.',
+  }),
+  m('REHASH_CALL_TITLE_MODE', 'bot', 'boolean', ['on', 'off'], 'on', { off: ['off'], otherwise: 'live' }, {
+    since: '2026-10-23', decider: 'Mark',
+    goLive: LIVE_BY_DEFAULT,
+    note: 'A Rehash Call appointment is titled "Reece Best-Offer Call: {First Last}" (not "Rehash Call - {name}"); the calendar keeps its name. Off: the old title.',
+  }),
+  m('REHASH_CALL_NOTES_MODE', 'bot', 'enum', OSL, 'live', OSL_S, {
+    since: '2026-10-23', decider: 'Mark',
+    goLive: LIVE_BY_DEFAULT,
+    note: 'Every Rehash Call the bot books gets an internal appointment note ("Booked by Reece Chatbot", the call, the rep on the visit, a short conversation summary). Never the description. Shadow logs the note text. Rollback: off.',
+  }),
   m('REHASH_PAUSE_MODE', 'bot', 'enum', OSL, 'shadow', OSL_S, {
     since: '2026-10-21', decider: 'Mark',
     evidence: { events: ['rehash.pause_started', 'rehash.pause_restarted', 'rehash.pause_fired', 'rehash.pause_would_hold'], table: 'bot_message_context' },

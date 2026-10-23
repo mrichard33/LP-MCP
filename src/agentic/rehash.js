@@ -184,6 +184,24 @@ export function etDay(nowMs = Date.now()) {
  * 2026-10-14 (John Manieri): the other rehash cards, one per kind per contact
  * per Eastern day. kind: 'quote' | 'concern' | 'digest'. Pure.
  */
+/**
+ * 2026-10-23 (Mark, Kim Turko review): a lead John owns (a Rehash Call is
+ * booked) asks to move or cancel it. The bot says "Got it, I'll let John know."
+ * and this card tells the rehash team; John owns cancellations. Pure.
+ */
+export function formatRehashChangeCard({ firstName, phone, repName = null, lastMessage, contactUrl }) {
+  const who = firstName || 'A rehash lead';
+  return [
+    `🔁 REHASH CALL CHANGE REQUEST`,
+    `${who} has a Rehash Call booked and asked to move or cancel it. The bot changed nothing.`,
+    lastMessage ? `${who} said: "${String(lastMessage).slice(0, 300)}"` : null,
+    repName ? `Rep: ${repName}` : null,
+    `Phone: ${cardPhone(phone)}`,
+    contactUrl ? `Contact: ${contactUrl}` : null,
+    `→ ${repName || 'Rehash team'}: reach out and move or cancel the call in GHL.`,
+  ].filter(Boolean).join('\n');
+}
+
 export function rehashReplyIdempotencyKey(kind, contactId, nowMs = Date.now()) {
   return `f0_rehash_${kind}_${contactId}_${etDay(nowMs)}`;
 }

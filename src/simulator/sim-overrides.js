@@ -37,6 +37,8 @@ export const SIM_MODE_OVERRIDES = Object.freeze({
   rehashOwnedMode: ['off', 'shadow', 'live'],
   rehashPauseMode: ['off', 'shadow', 'live'],
   rehashVoiceMode: ['rep', 'team'],
+  // 2026-10-23 (Kim Turko): an owned lead's direct question gets a short answer.
+  rehashOwnedAnswerMode: ['off', 'shadow', 'live'],
 });
 
 /** Run fn with these overrides in force. Unknown or empty values are ignored. */
