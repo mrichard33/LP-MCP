@@ -26,7 +26,7 @@
 //   runs any period (dry run by default).
 
 import supabase from '../supabase.js';
-import { getLeads, getLead, getLeadByLdsId, getProspectByCstId, getJobStatusChanges } from '../lp-client.js';
+import { getLeads, getLead, getLeadByLdsId, getProspectByCstId } from '../lp-client.js';
 import { processProspect } from '../sync-leads.js';
 import { extractArray, getField } from '../sync-utils.js';
 import { createPageWalker } from '../lp-paging.js';
@@ -147,7 +147,7 @@ async function walkAll(fetch, idOf, label) {
 
 export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn = {}) {
   const d = {
-    db: supabase, getLeads, getLead, getLeadByLdsId, getProspectByCstId, getJobStatusChanges, processProspect,
+    db: supabase, getLeads, getLead, getLeadByLdsId, getProspectByCstId, processProspect,
     ...depsIn,
   };
   if (!d.db) return { ok: false, error: 'supabase unavailable' };
@@ -204,16 +204,14 @@ export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn
   }
   await runPool(prospects, handle);
 
-  // 2. Jobs that changed in the period on leads entered earlier (a contract or
-  //    RTP this month on a lead from last spring). LP's job-change list, then
-  //    one full read per customer not already handled.
-  const changes = await walkAll(
-    ({ PageSize, StartIndex }) => d.getJobStatusChanges({
-      startdate: period.from, enddate: addDays(period.to, 2), PageSize, StartIndex,
-    }).then(extractArray),
-    (r) => (r ? `${r.job_id}|${r.cst_id}` : null), '[SalesReconcile:jobs]',
-  );
-  const cstFromChanges = [...new Set(changes.map((r) => String(r.cst_id ?? '')).filter((c) => c && !seenCst.has(c)))];
+  console.log(`[SalesReconcile] phase 1 (leads entered): ${JSON.stringify({ ...stats, samples: stats.samples.slice(0, 5) })}`);
+
+  // 2. Jobs contracted in the period on leads entered earlier (a contract or RTP
+  //    this month on a lead from last spring): our own lp_jobs list, one full
+  //    read per customer not already handled. Not LP's GetJobStatusChanges: on
+  //    2026-10-23 its date filter returned 2024 jobs and its paging disagreed
+  //    with itself, so the walker fell back to one row per call.
+  const cstFromChanges = [];
   // Our own jobs contracted in the period whose customer LP did not list either.
   const { data: ourJobs, error: ojErr } = await d.db.from('lp_jobs')
     .select('lp_lead_id, lp_leads!inner(lp_prospect_id)')
