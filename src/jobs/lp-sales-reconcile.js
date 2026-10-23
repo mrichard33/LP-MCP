@@ -147,7 +147,7 @@ async function walkEach(fetch, idOf, label, onPage) {
   }
 }
 
-export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn = {}) {
+export async function runSalesReconcile({ from, to, dryRun = true, runId = null } = {}, depsIn = {}) {
   const d = {
     db: supabase, getLeads, getLead, getLeadByLdsId, getProspectByCstId, processProspect,
     ...depsIn,
@@ -207,7 +207,21 @@ export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn
     await runPool(items, handle);
   };
   stats.days_failed = [];
+  // Days a cut-short pass already finished (and the lead ids LP listed on them).
+  const doneDays = new Set();
+  if (runId) {
+    const { data: done, error } = await d.db.from('lp_sales_reconcile_days')
+      .select('day, seen_lead_ids').eq('run_id', runId);
+    if (error) throw new Error(`progress read: ${error.message}`);
+    for (const r of done || []) {
+      doneDays.add(String(r.day).slice(0, 10));
+      for (const id of r.seen_lead_ids || []) seenLeads.add(String(id));
+    }
+    stats.days_resumed = doneDays.size;
+  }
   for (let dayIso = addDays(period.from, -1); dayIso <= addDays(period.to, 1); dayIso = addDays(dayIso, 1)) {
+    if (doneDays.has(dayIso)) continue;
+    const before = new Set(seenLeads);
     try {
       await walkEach(
         ({ PageSize, StartIndex }) => d.getLeads({
@@ -215,7 +229,15 @@ export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn
         }).then(extractArray),
         (r) => r?.cst_id ?? null, `[SalesReconcile:leads ${dayIso}]`, onPage,
       );
-      console.log(`[SalesReconcile] ${dayIso} read: ${stats.lp_prospects} customers so far, ${stats.resynced} re-synced, ${stats.jobs_marked_deleted} jobs gone from LP`);
+      if (runId) {
+        const dayIds = [...seenLeads].filter((id) => !before.has(id));
+        const { error } = await d.db.from('lp_sales_reconcile_days').upsert({
+          run_id: runId, day: dayIso, seen_lead_ids: dayIds,
+          stats: { customers: stats.lp_prospects, resynced: stats.resynced, jobs_marked_deleted: stats.jobs_marked_deleted },
+        }, { onConflict: 'run_id,day' });
+        if (error) console.warn(`[SalesReconcile] progress write for ${dayIso} failed: ${error.message}`);
+      }
+      console.log(`[SalesReconcile] ${dayIso} read: ${stats.lp_prospects} customers this pass, ${stats.resynced} re-synced, ${stats.jobs_marked_deleted} jobs gone from LP`);
     } catch (err) {
       stats.days_failed.push(dayIso);
       console.warn(`[SalesReconcile] day ${dayIso} read failed: ${err.message}`);
@@ -296,46 +318,88 @@ export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn
   return stats;
 }
 
-// ── Start a run (route and MCP tool) ───────────────────────────────────────
-// Long (minutes): starts in the background and answers at once; the result is
-// the job_runs row (job_id lp-sales-reconcile, detail = the stats) and the log
-// line above. Not drained on shutdown on purpose: a deploy marks the row
-// interrupted and the next run starts over, which is safe (every write is
-// "make our copy match LP").
+// ── Start / resume a run (route, MCP tool, scheduler) ──────────────────────
+// A month is ~40 minutes of LP paging and deploys are frequent, so a run is a
+// row in lp_sales_reconcile_runs and every finished day a row in
+// lp_sales_reconcile_days. Whatever instance is up resumes an open run within
+// five minutes and skips the finished days; the run row gets the stats when it
+// ends. Every write is "make our copy match LP", so redoing a day is harmless.
 let running = null;
-export function startSalesReconcile({ from, to, dryRun = true } = {}) {
-  if (running) return { ok: false, error: 'a reconcile is already running' };
+const OPEN_RUN_MAX_AGE_MS = 3 * 86400000;
+
+async function openRun({ from, to, dryRun }, db = supabase) {
+  const { data: existing, error: rErr } = await db.from('lp_sales_reconcile_runs').select('id')
+    .eq('period_from', from).eq('period_to', to).eq('dry_run', dryRun).is('finished_at', null).limit(1);
+  if (rErr) throw new Error(rErr.message);
+  if (existing?.length) return existing[0].id;
+  const { data, error } = await db.from('lp_sales_reconcile_runs')
+    .insert({ period_from: from, period_to: to, dry_run: dryRun }).select('id').single();
+  if (error) throw new Error(error.message);
+  return data.id;
+}
+
+function kick(run, db = supabase) {
+  running = runJob('lp-sales-reconcile', async () => {
+    const stats = await runSalesReconcile({ from: run.period_from, to: run.period_to, dryRun: run.dry_run, runId: run.id });
+    const { error } = await db.from('lp_sales_reconcile_runs')
+      .update({ finished_at: new Date().toISOString(), detail: stats }).eq('id', run.id);
+    if (error) console.warn(`[SalesReconcile] run ${run.id} close failed: ${error.message}`);
+    return stats;
+  }).catch((e) => console.error('[SalesReconcile] run failed:', e.message))
+    .finally(() => { running = null; });
+}
+
+export async function startSalesReconcile({ from, to, dryRun = true } = {}) {
   if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) {
     return { ok: false, error: 'from/to must be YYYY-MM-DD' };
   }
-  running = runJob('lp-sales-reconcile', () => runSalesReconcile({ from, to, dryRun }))
-    .catch((e) => console.error('[SalesReconcile] run failed:', e.message))
-    .finally(() => { running = null; });
-  return { ok: true, started: true, dry_run: dryRun, from: from || null, to: to || null,
-    result: 'job_runs where job_id = lp-sales-reconcile (detail holds the counts)' };
+  const period = from && to ? { from, to } : defaultPeriod();
+  const id = await openRun({ ...period, dryRun });
+  if (running) return { ok: true, queued: true, run_id: id, note: 'another run is going; this one starts within 5 minutes of it ending' };
+  kick({ id, period_from: period.from, period_to: period.to, dry_run: dryRun });
+  return { ok: true, started: true, run_id: id, dry_run: dryRun, ...period,
+    result: 'lp_sales_reconcile_runs (detail when finished_at is set); progress per day in lp_sales_reconcile_days' };
+}
+
+async function resumeOpenRun(db = supabase) {
+  if (running) return;
+  const { data, error } = await db.from('lp_sales_reconcile_runs')
+    .select('id, period_from, period_to, dry_run, requested_at').is('finished_at', null)
+    .gte('requested_at', new Date(Date.now() - OPEN_RUN_MAX_AGE_MS).toISOString())
+    .order('requested_at', { ascending: true }).limit(1);
+  if (error || !data?.length) return;
+  const run = { ...data[0], period_from: String(data[0].period_from).slice(0, 10), period_to: String(data[0].period_to).slice(0, 10) };
+  console.log(`[SalesReconcile] resuming run ${run.id} (${run.period_from}..${run.period_to}${run.dry_run ? ', dry run' : ''})`);
+  kick(run, db);
 }
 
 export function registerSalesReconcileRoutes(app, authenticate) {
-  app.post('/admin/lp-sales-reconcile', authenticate, (req, res) => {
+  app.post('/admin/lp-sales-reconcile', authenticate, async (req, res) => {
     const b = req.body || {};
-    const out = startSalesReconcile({ from: b.from, to: b.to, dryRun: b.dry_run !== false });
-    res.status(out.ok ? 202 : (out.error?.includes('running') ? 409 : 400)).json(out);
+    try {
+      const out = await startSalesReconcile({ from: b.from, to: b.to, dryRun: b.dry_run !== false });
+      res.status(out.ok ? 202 : 400).json(out);
+    } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
   });
   console.log('[SalesReconcile] Route registered: POST /admin/lp-sales-reconcile');
 }
 
-// ── Scheduler: nightly 01:00 ET, current + prior month ─────────────────────
+// ── Scheduler: resume open runs; nightly 01:00 ET, prior + current month ───
 let timer = null, lastRunDate = null;
 export function startSalesReconcileScheduler() {
   if (timer) return;
   if (!ENABLED()) { console.log('[SalesReconcile] Scheduler disabled (LP_SALES_RECONCILE_ENABLED=false)'); return; }
-  console.log('[SalesReconcile] Scheduler started — daily 01:00 ET (prior + current month)');
-  timer = setInterval(async () => {
-    const today = todayET();
-    if (hourET() !== RUN_HOUR_ET || lastRunDate === today || running) return;
-    lastRunDate = today;
-    running = runJob('lp-sales-reconcile', () => runSalesReconcile({ dryRun: false }), { occurrence: today })
-      .catch((e) => console.error('[SalesReconcile] run failed:', e.message))
-      .finally(() => { running = null; });
-  }, 5 * 60 * 1000);
+  console.log('[SalesReconcile] Scheduler started — resumes open runs; daily 01:00 ET (prior + current month)');
+  const tick = async () => {
+    try {
+      const today = todayET();
+      if (hourET() === RUN_HOUR_ET && lastRunDate !== today) {
+        lastRunDate = today;
+        await openRun({ ...defaultPeriod(today), dryRun: false });
+      }
+      await resumeOpenRun();
+    } catch (e) { console.warn('[SalesReconcile] scheduler tick failed:', e.message); }
+  };
+  setTimeout(tick, 60_000); // a run a deploy cut short picks up a minute after boot
+  timer = setInterval(tick, 5 * 60 * 1000);
 }

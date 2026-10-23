@@ -207,13 +207,13 @@ export function registerSalesBoardTools(server, deps = {}) {
     'lp_sales_reconcile_run',
     'Re-read from LP every lead entered and every job changed in a period and fix our copy (lp_leads / lp_jobs) where '
       + 'it differs: re-sync changed prospects, mark jobs LP deleted, mark leads LP deleted. Starts in the background; '
-      + 'the counts land in job_runs (job_id lp-sales-reconcile). Dry run by default (counts only, writes nothing).',
+      + 'progress in lp_sales_reconcile_runs / _days, resumed after a deploy. Dry run by default (counts only, writes nothing).',
     {
       from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('first day (default: first of last month)'),
       to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('last day (default: today)'),
       dry_run: z.boolean().optional().default(true).describe('true (default) counts only; false writes'),
     },
-    async (args) => text(startSalesReconcile({ from: args.from, to: args.to, dryRun: args.dry_run !== false })),
+    async (args) => text(await startSalesReconcile({ from: args.from, to: args.to, dryRun: args.dry_run !== false })),
   );
 
   server.tool(
