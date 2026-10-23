@@ -28,14 +28,32 @@
  *   - No recording, no email. The awaiting_siro hold (f0-interrupts.js) is
  *     reused with a cap of F0_EMAIL_HOLD_CAP_ET (default 08:30 ET the day after
  *     the demo) instead of 24h; past the cap with no recording the touch is
- *     suppressed no_recording and the workflow sends its fixed fallback
- *     template (tag f0-no-recording). The model never writes a generic email.
+ *     suppressed no_recording. The model never writes a generic email.
+ *   - Every lead gets an email (the user, 2026-10-23). When no AI email will go
+ *     out and nothing says the lead should get none (no recording, the email
+ *     off or its prompt inactive, a failed generation or copy check), the
+ *     contact gets the tag f0-email-fallback and the workflow sends its static
+ *     Reece Team email (docs/f0-v2-static-emails.md). This replaces "a quiet
+ *     exit, never a fixed email" for this one email; a failed TEXT is still
+ *     skipped. emailFallbackTag is the one list; the orchestrator adds the tag.
  */
 import { siroModes } from './config.js';
 
 export const F0_EMAIL_POSITION = 0;
 export const F0_EMAIL_CHANNEL = 'email';
-export const F0_NO_RECORDING_TAG = 'f0-no-recording';
+export const F0_EMAIL_FALLBACK_TAG = 'f0-email-fallback';
+
+// The outcomes that send the static email: no AI email will go out and no
+// rule says this lead should get none. Everything else (sold, a newer lead,
+// rebooked, rehash ended, a team-note DQ, the two-no stop, a person texting the
+// lead, a recent reply, DNC / stop-bot, rehash_owned, wrong_active_workflow,
+// a hold) sends nothing, as before.
+export const F0_EMAIL_FALLBACK_REASONS = new Set([
+  'no_recording',
+  'f0_v2_off', 'f0_email_off', 'email_prompt_inactive', 'no_prompt_match',
+  'generation_error', 'retry_error', 'safety_failed_after_retry', 'writeback_error',
+  'context_build_failed',
+]);
 export const F0_EMAIL_HOLD_CAP_DEFAULT = '08:30';
 export const F0_EMAIL_SUBJECT_MAX = 60;
 export const F0_EMAIL_PREHEADER_MAX = 90;
@@ -50,6 +68,11 @@ export function isF0EmailRequest(req) {
     && Number(req?.sequence_position) === F0_EMAIL_POSITION
     && req?.channel === F0_EMAIL_CHANNEL
     && req?.sequence_position !== '' && req?.sequence_position != null;
+}
+
+/** The fallback tag for an email outcome, or null when no email should go. Pure. */
+export function emailFallbackTag(reason) {
+  return F0_EMAIL_FALLBACK_REASONS.has(String(reason || '')) ? F0_EMAIL_FALLBACK_TAG : null;
 }
 
 /** May this caller ask for position 0? Only F.0 by email. Pure. */
@@ -188,7 +211,7 @@ export function emailHoldWindow({ demoAtMs, nowMs = Date.now(), capEt = F0_EMAIL
  */
 export function emailGate({ pd, facts }) {
   if (pd?.suppress || pd?.hold) return pd;
-  if (!facts) return { suppress: 'no_recording', terminal: true, tag: F0_NO_RECORDING_TAG };
+  if (!facts) return { suppress: 'no_recording', terminal: true, tag: F0_EMAIL_FALLBACK_TAG };
   return null;
 }
 

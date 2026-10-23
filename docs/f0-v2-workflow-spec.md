@@ -72,6 +72,17 @@ GHL number; `generated_meta.internal_position` the inside one.
 10. **Pause gate** (existing "Pause Workflow Active?"): a reply parks the contact;
     the reply path owns the conversation (it reads the same Siro visit).
 11. **Wait** `{{contact.ai_msg_next_wait_hours}}` hours. `0` → exit (position 6, the fifth text, is terminal).
+    **Two static emails ride inside two of these waits** (the user, 2026-10-23; copy in
+    `docs/f0-v2-static-emails.md`, same From Name and signature as 0f):
+    - Position 3 (text 2 just sent, a 48h wait): wait 24h → the pause gate → contact
+      has no `rehash-owned` tag → send **Static Email 3** → wait 24h. (Day 4.)
+    - Position 5 (text 4 just sent, a 168h wait): wait 72h → the same checks → send
+      **Static Email 4** → wait 96h. (Day 11.)
+    Every other position waits as before. The exits below cover both emails, and a
+    contact whose text was suppressed has already left at step 7, so a static email
+    only reaches a lead still in the sequence.
+    Schedule: email day 0 evening, text 1 day 1, text 2 day 3, Email 3 day 4, text 3
+    day 5, text 4 day 8, Email 4 day 11, text 5 day 15.
 12. **Update** `AI Msg Sequence Position` + 1, clear the previous message values,
     and **Fire Self for Next Cycle** (as S4.5).
 
@@ -95,7 +106,8 @@ It REPLACES the old static F.0 email
 nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
 
 0a. **"Update Pre-send Fields"**: `AI Msg Sequence Position` = **1** (was 0: GHL
-    saves a 0 as blank). **Reset** `AI Msg Send Ready` = No.
+    saves a 0 as blank). **Reset** `AI Msg Send Ready` = No. **Remove tag
+    `f0-email-fallback`** (2026-10-23), so a later demo never inherits it.
 0b. **Webhook POST** `/api/agentic/nurture/generate`, same header as step 5, body
     `contact_id = {{contact.id}}`, `workflow_code = F.0`, `sequence_position = 1`,
     `channel = email`. Position 1 by email is the email; anything else F.0 does not
@@ -104,13 +116,18 @@ nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
     it → wait that many hours → go back to 0a's reset and 0b. LP-MCP holds in 2h
     steps while the recording is not in yet, up to `F0_EMAIL_HOLD_CAP_ET` (08:30 ET
     the day after the demo).
-0d. **If the contact has the tag `f0-no-recording`** (the rep did not record, or
-    Siro had nothing by 08:30): send the **fixed fallback email template** (the
-    one person-written email; LP-MCP never writes a generic one), then go to 0g.
+0d. **If the contact has the tag `f0-email-fallback`** (the user, 2026-10-23: every
+    unsold demo gets an email): send **Static Email 1** (`docs/f0-v2-static-emails.md`,
+    same From Name and signature as 0f), **remove the tag**, then go to 0g. LP-MCP adds
+    the tag when no AI email will go out and nothing says the lead should get none:
+    no recording by 08:30, F0_EMAIL_MODE or F0_V2_MODE off, the email prompt not
+    active, or a draft that failed (model error, copy checks, writeback). It never
+    adds it for a real stop (sold, a newer lead, rebooked, a DQ, an opt-out, a reply).
+    The tag replaces `f0-no-recording` (never built in GHL).
 0e. **Wait for condition** `AI Msg Send Ready` = Yes, timeout to 09:15 ET the next
-    day. Timeout with `AI Msg Generation ID` empty → nothing to send (sold, a newer
-    lead, suppressed, F0_EMAIL_MODE off, prompt not active): go to 0g quietly.
-    Timeout with an id → in approval too long: go to 0g (no email).
+    day. Timeout with `AI Msg Generation ID` empty → a real stop: go to 0g quietly.
+    Timeout with an id (a draft that never reached Yes) → send **Static Email 1**,
+    then go to 0g.
 0f. **Send email** with the branded template: subject `{{contact.ai_email_subject_draft}}`,
     preheader **AI Email Preview Draft** (`C8mSMxWqXGr1HvxrImyx`, merge tag `{{contact.ai_email_preview_draft}}`:
     the field key GHL gave it; `{{contact.ai_email_preheader_draft}}` never existed), body `{{contact.ai_email_body_draft}}`
@@ -135,6 +152,14 @@ A reply to the email lands in the same GHL conversation (GHL keeps one per
 contact, the workflow's template sends included); the reply path answers in the
 same thread (`emailMessageId` = the lead's reply) and the pause gate parks the
 contact as for a text.
+
+**Going live without approval (the user, 2026-10-23: "I do not want to have to
+approve any messaging before it goes out").** Skip the shadow week below. Set, in one
+batch: `F0_EMAIL_MODE=live`, `F0_V2_MODE=live`, `NURTURE_SHADOW_WORKFLOWS=none` (unset
+or empty reads as `F.0`), `F0_FORMULA_MODE=four_step`,
+`NURTURE_WORKFLOW_IDS=F.0:07559309-9f55-4adf-8eff-9e5e3e5c3979,S4.5:f99fba97-6d2f-4fd6-966c-b5e5e36f8938`.
+The prompt rows (email V2, texts V3) must be active first. Pause the old F.0 the same
+day. With the email off (`F0_EMAIL_MODE=off`), Static Email 1 goes to everyone.
 
 **Railway, after the merge (no default changes anything):**
 1. Activate the email prompt row (the UPDATE in the header of

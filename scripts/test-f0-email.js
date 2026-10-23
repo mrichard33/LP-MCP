@@ -15,14 +15,14 @@ import { fakeSupabase } from './lib/fake-supabase.js';
 
 const {
   isF0EmailRequest, allowsPositionZero, asksPositionZero, f0EmailMode, f0EmailShadow, emailHoldCapMs,
-  emailHoldWindow, emailGate, f0EmailOutput, paragraphsToHtml, F0_NO_RECORDING_TAG,
+  emailHoldWindow, emailGate, f0EmailOutput, paragraphsToHtml, F0_EMAIL_FALLBACK_TAG, emailFallbackTag,
 } = await import('../src/siro/f0-email.js');
 const { checkF0Copy, f0RetryNote } = await import('../src/siro/f0-copy-checks.js');
 const { postDemoInterrupt } = await import('../src/siro/f0-interrupts.js');
 const { buildVisitFacts } = await import('../src/siro/f0-four-step.js');
 const { coerceSeqPos } = await import('../src/nurture/nurture-sequence-resolver.js');
 const { f0FormulaAllows } = await import('../src/nurture/nurture-prompt-selector.js');
-const { buildF0ApprovalCard } = await import('../src/nurture/nurture-orchestrator.js');
+const { buildF0ApprovalCard, runNurtureGeneration } = await import('../src/nurture/nurture-orchestrator.js');
 const { loadF0Context, resolveRehashRepFirst, greetingName, applyGreetingName } = await import('../src/siro/f0-context.js');
 const { previewF0Generation } = await import('../src/siro/f0-preview.js');
 
@@ -121,7 +121,7 @@ test('the wait for the recording: 2h steps, the last one shorter, nothing past t
   const pd = postDemoInterrupt({ ...input, demoAgeH: 14.5, waitMaxH: past.waitMaxH, waitHoldH: past.waitHoldH });
   assert.equal(pd, null);
   // Past the cap with no recording: no_recording, with the fallback tag.
-  assert.deepEqual(emailGate({ pd, facts: null }), { suppress: 'no_recording', terminal: true, tag: F0_NO_RECORDING_TAG });
+  assert.deepEqual(emailGate({ pd, facts: null }), { suppress: 'no_recording', terminal: true, tag: F0_EMAIL_FALLBACK_TAG });
   assert.equal(emailGate({ pd: null, facts: FACTS }), null);
   // Every other suppression passes through untouched (no tag).
   const sold = postDemoInterrupt({ lpSold: true });
@@ -371,4 +371,47 @@ test('a reply to the email threads: the lead\'s id, email kept, the post-demo em
   // The post-demo email reply path plans the turn.
   assert.equal(planPostDemoEmail({ trigger: 'Thanks, but we are not interested at this time.' }), 'decline_first');
   assert.equal(planPostDemoEmail({ trigger: 'We went with another company.' }), 'signed_elsewhere');
+});
+
+// 2026-10-23 (the user): every unsold demo gets the post-demo email. No AI email
+// and no rule against one → the tag f0-email-fallback; a real stop → nothing.
+test('emailFallbackTag: the static email for a failure, nothing for a real stop', () => {
+  assert.equal(F0_EMAIL_FALLBACK_TAG, 'f0-email-fallback');
+  for (const r of ['no_recording', 'f0_v2_off', 'f0_email_off', 'email_prompt_inactive', 'no_prompt_match',
+    'generation_error', 'retry_error', 'safety_failed_after_retry', 'writeback_error', 'context_build_failed']) {
+    assert.equal(emailFallbackTag(r), F0_EMAIL_FALLBACK_TAG, r);
+  }
+  for (const r of ['sold', 'newer_lead', 'rebooked', 'rehash_ended', 'lp_note_dq', 'post_demo_stop', 'human_replied',
+    'recent_reply', 'dnc_or_stop', 'rehash_owned', 'wrong_active_workflow', 'awaiting_siro', 'awaiting_approval', null, undefined, '']) {
+    assert.equal(emailFallbackTag(r), null, String(r));
+  }
+});
+
+test('runNurtureGeneration tags the F.0 email fallback once, in one place', async () => {
+  const email = { contact_id: 'c1', workflow_code: 'F.0', sequence_position: 0, channel: 'email' };
+  const text = { contact_id: 'c1', workflow_code: 'F.0', sequence_position: 1, channel: 'sms' };
+  const run = async (request, result) => {
+    const tags = [];
+    const out = await runNurtureGeneration(request, {
+      inner: async () => { if (result instanceof Error) throw result; return result; },
+      addTag: async (contactId, tag) => { tags.push(`${contactId}:${tag}`); },
+    });
+    return { out, tags };
+  };
+  // A failed generation and no recording: tagged.
+  assert.deepEqual((await run(email, { generation_id: 'g', send_ready: false, suppressed_reason: 'safety_failed_after_retry' })).tags, ['c1:f0-email-fallback']);
+  assert.deepEqual((await run(email, { generation_id: 'g', send_ready: false, suppressed_reason: 'no_recording' })).tags, ['c1:f0-email-fallback']);
+  // A sold lead, a hold, a ready draft: not tagged.
+  assert.deepEqual((await run(email, { generation_id: 'g', send_ready: false, suppressed_reason: 'sold' })).tags, []);
+  assert.deepEqual((await run(email, { generation_id: 'g', send_ready: false, suppressed_reason: 'awaiting_siro' })).tags, []);
+  assert.deepEqual((await run(email, { generation_id: 'g', send_ready: true })).tags, []);
+  // A text that fails is still skipped, never the static email.
+  assert.deepEqual((await run(text, { generation_id: 'g', send_ready: false, suppressed_reason: 'generation_error' })).tags, []);
+  // A throw tags, then still throws (the route answers 200 with the error).
+  const tags = [];
+  await assert.rejects(runNurtureGeneration(email, {
+    inner: async () => { throw new Error('boom'); },
+    addTag: async (contactId, tag) => { tags.push(tag); },
+  }), /boom/);
+  assert.deepEqual(tags, ['f0-email-fallback']);
 });
