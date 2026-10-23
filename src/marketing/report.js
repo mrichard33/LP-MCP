@@ -99,7 +99,7 @@ export function buildMarketModel({ market, month, monthRows, weekRows }) {
     disputedTotal ? `Disputed, not in any market (billed for more than we could find; waiting on a revised invoice, a confirmed charge or a credit): $${disputedTotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}.` : null,
     asOf ? `Net / Working $ as of the ${asOf} report 133 snapshot — statuses move daily.` : 'Net / Working $: no report 133 snapshot for this month yet.',
     'Net $ = jobs released to production (RTP) or completed; Working $ = sold but not yet RTP.',
-    'Cost / Issued Lead = (Invoice Cost + Calculated Cost) ÷ Issued. Calculated = Canvass 15% (estimate until canvasser payroll), MVP Marketing 15%, LeadPilotData 15%, Previous Customer / Referral 1% of net.',
+    'Cost / Issued Lead = (Invoice Cost + Calculated Cost) ÷ Issued. Calculated = Canvass 15% (estimate until canvasser payroll), MVP Marketing 15%, LeadPilotData 15% of net. Previous Customer and Customer Referral carry no cost.',
   ].filter(Boolean);
   return { market, title: market === COMPANY ? 'Reece Windows & Doors — all markets' : marketLabel(market), month, monthLabel: monthLabel(month), campaign, monthly, weekly, held: heldTotal, disputed: disputedTotal, recommendations, asOf, footnotes };
 }
