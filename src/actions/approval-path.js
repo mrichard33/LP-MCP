@@ -278,6 +278,7 @@ import {
   CALLBACK_TAG_SALES,
 } from '../knowledge/callback-resolver.js';
 import { slackPhone } from '../format-helpers.js';
+import { shortCircuitNoticeNeeded } from '../human-handoff-alert.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 
@@ -743,7 +744,10 @@ async function applyHandoffInline({
   const preview = (triggerMessage || '').slice(0, 120);
   const displayName = contactName ? `${contactName}${contactPhone ? ` (${slackPhone(contactPhone)})` : ''}` : contactId;
 
-  await sendGroupMeMessage(
+  // 2026-10-23 — same rule as handleShortCircuit: a disqualifier whose tags
+  // went on posts no card; the completed rows above are the audit trail.
+  const postNotice = shortCircuitNoticeNeeded({ isDisqualifier: isDQ, tagApplied });
+  if (postNotice) await sendGroupMeMessage(
     `🛑 AGENTIC SHORT-CIRCUIT${dqLabel} (queue-time)\n` +
     `👤 ${displayName}\n` +
     `Intent: ${generated.intent_class || 'unknown'}` +
@@ -758,7 +762,8 @@ async function applyHandoffInline({
   });
 
   console.log(`[ApprovalPath] 🛑 INLINE HANDOFF: ${contactId} → ${tagSummary} ` +
-    `(intent: ${generated.intent_class}, ${batchActions.length} actions completed, no approval card)`);
+    `(intent: ${generated.intent_class}, ${batchActions.length} actions completed, no approval card` +
+    `${postNotice ? '' : ', disqualifier: no card'})`);
 
   return actionIds.length;
 }

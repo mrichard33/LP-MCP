@@ -44,6 +44,16 @@ export const WORKFLOW_ANSWERED_HANDOFF_TAGS = new Set([
   'hdl:callback-service',
 ]);
 
+// 2026-10-23 — handoffs that mean "never contact this person again". STOP and
+// WRONG_NUMBER are disqualifiers: the bot is silent BY DESIGN and nobody may
+// reply, so "HUMAN NEEDED NOW" for them was a false alarm (Srsa58u9ldtV9B2MGdtx,
+// "Ok muchas gracias" → WRONG_NUMBER, agent_actions 630601: a 15-minute
+// priority card telling the team to answer a number that is not our lead).
+export const NO_CONTACT_HANDOFF_TAGS = new Set([
+  'hdl:stop',
+  'hdl:wrong-number',
+]);
+
 /** One alert per contact per this many minutes, via the send_notification cooldown. */
 export const HANDOFF_ALERT_COOLDOWN_MINUTES = 30;
 
@@ -53,13 +63,69 @@ export const HANDOFF_ALERT_RULE = 'HUMAN_HANDOFF_ALERT';
 /**
  * Does this handoff leave the lead with nobody talking to them?
  *
+ * A disqualifier (the classifier's is_disqualifier) or a no-contact tag never
+ * needs one: there is nobody a person should be talking to.
+ *
  * @param {string|null} handoffTag
+ * @param {{ isDisqualifier?: boolean }} [opts]
  * @returns {boolean}
  */
-export function handoffNeedsHumanAlert(handoffTag) {
+export function handoffNeedsHumanAlert(handoffTag, { isDisqualifier = false } = {}) {
+  if (isDisqualifier) return false;
   const tag = String(handoffTag || '').trim().toLowerCase();
   if (!tag) return true; // tagless handoff: nothing can be listening
+  if (NO_CONTACT_HANDOFF_TAGS.has(tag)) return false;
   return !WORKFLOW_ANSWERED_HANDOFF_TAGS.has(tag);
+}
+
+/**
+ * Should the "🛑 AGENTIC SHORT-CIRCUIT" card post? (2026-10-23)
+ *
+ * A disqualifier whose tags went on is mechanical: the tags and suppress-
+ * automation did the job, the agent_actions row and the log line are the audit
+ * trail, and the card asked nobody to do anything. A disqualifier whose tag
+ * write FAILED still posts: the contact is not suppressed, and only a person
+ * can fix that. Every other short-circuit posts as before.
+ *
+ * @param {{ isDisqualifier?: boolean, tagApplied?: boolean }} args
+ * @returns {boolean}
+ */
+export function shortCircuitNoticeNeeded({ isDisqualifier = false, tagApplied = false } = {}) {
+  if (!isDisqualifier) return true;
+  return !tagApplied;
+}
+
+// ── The disengagement card behind a disqualifier handoff (2026-10-23) ──────
+// BEHAVIORAL_DISENGAGEMENT_SEVERE fires on the same inbound as the STOP /
+// WRONG_NUMBER short-circuit and posted "DISENGAGEMENT CLASSIFIED" for a lead
+// we must not contact. In the reference case its card went out at 15:02:38 and
+// the short-circuit finished at 15:02:48 (same event 4498304), so a look-back
+// alone misses it: while a send_message on the same event is still running,
+// the card waits briefly for its verdict.
+export const DQ_QUIET_NOTIFICATION_RULES = new Set(['BEHAVIORAL_DISENGAGEMENT_SEVERE']);
+/** A disqualifier handoff this recent on the contact skips the live card. */
+export const DQ_HANDOFF_LOOKBACK_MINUTES = 5;
+/** How long one wait for the sibling send lasts. */
+export const DQ_SIBLING_WAIT_SECONDS = 20;
+/** Past this age the card stops waiting and posts (a stuck send must not swallow it). */
+export const DQ_SIBLING_MAX_WAIT_MS = 3 * 60 * 1000;
+
+/**
+ * Pure. What the disengagement card does given what the reads found.
+ * Unknown (a failed read) posts: that is today's behaviour, never silence.
+ *
+ * @param {object} args
+ * @param {boolean|null} args.dqHandoffRecent  a completed DQ handoff in the window (null = unreadable)
+ * @param {boolean|null} args.siblingSendOpen  a send_message on the same event still running (null = unreadable)
+ * @param {number|null}  args.ageMs            how old this notification row is
+ * @returns {{ verdict: 'send'|'skip'|'defer', reason: string }}
+ */
+export function dqQuietNotificationDecision({ dqHandoffRecent = null, siblingSendOpen = null, ageMs = null } = {}) {
+  if (dqHandoffRecent === true) return { verdict: 'skip', reason: 'disqualifier_handoff_recent' };
+  if (siblingSendOpen === true && Number.isFinite(ageMs) && ageMs < DQ_SIBLING_MAX_WAIT_MS) {
+    return { verdict: 'defer', reason: 'awaiting_sibling_send_verdict' };
+  }
+  return { verdict: 'send', reason: dqHandoffRecent === null ? 'dq_read_unknown' : 'no_disqualifier_handoff' };
 }
 
 /** The GHL conversation deep link, or the contact record when we have no thread. */
@@ -145,6 +211,9 @@ export function buildHumanHandoffAlertPayload({
 
 export default {
   handoffNeedsHumanAlert,
+  shortCircuitNoticeNeeded,
+  dqQuietNotificationDecision,
+  NO_CONTACT_HANDOFF_TAGS,
   buildHumanHandoffAlertPayload,
   ghlConversationLink,
   HANDOFF_ALERT_RULE,
