@@ -87,7 +87,10 @@ of its generic SMS steps carry over.
 ## Position 1: the post-demo email (Mark, 2026-10-21)
 
 The evening of the demo, before the first text, F.0 v2 sends ONE email written
-from the Siro recording as the rehash rep. It REPLACES the old static F.0 email
+from the Siro recording and signed as **the Reece Team** ("we", never "I"; Mark,
+2026-10-22). Its call invite names the rehash rep from the GHL custom value
+`rehash_rep_name` (today "John"), else the follower on the lead, else "our team".
+It REPLACES the old static F.0 email
 ("What we saw at your home, <name>"): delete that step from the old copy, keep
 nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
 
@@ -111,8 +114,10 @@ nothing of its text. Build these steps between step 1 (entry) and step 2 (init):
 0f. **Send email** with the branded template: subject `{{contact.ai_email_subject_draft}}`,
     preheader **AI Email Preview Draft** (`C8mSMxWqXGr1HvxrImyx`, `{{contact.ai_email_preheader_draft}}`), body `{{contact.ai_email_body_draft}}`
     (HTML paragraphs), P.S. `{{contact.ai_email_ps_draft}}` (the Template A / B
-    branch as S4.5: an empty P.S. means no P.S. block). **From: the rehash rep
-    (John)**. The template's footer reads only "Protecting families since 1972"
+    branch as S4.5: an empty P.S. means no P.S. block). **From Name: Reece Team**
+    (was the rehash rep, John, until 2026-10-22); keep the From email as it is. The
+    body ends with the line "The Reece Team", so the template adds no personal
+    signature. The template's footer reads only "Protecting families since 1972"
     (fix the trust band in the template; the model never writes a footer, an
     address or an unsubscribe line). Then **Webhook POST**
     `/api/agentic/messages/engagement` with `generation_id = {{contact.ai_msg_generation_id}}`,
@@ -137,6 +142,14 @@ contact as for a text.
    workflow asking. The workflow must set that field at entry.
 4. After a week of approved emails: `F0_EMAIL_MODE=live`. The email and the texts
    go live independently. Rollback, one variable: `F0_EMAIL_MODE=off`.
+5. (2026-10-22) Run `sql/seeds/2026-10-22_f0_v2_email_prompt_team_voice.sql` AFTER
+   the deploy that reads `F0_EMAIL_VOICE` (default `team`: prompt
+   `F.0-P0-email-V2`). Set the GHL custom value `rehash_rep_name` (today **John**).
+   `F0_EMAIL_VOICE=rep` puts back the email written as the rehash rep (prompt V1,
+   left active for that rollback) and its checks.
+6. (2026-10-22) Run `sql/seeds/2026-10-22_f0_v2_four_step_varied_close.sql` after the
+   same deploy: the texts word their call ask differently each time and never repeat
+   an earlier close ("if I could … would you" is the idea, not the script).
 
 ## Testing on a test contact (the user, 2026-10-21)
 

@@ -138,7 +138,8 @@ test('each bad example fails', () => {
   assert.ok(codes('Just checking in, James. If I could make it work, would you be open to a quick call with John?').includes('first_name_not_first'));
   assert.ok(codes('Just checking in to see where you are. Any questions?').includes('generic_opener'));
   // The formula itself.
-  assert.ok(codes('James, the windows still matter. Would you be open to a quick call with John?').includes('no_if_i_could'));
+  // 2026-10-22 (the user): any conditional offer counts; none at all still fails.
+  assert.ok(codes('James, the windows still matter. Would you be open to a quick call with John?').includes('no_conditional_offer'));
   assert.ok(codes('James, the windows still matter. If I could make it work better, would you like that?').includes('no_call_question'));
   assert.ok(codes(GOOD, opts(1, { slots: { ...SLOTS, hesitation: null } })).includes('slot_missing:hesitation'));
   assert.ok(codes(GOOD, opts(1, { slots: { ...SLOTS, reframe: 'a brand new lanai enclosure with skylights' } })).some(c => c.startsWith('slot_')));
@@ -173,7 +174,7 @@ test('v1 keeps its own checks, plus the sensitive-detail rule (ruling 7)', () =>
 });
 
 test('the retry note names every new failure in plain words', () => {
-  const n = f0RetryNote(['sensitive_detail', 'no_if_i_could', 'slot_ungrounded:hesitation', 'slot_not_in_text:reframe', 'four_step_output'], { position: 1 });
+  const n = f0RetryNote(['sensitive_detail', 'no_conditional_offer', 'slot_ungrounded:hesitation', 'slot_not_in_text:reframe', 'four_step_output'], { position: 1 });
   for (const w of ['death', 'If I could', 'hesitation slot', 'reframe slot', 'JSON']) assert.ok(n.includes(w), w);
 });
 

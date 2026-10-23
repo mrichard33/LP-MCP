@@ -163,3 +163,51 @@ export function parseFourStepOutput(output) {
   }
   return { ok: true, slots, text };
 }
+
+// ── The close is a strategy, not a script (the user, 2026-10-22) ──────────────
+// "The messages repeat 'if I could, would you' a little too much … this is just
+// the overall strategy but we do not need to say word for word". Every F.0 touch
+// (the email and the texts) closed on "If I could …, would you be open to a quick
+// call with John?", and the copy checks REQUIRED those words. Now any conditional
+// offer counts (CONDITIONAL_OFFER_RX), and a close that opens like a close we
+// already sent the lead fails (closeRepeats): "if I/we could" once per thread.
+
+/** A conditional offer to make it work better, in any wording. */
+export const CONDITIONAL_OFFER_RX = /\bif\b[^.?!]{0,120}?\b(?:could|can|were\s+able|was\s+able|found|find|manage|make|work)\b|\bwhat\s+if\b|\bsee\s+(?:if|whether|what)\b|\b(?:may|might)\s+be\s+able\s+to\b|\bthere\s+(?:may|might)\s+be\s+(?:a\s+)?(?:way|room|options?)\b/i;
+const IF_COULD_RX = /\bif\s+(?:i|we)\s+could\b/i;
+const stripHtml = (s) => String(s || '').replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ');
+
+/** The last question sentence of a message, or ''. Pure. */
+export function closingQuestion(text) {
+  const qs = stripHtml(text).match(/[^.!?\n]*\?/g) || [];
+  return (qs[qs.length - 1] || '').trim();
+}
+
+/** The first four words of a close, "we" read as "I" (so "If we could" = "If I could"). Pure. */
+export function closeOpener(question) {
+  const words = String(question || '').toLowerCase().replace(/[’']/g, '').replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/).filter(Boolean).map(w => (w === 'we' ? 'i' : w));
+  return words.length >= 4 ? words.slice(0, 4).join(' ') : '';
+}
+
+/**
+ * The draft's close repeats one we already sent: both use "if I/we could", or
+ * both open with the same four words. `earlier` = our earlier messages. Pure.
+ */
+export function closeRepeats(draft, earlier = []) {
+  const q = closingQuestion(draft);
+  if (!q) return false;
+  const op = closeOpener(q);
+  return (Array.isArray(earlier) ? earlier : []).some((e) => {
+    const eq = closingQuestion(e);
+    if (!eq) return false;
+    if (IF_COULD_RX.test(q) && IF_COULD_RX.test(eq)) return true;
+    return !!op && op === closeOpener(eq);
+  });
+}
+
+/** The closes of our earlier messages, for the prompt's EARLIER CLOSES line. Pure. */
+export function earlierClosesLine(earlier = []) {
+  const qs = [...new Set((Array.isArray(earlier) ? earlier : []).map(closingQuestion).filter(Boolean))];
+  return qs.length ? qs.map(q => `- ${q}`).join('\n') : 'none';
+}

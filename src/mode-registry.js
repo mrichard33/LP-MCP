@@ -277,6 +277,11 @@ export const MODES = Object.freeze([
     goLive: 'a week of approved position-0 emails in #contact-rehash (F.0 email prompt row active first)',
     note: 'F.0 v2 position-0 email, written from the Siro visit as the rehash rep (src/siro/f0-email.js): off skips it quietly, shadow drafts it for approval, live sends it. Decides the email alone; F0_V2_MODE=off still stops every F.0 touch.',
   }),
+  m('F0_EMAIL_VOICE', 'bot', 'enum', ['team', 'rep'], 'team', { live: ['team'], off: ['rep'] }, {
+    since: '2026-10-22', decider: 'Mark', evidence: { table: 'agentic_messages' },
+    goLive: 'live by Mark\'s ruling (2026-10-22): the F.0 v2 email is the Reece Team\'s; rep is the rollback',
+    note: 'F.0 v2 position-0 email voice (src/siro/f0-email.js): team = written and signed as "The Reece Team" ("we", never "I"), the call invite names the rep from the GHL custom value rehash_rep_name (else the follower, else "our team"), prompt F.0-P0-email-V2; rep = the 2026-10-21 email written as the rehash rep, prompt F.0-P0-email-V1 and its checks. The texts are unchanged.',
+  }),
   m('F0_TEST_LINKS', 'bot', 'choice', ['', '<testContactId>:<realLpLeadId>,…'], '', {}, {
     since: '2026-10-21', decider: 'Mark', evidence: { table: 'agentic_messages' },
     goLive: 'empty = off; set per test contact ("testContactId:realLpLeadId,…"), only contacts tagged aios-test are linked',
