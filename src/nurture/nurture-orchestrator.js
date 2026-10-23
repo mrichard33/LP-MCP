@@ -1093,6 +1093,7 @@ function pickMeta(output) {
     specific_data_points_referenced: output.specific_data_points_referenced || null,
     booking_escape_hatch_position: output.booking_escape_hatch_position || null,
     has_ps: !!output.ps_text,
+    ...(output.question_mark_restored ? { question_mark_restored: true } : {}),
   };
 }
 

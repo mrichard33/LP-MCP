@@ -9,6 +9,9 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 F.0 v2: every unsold demo gets an email (the user).
 
+- **A dropped "?" no longer sends the static email.** When the model ends an
+  F.0 email's call invite without its "?", it is put back before the checks
+  (`closeQuestion`, `src/siro/f0-email.js`). A closing statement is left alone.
 - **A static Reece Team email goes out when the AI email can't.** No Siro
   recording, the AI email turned off, or a failed draft now tags the contact
   `f0-email-fallback`, and the workflow sends the static email instead of

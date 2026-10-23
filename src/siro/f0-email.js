@@ -38,6 +38,7 @@
  *     skipped. emailFallbackTag is the one list; the orchestrator adds the tag.
  */
 import { siroModes } from './config.js';
+import { restoreQuestionMark } from '../agentic/human-voice.js';
 
 export const F0_EMAIL_POSITION = 0;
 // 2026-10-23 (the user): two more emails between the texts, written from the
@@ -244,10 +245,28 @@ export function paragraphsToHtml(text) {
  * the copy checks. A shape that is not that is a failed check (one re-write,
  * then suppressed_low_conf). Pure.
  */
+/**
+ * The closing question with its "?" back (the user, 2026-10-23). The day-11
+ * preview ended "…a quick call with John to walk through it with both of you"
+ * with no "?" and no period, failed question_count / no_call_question, and
+ * would have gone out as the static email. Only the body's LAST sentence is
+ * touched, and only when it reads as a question (restoreQuestionMark, the same
+ * test the reply bots use); a closing statement stays as it is and the checks
+ * still decide. Pure. Returns { text, changed }.
+ */
+export function closeQuestion(body) {
+  const text = String(body ?? '').trim();
+  if (!text || /[?!]$/.test(text)) return { text, changed: false };
+  if (text.endsWith('.')) return restoreQuestionMark(text);
+  const fixed = restoreQuestionMark(`${text}.`);
+  return fixed.changed ? fixed : { text, changed: false };
+}
+
 export function f0EmailOutput(raw) {
   const o = raw && typeof raw === 'object' ? raw : {};
   const str = (v) => (typeof v === 'string' ? v.trim() : '');
-  const body = str(o.body) || str(o.text);
+  const closed = closeQuestion(str(o.body) || str(o.text));
+  const body = closed.text;
   const slots = o.slots && typeof o.slots === 'object' && !Array.isArray(o.slots) ? o.slots : null;
   const invalid = !body ? 'missing_body' : !str(o.subject) ? 'missing_subject' : !str(o.preheader) ? 'missing_preheader' : !slots ? 'missing_slots' : null;
   const cleanSlots = {};
@@ -263,6 +282,7 @@ export function f0EmailOutput(raw) {
     next_wait_hours: 0,
     email_plain_body: body,
     four_step_slots: slots ? cleanSlots : null,
+    ...(closed.changed ? { question_mark_restored: true } : {}),
     ...(invalid ? { email_invalid: invalid } : {}),
   };
 }
