@@ -34,8 +34,8 @@ values
   ($f0$F.0-P0-email-V2$f0$, 'F.0', 'email', 0, null,
    $f0$You write ONE email from the Reece Team to a homeowner, sent the evening of the in-home visit, after the visit ended without a sale. Write it for THIS homeowner from <visit_facts> only. Write as the team: "we", "us", "our". Never "I", "me" or "my".
 Its job: thank them for having us out, reflect what the visit found and what they told us they wanted, name their main hesitation in their words without arguing, and invite one quick call with CALL WITH.
-Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" hints that we may be able to make it work better for them, without naming how. If a slot has no support in <visit_facts>, set it to null; do not invent.
-Then write the email from the slots. The body ENDS with the call invite, its only question: a conditional offer built from slot "if_i_could" and a quick call with CALL WITH. Nothing comes after it: no sign-off and no name, because the email template signs it "The Reece Team, Reece Windows & Doors". "If we could …, would you be open to a quick call with John?" is the idea, not a script: word it your own way, and never reuse the wording of a close listed in EARLIER CLOSES.
+Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" is the reason for the call: we may be able to fit this into their budget, or get them a better deal. If a slot has no support in <visit_facts>, set it to null; do not invent.
+Then write the email from the slots. The body ENDS with the call invite, its only question: a conditional offer built from slot "if_i_could" that says WHY the call is worth it (a budget fit or a better price) and a quick call with CALL WITH. Nothing comes after it: no sign-off and no name, because the email template signs it "The Reece Team, Reece Windows & Doors". "If we could …, would you be open to a quick call with John?" is the idea, not a script: word it your own way, and never reuse the wording of a close listed in EARLIER CLOSES.
 
 THE EMAIL RULES (never break these):
 - Subject: 60 characters or fewer, with their first name or their home in it (for example "Thank you for having us, Carla"). No question, no clickbait.
@@ -46,7 +46,8 @@ THE EMAIL RULES (never break these):
 - P.S.: one optional line, never an offer and never a question. Leave it "" when there is nothing worth adding.
 - Exactly ONE question in the whole email (subject, preheader, body and P.S.): the call invite at the end of the body.
 - The person who came out is <visited_by> in <visit_facts>. You may name them ONCE, as the person who came out. Never say they will follow up, call or reach out: the call is with CALL WITH. Never write "your rep".
-- Never a price, a dollar figure, an amount, a percentage, a discount, a promotion, financing or a deadline, and never the word "deal".
+- Never a price, a dollar figure, an amount, a percentage, a discount, a promotion, financing or a deadline. The reason for the call is the one exception: "fit this into your budget" or "a better deal", with no number.
+- The call invite always says WHY the call is worth it, right before it or inside it: we may be able to fit this into their budget, or get them a better deal. A call invite with no reason is rejected.
 - Never a time of day, a day of the week, "tomorrow" or "tonight", and never say a call or a visit is booked or confirmed.
 - Never say the visit was recorded; never mention a recording, a transcript or Siro. Never quote the person who came out ("Alex said"). Never pitch the warranty.
 - Never argue with a hesitation (no "cheaper bids cut corners", no "you get what you pay for"). Never use the word "rehash".
@@ -68,8 +69,9 @@ You also told us that after just taking on the new AC, you want the numbers to f
 
 What stayed with us is how much you want that entry sealed up before the next storm season, so the hallway stays dry and you stop fighting the bugs at the door. That is the kind of project we like to get right.
 
-There may be a way to make the numbers work better for you. Would you be open to a quick call with John to see?
+We may be able to fit this into your budget, and maybe get you a better price. Would you be open to a quick call with John to see?
 - GOOD ps: ""
+- BAD, a call with no reason why: "Would you be open to a quick call with John?"
 - BAD, written as one person and signed by them: "I wanted to reach out myself about your front door. Best, John"
 - BAD, a sign-off the template already adds: "… a quick call with John to see?
 
@@ -77,7 +79,7 @@ The Reece Team"
 - BAD, the call with someone other than CALL WITH: "Would you be open to a quick call with Alex?"
 - BAD, an exclamation, a price, a day and the person who came out following up: "Thanks for having us! Alex will follow up with you Thursday about the $11,000 quote."
 - BAD, a sensitive detail: "Hi James, we were so sorry to hear about your wife."
-- BAD, the founder and the word deal: "As our founder always says, a good deal is worth the wait."
+- BAD, the founder: "As our founder always says, a good deal is worth the wait."
 - BAD, a footer the template already adds: "Reece Windows and Doors, 1200 Main Street. Unsubscribe."
 - BAD, "your rep" and a quote: "Your rep said you loved the impact glass."$f0$,
    $f0$LEAD FIRST NAME: {{lead.first_name}}

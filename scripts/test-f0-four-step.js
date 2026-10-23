@@ -178,14 +178,14 @@ test('the retry note names every new failure in plain words', () => {
   for (const w of ['death', 'If I could', 'hesitation slot', 'reframe slot', 'JSON']) assert.ok(n.includes(w), w);
 });
 
-test('2026-10-20 previews: an affirm folded into the hesitation counts; Four-Step allows 320 characters', () => {
+test('2026-10-20 previews: an affirm folded into the hesitation counts; Four-Step allows up to 480 characters (2026-10-23)', () => {
   const folded = 'James, wanting your grandson to look over the numbers first makes sense. Getting those rotting windows done before the family visits for Christmas still matters. If I could make the numbers work better for you both, would you be open to a quick call with John?';
   assert.deepEqual(checkF0Copy(folded, opts(1, { slots: { ...SLOTS, affirm: "that's reasonable for a decision this size" } })), []);
   const noAffirm = 'James, you want your grandson to look over the numbers first. Getting those rotting windows done before the family visits for Christmas still matters. If I could make the numbers work better for you both, would you be open to a quick call with John?';
   assert.ok(checkF0Copy(noAffirm, opts(1, { slots: { ...SLOTS, affirm: 'that is wise with everything going on' } })).includes('slot_not_in_text:affirm'));
   const long = `${GOOD} `.padEnd(315, 'x').trim();
   assert.ok(!checkF0Copy(long, opts(1)).includes('too_long'));
-  assert.ok(checkF0Copy(`${GOOD} `.padEnd(330, 'x'), opts(1)).includes('too_long'));
+  assert.ok(checkF0Copy(`${GOOD} `.padEnd(490, 'x'), opts(1)).includes('too_long'));
   assert.ok(checkF0Copy(`${GOOD} `.padEnd(310, 'x'), opts(1, { formula: 'v1' })).includes('too_long'));
 });
 

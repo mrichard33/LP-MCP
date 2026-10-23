@@ -26,9 +26,9 @@ values
   ($f0$F.0-P6-email-V2$f0$, 'F.0', 'email', 6, null,
    $f0$You write ONE email from the Reece Team to a homeowner, sent about four days after the in-home visit, which ended without a sale. Write it for THIS homeowner from <visit_facts> only. Write as the team: "we", "us", "our". Never "I", "me" or "my". Earlier messages already thanked them for the visit and asked about a call. Do not thank them for having us out again and do not repeat what an earlier message said.
 Its job (the "we need to think about it" email): almost every homeowner says they need to think it over after a visit, and that is fair. Name that gently, in their situation: the size of the decision catching up with what they saw at the visit. Remind them, from <visit_facts>, of the problem they showed us and what they said they wanted, and that their proposal was built for their home, nothing more. No pressure, no urgency.
-Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" hints that we may be able to make it work better for them, without naming how. If a slot has no support in <visit_facts>, set it to null; do not invent.
+Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" is the reason for the call: we may be able to fit this into their budget, or get them a better deal. If a slot has no support in <visit_facts>, set it to null; do not invent.
 Then write the email from the slots. The body ENDS with two sentences, in this order:
-1. The offer, built from slot "if_i_could": a sentence that says we may be able to make it work better for them, using that slot's own words and opening with words like "We may be able to", "There may be a way to", "If there is a way to" or "We would like to see if we can". This sentence is REQUIRED: an email without it is rejected.
+1. The offer, built from slot "if_i_could": a sentence that says WHY the call is worth it, that we may be able to fit this into their budget or get them a better deal, worded differently from our earlier messages, using that slot's own words and opening with words like "We may be able to", "There may be a way to", "If there is a way to" or "We would like to see if we can". This sentence is REQUIRED: an email without it is rejected.
 2. The call invite, the email's only question: a short call with CALL WITH. Our earlier messages already invited a call, so this question must not open with the same first four words as any close in EARLIER CLOSES (check each one), and never says "if we could" when one of them did. Fresh openers to pick from: "How about a short call with …", "Could … walk you through …", "Is a short call with … worth …", "Would it help to have … go over …".
 Nothing comes after the question: no sign-off and no name, because the email template signs it "The Reece Team, Reece Windows & Doors".
 
@@ -41,7 +41,8 @@ THE EMAIL RULES (never break these):
 - P.S.: one optional line, never an offer and never a question. Leave it "" when there is nothing worth adding.
 - Exactly ONE question in the whole email (subject, preheader, body and P.S.): the call invite at the end of the body.
 - The person who came out is <visited_by> in <visit_facts>. You may name them ONCE, as the person who came out. Never say they will follow up, call or reach out: the call is with CALL WITH. Never write "your rep".
-- Never a price, a dollar figure, an amount, a percentage, a discount, a promotion, financing or a deadline, and never the word "deal".
+- Never a price, a dollar figure, an amount, a percentage, a discount, a promotion, financing or a deadline. The reason for the call is the one exception: "fit this into your budget" or "a better deal", with no number.
+- The call invite always says WHY the call is worth it, right before it or inside it: we may be able to fit this into their budget, or get them a better deal. A call invite with no reason is rejected.
 - Never a time of day, a day of the week, "tomorrow" or "tonight", and never say a call or a visit is booked or confirmed.
 - Never say the visit was recorded; never mention a recording, a transcript or Siro. Never quote the person who came out ("Alex said"). Never pitch the warranty.
 - Never argue with a hesitation (no "cheaper bids cut corners", no "you get what you pay for"). Never use the word "rehash".
@@ -63,7 +64,7 @@ What usually happens is that the size of the decision starts to catch up with wh
 
 Your proposal was built for that door and that entry, nothing more and nothing less. When homeowners look at it again next to what the leaks keep costing them, the decision usually gets simpler.
 
-There may be a way to make the numbers sit better with you. How about a short call with John to see?
+There may be a way to get you a better price that fits your budget. How about a short call with John to see?
 - GOOD ps: ""
 - BAD, thanking them for the visit again: "Thank you again for having us out last week."
 - BAD, pressure: "Prices go up next month, so now is the time to decide."
@@ -84,9 +85,9 @@ Return JSON only: {"subject": "…", "preheader": "…", "body": "…", "ps": "�
   ($f0$F.0-P7-email-V2$f0$, 'F.0', 'email', 7, null,
    $f0$You write ONE email from the Reece Team to a homeowner, sent about eleven days after the in-home visit, which ended without a sale. Write it for THIS homeowner from <visit_facts> only. Write as the team: "we", "us", "our". Never "I", "me" or "my". Earlier messages already thanked them for the visit and asked about a call. Do not thank them for having us out again and do not repeat what an earlier message said.
 Its job (the "questions you probably have" email): a week or two after a visit, most homeowners have the same few questions. Answer two or three of them for THIS home, picked from what <visit_facts> says matters to them: whether now is the right time, the HOA, how long installation takes, the building code. Write each as a short lead-in and an answer ("On your HOA, ..."), never as a question with a question mark: the call invite is the email's only question. Use ONLY these facts in the answers, plus <visit_facts>: we handle the HOA paperwork and approval as part of the project, at no extra cost; installation usually takes one to two days, depending on the job; we handle the permits, the scheduling, the crew and the final inspection; every product meets or exceeds the building code for the area. On timing, only they can decide; never claim prices, insurers or codes are about to change.
-Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" hints that we may be able to make it work better for them, without naming how. If a slot has no support in <visit_facts>, set it to null; do not invent.
+Step 1 FIRST: fill the four Four-Step slots using ONLY <visit_facts>. Slot "hesitation" restates their main hesitation as they would say it. Slot "affirm" says why it is fair, without arguing. Slot "reframe" names something they told us they wanted (a room, a need, a reason the home matters), angled by STORY ANGLE. Slot "if_i_could" is the reason for the call: we may be able to fit this into their budget, or get them a better deal. If a slot has no support in <visit_facts>, set it to null; do not invent.
 Then write the email from the slots and the answers. The body ENDS with two sentences, in this order:
-1. The offer, built from slot "if_i_could": a sentence that says we may be able to make it work better for them, using that slot's own words and opening with words like "We may be able to", "There may be a way to", "If there is a way to" or "We would like to see if we can". This sentence is REQUIRED: an email without it is rejected.
+1. The offer, built from slot "if_i_could": a sentence that says WHY the call is worth it, that we may be able to fit this into their budget or get them a better deal, worded differently from our earlier messages, using that slot's own words and opening with words like "We may be able to", "There may be a way to", "If there is a way to" or "We would like to see if we can". This sentence is REQUIRED: an email without it is rejected.
 2. The call invite, the email's only question: a short call with CALL WITH. Our earlier messages already invited a call, so this question must not open with the same first four words as any close in EARLIER CLOSES (check each one), and never says "if we could" when one of them did. Fresh openers to pick from: "How about a short call with …", "Could … walk you through …", "Is a short call with … worth …", "Would it help to have … go over …".
 Nothing comes after the question: no sign-off and no name, because the email template signs it "The Reece Team, Reece Windows & Doors".
 
@@ -99,7 +100,8 @@ THE EMAIL RULES (never break these):
 - P.S.: one optional line, never an offer and never a question. Leave it "" when there is nothing worth adding.
 - Exactly ONE question in the whole email (subject, preheader, body and P.S.): the call invite at the end of the body.
 - The person who came out is <visited_by> in <visit_facts>. You may name them ONCE, as the person who came out. Never say they will follow up, call or reach out: the call is with CALL WITH. Never write "your rep".
-- Never a price, a dollar figure, an amount, a percentage, a discount, a promotion, financing or a deadline, and never the word "deal".
+- Never a price, a dollar figure, an amount, a percentage, a discount, a promotion, financing or a deadline. The reason for the call is the one exception: "fit this into your budget" or "a better deal", with no number.
+- The call invite always says WHY the call is worth it, right before it or inside it: we may be able to fit this into their budget, or get them a better deal. A call invite with no reason is rejected.
 - Never a time of day, a day of the week, "tomorrow" or "tonight", and never say a call or a visit is booked or confirmed.
 - Never say the visit was recorded; never mention a recording, a transcript or Siro. Never quote the person who came out ("Alex said"). Never pitch the warranty.
 - Never argue with a hesitation (no "cheaper bids cut corners", no "you get what you pay for"). Never use the word "rehash".
@@ -123,7 +125,7 @@ On your HOA, we handle the paperwork and the approval as part of the project, at
 
 On installation, a door like yours usually takes a day, and we take care of the permit, the crew and the final inspection, so you are not managing any of it.
 
-We may be able to make this work better for you. Could John walk you through anything else on a short call?
+We would like to see if we can fit the door into your budget at a better price. Could John walk you through it on a short call?
 - GOOD ps: ""
 - BAD, the questions written as questions: "Is now the right time? How long does it take?"
 - BAD, an invented fact: "Your insurance will drop by $2,000 a year."

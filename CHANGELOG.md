@@ -12,7 +12,14 @@ F.0 v2: every unsold demo gets an email (the user).
 - **F.0 v2 go-live, rules side.** The 10-21 objection split (no O.0 routing for
   a rehash lead) is now applied, and every rule that takes a lead out of F.0
   also takes it out of v2 (`sql/seeds/2026-10-23_f0_v2_enrollment_switch.sql`).
-  New OPPFDN leads move to v2 once Railway's F.0 modes are live.
+  New OPPFDN leads moved to v2, then back to the original F.0 the same night: v2
+  stays in draft for testing (the user).
+- **One failed text no longer ends F.0 v2.** A Four-Step text may run to 480
+  characters (it still aims for 300), and a text that fails its checks sends a
+  generic Reece Team text instead, so the workflow goes on to the next one.
+- **Every F.0 call invite says why.** The Reece Team texts and emails ask for the
+  call because we may fit it into their budget or find them a better deal; the
+  word "deal" is allowed there now.
 - **The day-4 and day-11 emails pass their checks.** Their prompts now require
   an offer sentence ("We may be able to …") before the call question and a
   question opening that no earlier message used. Before, the day-11 preview

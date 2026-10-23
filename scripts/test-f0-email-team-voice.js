@@ -45,12 +45,12 @@ We understand you want your grandson to look over the numbers before you commit 
 
 What stayed with us is how much you want the home protected and looking its best when the family visits for Christmas. Getting those rotting windows replaced before then is exactly the kind of project we like to get right.
 
-If we could make the numbers work better for you both, would you be open to a quick call with John?`;
+If we could fit this into your budget at a better price, would you be open to a quick call with John?`;
 const SLOTS = {
   hesitation: 'you want your grandson to look over the numbers',
   affirm: 'that makes complete sense',
   reframe: 'getting those rotting windows replaced before the family visits for Christmas',
-  if_i_could: 'make the numbers work better for you both',
+  if_i_could: 'fit this into your budget at a better price',
 };
 const EMAIL = { subject: 'Thank you for having us, James', preheader: 'A few thoughts on those rear windows and Christmas', ps: '' };
 const opts = (extra = {}) => ({ facts: FACTS, position: 0, repFirstName: 'John', formula: 'email', voice: 'team', callWith: 'John', slots: SLOTS, firstName: 'James', ...EMAIL, ...extra });
@@ -217,7 +217,7 @@ test('the V2 seed: active, version 2, CALL WITH, and its example passes the team
   const words = content.split(/\s+/).filter(Boolean).length;
   assert.ok(words >= 120 && words <= 180, `example is ${words} words`);
   assert.equal((ex.match(/\?/g) || []).length, 1);
-  assert.match(ex, /There may be a way/, 'the example close is not "If we could": the idea, not the script');
+  assert.match(ex, /We may be able to/, 'the example close is not "If we could": the idea, not the script');
   assert.doesNotMatch(content, /\bI\b|\b(?:me|my)\b/);
   assert.doesNotMatch(ex, /!|\bdeal\b|founder|—/i);
 });
