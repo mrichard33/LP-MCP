@@ -293,6 +293,7 @@ export function sendMessageBudgetMs() {
 import {
   buildHumanHandoffAlertPayload,
   handoffNeedsHumanAlert,
+  shortCircuitNoticeNeeded,
   HANDOFF_ALERT_RULE,
 } from './human-handoff-alert.js';
 import { HUMAN_FOLLOW_UP_INTENTS } from './agentic/handoff-policy.js';
@@ -2326,7 +2327,9 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
   // for a manager, and a promise we did not keep. The rest the reply handles.
   const botReplies = !!opts.botReplies;
   let humanAlertQueued = false;
-  if (!opts.dryRun && handoffNeedsHumanAlert(handoffTag) &&
+  // 2026-10-23 — never for a disqualifier (STOP / WRONG_NUMBER): nobody may
+  // reply to them, so a "HUMAN NEEDED NOW" card was a false alarm.
+  if (!opts.dryRun && handoffNeedsHumanAlert(handoffTag, { isDisqualifier: isDQ }) &&
       (!botReplies || HUMAN_FOLLOW_UP_INTENTS.has(generated.intent_class))) {
     try {
       const { error: alertErr } = await supabase.from('agent_actions').insert({
@@ -2363,7 +2366,11 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
     }
   }
 
-  await sendGroupMeMessage(
+  // 2026-10-23 — a disqualifier whose tags went on posts no card: nothing for a
+  // person to do. This log line and the action's execution_result are the
+  // record. A failed tag write still posts (the contact is not suppressed).
+  const postNotice = shortCircuitNoticeNeeded({ isDisqualifier: isDQ, tagApplied });
+  if (postNotice) await sendGroupMeMessage(
     `🛑 AGENTIC SHORT-CIRCUIT${dqLabel}\n` +
     `👤 ${contactName}\n` +
     `Intent: ${generated.intent_class || 'unknown'}` +
@@ -2377,7 +2384,7 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
     console.warn(`[SendMessage] GroupMe (short-circuit) failed: ${err.message}`);
   });
 
-  console.log(`[SendMessage] 🛑 SHORT-CIRCUIT: ${contactId} → ${tagSummary} (intent: ${generated.intent_class}, ${generated.classification_method})`);
+  console.log(`[SendMessage] 🛑 SHORT-CIRCUIT: ${contactId} → ${tagSummary} (intent: ${generated.intent_class}, ${generated.classification_method})${postNotice ? '' : ' — disqualifier, no card'}`);
 
   return {
     action: 'send_message_handed_off',
@@ -2393,6 +2400,7 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
     callback_basis: callbackBasis,
     pending_cleared: pendingCleared,
     human_alert_queued: humanAlertQueued,
+    short_circuit_notice_posted: postNotice,
     reason: 'compliance_gate_handoff',
   };
 }

@@ -61,6 +61,12 @@ import {
   sanitizeNarrative,
   sendToDevChannel,
 } from '../notification-classifier.js';
+import {
+  DQ_QUIET_NOTIFICATION_RULES,
+  DQ_HANDOFF_LOOKBACK_MINUTES,
+  DQ_SIBLING_WAIT_SECONDS,
+  dqQuietNotificationDecision,
+} from '../../human-handoff-alert.js';
 
 const LOG_PREVIEW_CHARS = 600;
 const RECOVERY_HISTORY_LIMIT = 50;
@@ -125,8 +131,83 @@ export async function findRecentNotification(ruleApplied, targetId, cooldownMinu
   }
 }
 
-export async function executeSendNotification(action, context) {
+/**
+ * 2026-10-23 — the reads behind dqQuietNotificationDecision. Each answer is
+ * true / false, or null when the read failed (the card then posts, as before).
+ *
+ *   dqHandoffRecent: a send_message on this contact that completed as a
+ *     disqualifier compliance_gate_handoff (STOP / WRONG_NUMBER) in the last
+ *     DQ_HANDOFF_LOOKBACK_MINUTES.
+ *   siblingSendOpen: a send_message on the SAME event that has not finished,
+ *     so its verdict (disqualifier or not) is still coming.
+ */
+export async function readDqHandoffState(action, client = supabase, nowMs = Date.now()) {
+  const out = { dqHandoffRecent: null, siblingSendOpen: null };
+  const contactId = action?.target_id;
+  if (!contactId) return out;
+  try {
+    const since = new Date(nowMs - DQ_HANDOFF_LOOKBACK_MINUTES * 60 * 1000).toISOString();
+    const { data, error } = await client
+      .from('agent_actions')
+      .select('id')
+      .eq('target_id', contactId)
+      .eq('action_type', 'send_message')
+      .eq('status', 'completed')
+      .eq('execution_result->>reason', 'compliance_gate_handoff')
+      .eq('execution_result->>is_disqualifier', 'true')
+      .gte('executed_at', since)
+      .limit(1);
+    if (error) throw new Error(error.message);
+    out.dqHandoffRecent = (data || []).length > 0;
+  } catch (err) {
+    console.warn(`[Notifications] DQ handoff read failed for ${contactId} (card posts): ${err.message}`);
+  }
+  if (out.dqHandoffRecent || action.event_id == null) {
+    if (action.event_id == null) out.siblingSendOpen = false;
+    return out;
+  }
+  try {
+    const { data, error } = await client
+      .from('agent_actions')
+      .select('id')
+      .eq('event_id', action.event_id)
+      .eq('target_id', contactId)
+      .eq('action_type', 'send_message')
+      .in('status', ['pending', 'approved', 'executing'])
+      .neq('id', action.id)
+      .limit(1);
+    if (error) throw new Error(error.message);
+    out.siblingSendOpen = (data || []).length > 0;
+  } catch (err) {
+    console.warn(`[Notifications] sibling send read failed for ${contactId} (card posts): ${err.message}`);
+  }
+  return out;
+}
+
+export async function executeSendNotification(action, context, deps = {}) {
   const params = action.action_payload || {};
+
+  // 2026-10-23 — a disengagement card for a lead who just texted STOP or
+  // "wrong number" asks nobody to do anything. The row stays (skipped, with
+  // the reason) as the record; nothing posts. See dqQuietNotificationDecision.
+  if (DQ_QUIET_NOTIFICATION_RULES.has(action.rule_applied)) {
+    const nowMs = deps.nowMs ?? Date.now();
+    const state = await readDqHandoffState(action, deps.client || supabase, nowMs);
+    const createdMs = Date.parse(action.created_at || '');
+    const decision = dqQuietNotificationDecision({
+      ...state,
+      ageMs: Number.isFinite(createdMs) ? nowMs - createdMs : null,
+    });
+    if (decision.verdict === 'skip') {
+      console.log(`[Notifications] ${action.rule_applied} for ${action.target_id} not posted: ${decision.reason}`);
+      return { action: 'dq_handoff_quiet', skipped: true, reason: decision.reason, rule_applied: action.rule_applied, target_id: action.target_id };
+    }
+    if (decision.verdict === 'defer') {
+      const retryAt = new Date(nowMs + DQ_SIBLING_WAIT_SECONDS * 1000).toISOString();
+      console.log(`[Notifications] ${action.rule_applied} for ${action.target_id} waits for the reply's verdict until ${retryAt}`);
+      return { deferred: true, reason: decision.reason, retry_at: retryAt };
+    }
+  }
 
   // 2026-05-11 — opt-in cooldown gate.
   const cooldownMinutes = Number(params.cooldown_minutes) || 0;
