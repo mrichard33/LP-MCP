@@ -24,6 +24,10 @@ export const FLAGS = Object.freeze({
   RULES_AI_DISAGREE: 'rules_ai_disagree',
   OCR_HEAVY: 'ocr_majority_pages',
   MARKET_NOT_ELIGIBLE: 'line_market_not_eligible',
+  // 2026-10-23: lines that name their market next to one that names none. The
+  // unnamed line would be spread over every market, including the ones already
+  // billed on their own line, so a person checks it (never auto-approved).
+  MIXED_LINE_MARKETS: 'some_lines_without_market',
   UNKNOWN_SUB_SOURCE: 'line_sub_source_unknown',
   // 2026-10-19 (security review): the invoice text is written by a third party.
   // A vendor only the MODEL found, or a revision that would replace an invoice
@@ -58,6 +62,12 @@ const LINE_MARKET_NAMES = [
   [/\b(?:orlando|lakeland)\b/i, 'ORL_MKT'], [/\b(?:boca\s+raton|miami|f(?:or)?t\.?\s+lauderdale)\b/i, 'FTLAU_MKT'],
   [/\bf(?:or)?t\.?\s+myers\b/i, 'FTMYR_MKT'], [/\bjacksonville\b/i, 'JAX_MKT'], [/\bsarasota\b/i, 'SAR_MKT'],
   [/\b(?:st\.?|saint)\s+pete(?:rsburg)?\b/i, 'STPET_MKT'],
+  // HomeBuddy bills by REGION, not branch (the user, 2026-10-23: Fort Lauderdale got
+  // $581 of a $1,950 "South East" line because the line was spread over every
+  // market's HomeBuddy leads). Matched only as a label between dashes or in
+  // parentheses ("- South East -", "(Central)"), never in prose.
+  [/(?:^|[-(]\s*)South\s*-?\s*East(?=\s*(?:[-)]|$))/, 'FTLAU_MKT'],
+  [/(?:^|[-(]\s*)Central(?=\s*(?:[-)]|$))/, 'ORL_MKT'],
 ];
 export function marketFromLineText(...texts) {
   const text = texts.filter(Boolean).join(' ');
@@ -209,6 +219,11 @@ export function computeFlags({
   if (possibleDuplicate) flags.add(FLAGS.POSSIBLE_DUPLICATE);
   if (confidence == null || Number(confidence) < minConfidence) flags.add(FLAGS.LOW_CONFIDENCE);
   if (disagreements.length) flags.add(FLAGS.RULES_AI_DISAGREE);
+  {
+    const lead = rows.filter((r) => !(r.eligible_markets || []).includes(ALL_OFFICES));
+    const pinned = lead.filter((r) => (r.eligible_markets || []).length).length;
+    if (pinned && pinned < lead.length) flags.add(FLAGS.MIXED_LINE_MARKETS);
+  }
   if (extraction && extraction.page_count > 0 && extraction.ocr_pages * 2 > extraction.page_count) flags.add(FLAGS.OCR_HEAVY);
   return [...flags];
 }
@@ -233,6 +248,7 @@ export const FLAG_LABELS = Object.freeze({
   [FLAGS.OCR_HEAVY]: 'More than half the pages were OCR\'d (scan quality)',
   [FLAGS.MARKET_NOT_ELIGIBLE]: 'A line names a market this vendor is not eligible for',
   [FLAGS.UNKNOWN_SUB_SOURCE]: 'A line names a sub-source this vendor does not have',
+  [FLAGS.MIXED_LINE_MARKETS]: 'Some lines name a market and some do not: the unnamed ones would be spread over every market (Edit to pick theirs)',
   [FLAGS.VENDOR_FROM_MODEL]: 'Vendor was picked by the AI only (the sender and name did not match one on file)',
   [FLAGS.REPLACES_APPROVED]: 'Replaces an invoice with the same number that was already approved',
   [FLAGS.UNVERIFIED_SOURCE]: 'Arrived before the intake password was set, so it could not be checked (never auto-approved)',
