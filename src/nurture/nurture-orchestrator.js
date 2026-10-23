@@ -458,7 +458,7 @@ export async function runNurtureGeneration(request) {
         ...prompt,
         system_prompt: prompt.system_prompt +
           `\n\nIMPORTANT: A previous attempt failed these safety checks: ${safety.failures.join(', ')}. Details: ${safety.details.join('; ')}. You MUST fix all of them in this attempt. These are non-negotiable compliance and trust requirements.` +
-          (safety.f0Failures?.length ? `\n\n${f0RetryNote(safety.f0Failures, { position: request.sequence_position, formula: f0CheckFormula(f0, request), voice: f0?.vars?.email_voice || 'rep' })}` : ''),
+          (safety.f0Failures?.length ? `\n\n${f0RetryNote(safety.f0Failures, { position: request.sequence_position, formula: f0CheckFormula(f0, request), voice: f0VoiceFor(f0, request) })}` : ''),
       };
       genResult = await generateNurtureContent(constrainedPrompt, context);
       if (isF0) genResult = { ...genResult, output: f0Output(genResult.output, f0, request) };
@@ -592,7 +592,9 @@ function runOutputChecks(output, prompt, context, f0, request) {
         firstName: ((fourStep || email) ? (f0.vars?.first_name || null) : (context?.lead?.first_name || null)),
         followupText: f0.vars?.followup_text_line ? f0.facts?.followup_text || null : null,
         earlierMessages: f0.earlierMessages || [],
-        ...(email ? { subject: output?.subject || '', preheader: output?.preheader || '', ps: output?.ps_text || '', voice: f0.vars?.email_voice || 'rep', callWith: f0.vars?.call_with || null } : {}),
+        ...(email ? { subject: output?.subject || '', preheader: output?.preheader || '', ps: output?.ps_text || '' } : {}),
+        voice: f0VoiceFor(f0, request),
+        callWith: f0.vars?.call_with || null,
       });
   if (!f0Failures.length) return safety;
   return {
@@ -601,6 +603,14 @@ function runOutputChecks(output, prompt, context, f0, request) {
     details: [...safety.details, ...f0Failures.map(f => `F0:${f}`)],
     f0Failures,
   };
+}
+
+/**
+ * The voice an F.0 turn is checked in: the email's (F0_EMAIL_VOICE), else the
+ * Four-Step text's (F0_TEXT_VOICE, the user 2026-10-23); 'rep' when unset.
+ */
+function f0VoiceFor(f0, request) {
+  return (isF0EmailRequest(request) ? f0?.vars?.email_voice : f0?.vars?.text_voice) || 'rep';
 }
 
 /** The checkF0Copy formula for an F.0 turn: the email, else the text formula. */

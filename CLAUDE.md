@@ -913,6 +913,15 @@ Seven rulings. Each change is behind its own flag in `src/mode-registry.js`; the
   `scripts/build-f0-four-step-seed.mjs`), seeded INACTIVE; `nurture-prompt-selector.js` reads version 2 only in four_step
   and version 1 otherwise (`f0FormulaAllows`). Go-live: activate the v2 rows (the UPDATE in the seed's header), then flip
   the mode. `siro_lead_presentation { preview_f0_position, formula: 'four_step' }` previews them while inactive.
+  **The texts are the Reece Team's too (the user, 2026-10-23; `F0_TEXT_VOICE` team (default) | rep).** The email was
+  the team's and the texts John's ("If I could …", "- John"), so one conversation came from two senders and the bot read
+  as John while John texted the lead himself. Team = version-3 rows (`F.0-P[1-5]-<variant>-V3`, variant_label
+  `four-step-team`, `sql/seeds/2026-10-23_f0_v2_four_step_team_voice.sql`, seeded INACTIVE): "we", never "I"; the call
+  is with `{{siro.call_with}}` (the follower first, else the custom value, else "our team"); position 5 signs
+  " - Reece Team". `f0FormulaAllows`: four_step + team reads version 3, rep version 2, v1 neither. `checkF0Copy`
+  formula 'four_step' voice 'team' fails `first_person`, `signed_as_person`, `signature_in_body`, `call_names_other`
+  and, at position 5, `missing_signature`. Go-live: activate the V3 rows (the UPDATE in the seed's header) with the
+  `F0_FORMULA_MODE=four_step` flip. Rollback: `F0_TEXT_VOICE=rep`.
 - **7. No sensitive detail from Siro in any text.** `dropSensitiveDetail` (`src/siro/text-guards.js`, re-exported by
   presentation-facts.js) drops the clause about a death or loss, an illness or the hospital, divorce, a lost job, debt or
   "can't afford", or age, at render time in every bot-facing PRESENTATION line and in `<visit_facts>` (the GHL demo note,
@@ -971,7 +980,7 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   voice 'team' fails `first_person`, `signed_as_person`, `signature_in_body`, `call_names_other`.
   `F0_EMAIL_VOICE` team (default) | rep: rep reads V1 (left active for this one-variable rollback) and its checks; a
   rollback also puts the template's signature line back to `{{custom_values.rehash_rep_name}}`. GHL step 0f From Name =
-  Reece Team. The five texts keep their voice.
+  Reece Team. The Four-Step texts are the Reece Team's too since 2026-10-23 (`F0_TEXT_VOICE`, ruling 6 above).
 - **`F0_EMAIL_MODE` off|shadow|live, default shadow, decides the email ALONE** (the user, 2026-10-21: the email and the
   texts go live independently): `F0_V2_MODE=off` and the global `NURTURE_SHADOW_MODE` still stop it, but the `F.0`
   entry in `NURTURE_SHADOW_WORKFLOWS` governs the texts only. Shadow: drafts + an email card in #contact-rehash (all

@@ -156,6 +156,13 @@ contact as for a text.
 6. (2026-10-22) Run `sql/seeds/2026-10-22_f0_v2_four_step_varied_close.sql` after the
    same deploy: the texts word their call ask differently each time and never repeat
    an earlier close ("if I could … would you" is the idea, not the script).
+7. (2026-10-23) Run `sql/seeds/2026-10-23_f0_v2_four_step_team_voice.sql` after the
+   deploy that reads `F0_TEXT_VOICE` (default `team`). It adds the 35 Four-Step texts
+   in the Reece Team voice ("we", never "I"; the call is with the rehash rep; the
+   last text signs " - Reece Team"), seeded INACTIVE. When the texts go live, run the
+   UPDATE in that seed's header (it activates the version-3 rows) together with
+   `F0_FORMULA_MODE=four_step`. `F0_TEXT_VOICE=rep` puts back the texts written as the
+   rehash rep (version 2).
 
 ## Testing on a test contact (the user, 2026-10-21)
 
