@@ -1514,7 +1514,10 @@ are retired: nobody types a cost into LP again, and no code reads `mcost_cents` 
 Working / Gross $ for COMMISSIONS come from report 133 (`mkt_sales_dollars`, D8; never change it for the view). **The view's
 dollars are by LEAD-CREATED date (2026-10-23, migration `20261023120000`):** Gross = `SUM(lp_jobs.job_value)` on leads created
 in the period, the way LP 136 counts (133 is contract-dated and a day late: ChatBot read $119,724 vs LP's $150,705); Net /
-Working / Lost from each job's newest 133 bucket, not yet in a snapshot = Working. The period is the Eastern date, which is
+Working / Lost from each job's LIVE lp_jobs status + its RTP milestone, LP 136's own split (lost = Cancelled / Cancelled By
+Mgt / Credit Decline / Dead Deal, net = an RTP or paid in full, working = the rest; a same-value copy job on one prospect
+counts once; `20261023200000`): the daily 133 file is month-to-date, so an older job kept a stale bucket (HomeBuddy
+September read Net $0 against LP's $36,727). The period is the Eastern date, which is
 the stored `created_at_lp` read as UTC (it already holds LP's wall clock), never `AT TIME ZONE 'America/New_York'`.
 `cc_issued` = issued leads a LightFire agent set (the dashboard's call-center spread). Tie-out:
 `node scripts/tieout-lead-cost-lp136.js`. The allocator is ONE pure module,
