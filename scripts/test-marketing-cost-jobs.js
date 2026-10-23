@@ -311,3 +311,38 @@ test('feed sync: a placed held day keeps its offices when the feed re-pulls a ne
   assert.deepEqual(row.eligible_markets, []);
   assert.ok(row.flags.includes('auto_assigned'));
 });
+
+// 2026-10-23: Lead Cost dollars by lead-created date (migration 20261023120000).
+import { readFileSync } from 'node:fs';
+import { compareToLp136, LP136 } from './tieout-lead-cost-lp136.js';
+
+test('lead-cohort dollars migration: keeps every old column, adds cc_issued last, no 133-snapshot dollars', () => {
+  const sql = readFileSync(new URL('../supabase/migrations/20261023120000_lead_cohort_sales_dollars.sql', import.meta.url), 'utf8');
+  const view = sql.slice(sql.indexOf('CREATE OR REPLACE VIEW v_market_subsource_cost'));
+  const select = view.slice(view.lastIndexOf('\nSELECT k.grain'));
+  const cols = ['grain', 'period_start', 'market', 'lp_sub_source', 'raw', 'set_count', 'issued', 'sat', 'sold', 'gross', 'working', 'net', 'lost',
+    'invoice_cost', 'calculated_cost', 'total_cost', 'cost_per_issued', 'nsli', 'mkt_pct', 'has_provisional', 'as_of_snapshot', 'recommended_market', 'recommendation_reason', 'cc_issued'];
+  let at = -1;
+  for (const c of cols) {
+    const i = select.search(new RegExp(`\\b${c}\\b`));
+    assert.ok(i >= 0, `column ${c} missing`);
+    assert.ok(i > at, `column ${c} out of order (CREATE OR REPLACE VIEW only appends)`);
+    at = i;
+  }
+  assert.doesNotMatch(view, /mkt_sales_dollars\s*\(/, 'dollars must not come from the contract-dated 133 snapshot');
+  assert.match(view, /AT TIME ZONE 'UTC'/, 'the Eastern date is the stored wall clock read as UTC');
+  assert.doesNotMatch(view, /America\/New_York/, 'created_at_lp is already Eastern wall clock');
+});
+
+test('LP 136 tie-out: exact match passes, a $2 gap fails, known gaps are listed not judged', () => {
+  const ours = Object.fromEntries(Object.entries(LP136).map(([k, v]) => [k, { gross: v, jobs: 1 }]));
+  ours['Reece ChatBot'] = { gross: 119724, jobs: 4 };
+  ours.Modernize = { gross: LP136.Modernize + 0.5, jobs: 1 };
+  const lines = compareToLp136(ours);
+  assert.equal(lines.find((l) => l.source === 'Reece ChatBot').ok, false);
+  assert.equal(lines.find((l) => l.source === 'Reece ChatBot').off, -30981);
+  assert.equal(lines.find((l) => l.source === 'Modernize').ok, true);
+  const canvass = lines.find((l) => l.source === 'Canvass');
+  assert.equal(canvass.ok, null);
+  assert.match(canvass.note, /130 vs 131/);
+});
