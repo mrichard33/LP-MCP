@@ -26,7 +26,7 @@ import { POST_DEMO_REBUTTAL_RX, UNPROMISED_FOLLOW_UP_RX } from '../agentic/nepq-
 import { enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { hasSensitiveDetail } from './text-guards.js';
 import { copiesSiroDraft, repQuoteRx } from './presentation-guard.js';
-import { groundingSources, FOUR_STEP_SLOTS, CONDITIONAL_OFFER_RX, closeRepeats } from './f0-four-step.js';
+import { groundingSources, FOUR_STEP_SLOTS, CONDITIONAL_OFFER_RX, closeRepeats, closeGivesReason } from './f0-four-step.js';
 import { findExclamations } from '../agentic/discovery-discipline.js';
 import { F0_EMAIL_SUBJECT_MAX, F0_EMAIL_PREHEADER_MAX, F0_EMAIL_BODY_WORDS, F0_TEAM_SIGNATURE, F0_TEAM_CALL_FALLBACK } from './f0-email.js';
 
@@ -34,7 +34,11 @@ export const F0_SMS_MAX = 300;
 // 2026-10-20 (the first Four-Step previews): name + four parts + the call
 // question ran 301-330 characters on 3 of 10 leads with nothing to cut. The
 // prompt still asks for 300; the check allows two full SMS segments.
-export const F0_FOUR_STEP_SMS_MAX = 320;
+// 2026-10-23 (the user): "a text of around 300 characters should not fail to
+// send." Mark Test's third text ran 324, failed twice and ended the sequence.
+// The prompt still asks for 300 (F0_SMS_MAX, the re-write note); only a text
+// past three SMS segments fails.
+export const F0_FOUR_STEP_SMS_MAX = 480;
 // The affirm slot is a short stock phrase ("that's fair with everything going
 // on") the model often folds into the hesitation ("… makes sense"): either
 // one word of the slot or an affirm phrase in the text counts.
@@ -56,6 +60,7 @@ const EMOJI_RX = /\p{Extended_Pictographic}/u;
 // in 1972), never writes the template's footer, an address or an unsubscribe
 // line, and never says "your rep".
 const DEAL_RX = /\bdeals?\b/i;
+const TEAM_DEAL_REASON_RX = /\b(?:a|the)\s+(?:better|best)\s+deal\b/gi;
 const FOUNDER_RX = /\bfound(?:er|ed|ing)\b/i;
 const FOOTER_RX = /\bunsubscribe\b|\bopt[\s-]?out\b|\bprotecting\s+families\s+since\b|©|\bcopyright\b|\ball\s+rights\s+reserved\b|\b\d{2,6}\s+(?:[A-Z][a-z]+\s+){1,3}(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Way|Ct|Court|Hwy|Highway|Pkwy|Parkway)\b/;
 const YOUR_REP_RX = /\byour\s+(?:sales\s+)?(?:rep|representative|consultant)\b/i;
@@ -121,13 +126,16 @@ function startsWithName(body, firstName) {
 }
 
 /** The Four-Step checks (formula 'four_step'). Pure. */
-function fourStepFailures(body, { facts, position, repFirstName, slots, firstName }) {
+function fourStepFailures(body, { facts, position, repFirstName, slots, firstName, voice = 'rep' }) {
   const fail = [];
   if (!startsWithName(body, firstName)) fail.push('first_name_not_first');
   if (position < CLOSE_POSITION) {
     // 2026-10-22 (the user): "if I could, would you" is the strategy, not the
     // words. Any conditional offer to make it work better counts.
     if (!CONDITIONAL_OFFER_RX.test(body)) fail.push('no_conditional_offer');
+    // 2026-10-23 (the user): the Reece Team close says WHY: a budget fit or a
+    // better price (closeGivesReason). The rep voice is the rollback, unchanged.
+    if (voice === 'team' && !closeGivesReason(body)) fail.push('no_call_reason');
     const last = (body.match(/[^.!?]*\?\s*$/) || [''])[0];
     if (!last || !repFirstName || !new RegExp(`\\b${String(repFirstName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(last) || !/\bcall\b/i.test(last)) fail.push('no_call_question');
   }
@@ -168,7 +176,7 @@ const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').tr
  * subject, preheader and P.S. are part of the email, so the content checks
  * read all four parts; the question and the call invite are the body's. Pure.
  */
-function emailFailures(body, { subject = '', preheader = '', ps = '', salesRepFirstName = null } = {}) {
+function emailFailures(body, { subject = '', preheader = '', ps = '', salesRepFirstName = null, teamVoiceEmail = false } = {}) {
   const fail = [];
   const all = [subject, preheader, body, ps].filter(Boolean).join('\n');
   if (!String(subject).trim() || String(subject).length > F0_EMAIL_SUBJECT_MAX) fail.push('subject_length');
@@ -180,7 +188,9 @@ function emailFailures(body, { subject = '', preheader = '', ps = '', salesRepFi
   if (words < F0_EMAIL_BODY_WORDS.min || words > F0_EMAIL_BODY_WORDS.max) fail.push('body_length');
   if ((all.match(/\?/g) || []).length !== 1) fail.push('question_count');
   if (findExclamations(all)) fail.push('exclamation');
-  if (DEAL_RX.test(all)) fail.push('deal_word');
+  // 2026-10-23 (the user): "You can use the word 'deal.' That's fine." The
+  // Reece Team email may name a better deal; the rep-voice rollback keeps the ban.
+  if (DEAL_RX.test(all) && !teamVoiceEmail) fail.push('deal_word');
   if (FOUNDER_RX.test(all)) fail.push('founder');
   if (FOOTER_RX.test(all)) fail.push('footer_text');
   if (YOUR_REP_RX.test(all)) fail.push('your_rep');
@@ -307,7 +317,11 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
   // slot 4 hints at a better deal at every position that asks (1-4). The
   // email allows no offer word at all, the P.S. included (Mark, 2026-10-21).
   const hintAllowed = email ? false : fourStep ? position < CLOSE_POSITION : position === HINT_POSITION;
-  const offerText = email ? [subject, preheader, body, ps].filter(Boolean).join('\n') : body;
+  let offerText = email ? [subject, preheader, body, ps].filter(Boolean).join('\n') : body;
+  // 2026-10-23 (the user): "a better deal" is the reason for the call on the
+  // Reece Team copy ("deal" is fine). Only those words are taken out before
+  // the offer test: an amount, a percent or a discount in the sentence still fails.
+  if (voice === 'team') offerText = offerText.replace(TEAM_DEAL_REASON_RX, '');
   if (findOfferTalk(offerText, { hintUsed: !hintAllowed }).length) fail.push('offer_talk');
   if (POST_DEMO_REBUTTAL_RX.test(body)) fail.push('rebuttal');
   if (UNPROMISED_FOLLOW_UP_RX.test(body)) fail.push('unpromised_follow_up');
@@ -336,16 +350,16 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
   if ((email || fourStep) && closeRepeats(body, earlierMessages)) fail.push('close_repeated');
 
   if (email) {
-    fail.push(...emailFailures(body, { subject, preheader, ps, salesRepFirstName: facts?.rep_first_name || null }));
+    fail.push(...emailFailures(body, { subject, preheader, ps, salesRepFirstName: facts?.rep_first_name || null, teamVoiceEmail: voice === 'team' }));
     // The Four-Step close and slots, as at position 1: the first name first,
     // a conditional offer and the call invite naming the rehash rep, both slots
     // required and grounded in the visit. A recording is required (no facts =
     // no email), so the grounding always runs.
     const team = voice === 'team';
-    fail.push(...fourStepFailures(body, { facts, position: 1, repFirstName: team ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName }));
+    fail.push(...fourStepFailures(body, { facts, position: 1, repFirstName: team ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName, voice }));
     if (!facts) fail.push('no_visit_facts');
   } else if (fourStep) {
-    fail.push(...fourStepFailures(body, { facts, position, repFirstName: teamText ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName }));
+    fail.push(...fourStepFailures(body, { facts, position, repFirstName: teamText ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName, voice: teamText ? 'team' : 'rep' }));
   } else if (facts && position <= 3) {
     const want = personalizationTokens(facts);
     const have = new Set(tokens(body));
@@ -360,7 +374,7 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
   const teamEmail = email && voice === 'team';
   const teamText = formula === 'four_step' && voice === 'team';
   const why = {
-    too_long: `Keep it under ${formula === 'four_step' ? F0_FOUR_STEP_SMS_MAX : F0_SMS_MAX} characters.`,
+    too_long: `Keep it under ${F0_SMS_MAX} characters.`,
     question_count: email ? 'Ask exactly one question in the whole email (subject, preheader, body and P.S.): the call invite at the end of the body.'
       : position >= CLOSE_POSITION ? 'Ask no question.' : 'Ask exactly one question.',
     money: 'No price, dollar figure or discount.',
@@ -389,6 +403,7 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     four_step_output: 'Answer as JSON: {"slots": {"hesitation", "affirm", "reframe", "if_i_could"}, "text"}.',
     first_name_not_first: 'Start the text with their first name.',
     no_conditional_offer: 'Before the call question, offer to make it work better for them, in your own words (for example "if there\'s a way to …", "we may be able to …"). It does not have to say "If I could".',
+    no_call_reason: 'Say WHY the call is worth it, right before or inside the call question: we may be able to fit this into their budget, or get them a better price (never "deal", never a number).',
     close_repeated: 'The close repeats one we already sent this lead. Word the call question a new way, and do not use "if I could" or "if we could" again.',
     no_call_question: teamEmail ? 'End the email on one question asking for a quick call with <CALL WITH>, in your own words, and nothing after it.'
       : teamText ? 'End with one question asking for a quick call with <CALL WITH>, in your own words, and nothing after it.'

@@ -39,10 +39,10 @@ const SLOTS = {
   hesitation: 'you want your grandson to look over the numbers',
   affirm: 'that makes sense',
   reframe: 'getting those rotting windows replaced before the family visits for Christmas',
-  if_i_could: 'make the numbers work better for you both',
+  if_i_could: 'fit this into your budget at a better price',
 };
 const STEM = 'James, it makes sense that you want your grandson to look over the numbers first. Getting those rotting windows replaced before the family visits for Christmas still matters.';
-const GOOD = `${STEM} If we could make the numbers work better for you both, would you be open to a quick call with John?`;
+const GOOD = `${STEM} If we could fit this into your budget at a better price, would you be open to a quick call with John?`;
 const opts = (extra = {}) => ({ facts: FACTS, position: 1, repFirstName: 'John', formula: 'four_step', voice: 'team', callWith: 'John', slots: SLOTS, firstName: 'James', ...extra });
 
 test('F0_TEXT_VOICE: team by default, rep is the rollback, a typo is team', () => {
@@ -54,10 +54,10 @@ test('F0_TEXT_VOICE: team by default, rep is the rollback, a typo is team', () =
 
 test('positions 1-4: the Reece Team text passes; "I", a sign-off or another name fails', () => {
   assert.deepEqual(checkF0Copy(GOOD, opts()), []);
-  assert.deepEqual(checkF0Copy(`${STEM} We may be able to make the numbers work better for you both. Would a quick call with John help?`, opts({ position: 2 })), []);
+  assert.deepEqual(checkF0Copy(`${STEM} We may be able to fit this into your budget at a better price. Would a quick call with John help?`, opts({ position: 2 })), []);
   // Written as one person.
   assert.ok(checkF0Copy(GOOD.replace('If we could', 'If I could'), opts()).includes('first_person'));
-  assert.ok(checkF0Copy(`${STEM} My hope is to make the numbers work better for you both. Would a quick call with John help?`, opts()).includes('first_person'));
+  assert.ok(checkF0Copy(`${STEM} My hope is to fit this into your budget at a better price. Would a quick call with John help?`, opts()).includes('first_person'));
   // Anything after the call question.
   assert.ok(checkF0Copy(`${GOOD} Thanks, John`, opts()).includes('signed_as_person'));
   assert.ok(checkF0Copy(`${GOOD} Thanks, the Reece Team`, opts()).includes('signature_in_body'));
@@ -184,4 +184,16 @@ test('the V3 seed: 35 inactive rows, CALL WITH, and every example in the team vo
     assert.doesNotMatch(g, /- John$/, g);
   }
   assert.match(sql, /BAD, written as one person and signed by them/);
+});
+
+// 2026-10-23 (the user): "We keep saying 'Would a quick call with John make
+// sense?' but we don't explain why." The Reece Team close names the reason.
+test('no_call_reason: a team close with no budget / better price reason fails; the rep voice is unchanged', () => {
+  const bare = `${STEM} There may be a way to make it work better for you. Would a quick call with John help?`;
+  assert.ok(checkF0Copy(bare, opts({ slots: { ...SLOTS, if_i_could: null } })).includes('no_call_reason'));
+  const inQuestion = `${STEM} Would a call with John make sense if we could fit this into your budget?`;
+  assert.ok(!checkF0Copy(inQuestion, opts({ slots: { ...SLOTS, if_i_could: null } })).includes('no_call_reason'));
+  const better = `${STEM} We may be able to get you a better price. Could a quick call with John help?`;
+  assert.ok(!checkF0Copy(better, opts({ slots: { ...SLOTS, if_i_could: null } })).includes('no_call_reason'));
+  assert.ok(!checkF0Copy(bare, { ...opts({ slots: { ...SLOTS, if_i_could: null } }), voice: 'rep', repFirstName: 'John' }).includes('no_call_reason'));
 });

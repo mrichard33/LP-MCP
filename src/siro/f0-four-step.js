@@ -177,6 +177,20 @@ export const CONDITIONAL_OFFER_RX = /\bif\b[^.?!]{0,120}?\b(?:could|can|were\s+a
 const IF_COULD_RX = /\bif\s+(?:i|we)\s+could\b/i;
 const stripHtml = (s) => String(s || '').replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ');
 
+// 2026-10-23 (the user): "We keep saying 'Would a quick call with John make
+// sense?' but we don't explain why." The Reece Team close names the reason for
+// the call, a budget fit or a better price, in the offer or the question: "We
+// may be able to fit this into your budget, and maybe get you a better deal.
+// Would a quick call with John make sense?" "Deal" is fine (the user, the same
+// day): checkF0Copy lets "a better deal" through the offer test on team copy.
+export const F0_CALL_REASON_RX = /\bbudget\b|\bbetter\s+(?:price|deal)\b|\bbeat\s+what\s+you(?:'|’)?re\s+(?:being\s+)?quoted\b|\bget\s+(?:that|the)\s+(?:number|price)\s+down\b/i;
+
+/** The close (its last two sentences) names why the call is worth it. Pure. */
+export function closeGivesReason(text) {
+  const sentences = stripHtml(text).replace(/\s+/g, ' ').match(/[^.!?]+[.!?]*/g) || [];
+  return F0_CALL_REASON_RX.test(sentences.slice(-2).join(' '));
+}
+
 /** The last question sentence of a message, or ''. Pure. */
 export function closingQuestion(text) {
   const qs = stripHtml(text).match(/[^.!?\n]*\?/g) || [];

@@ -191,7 +191,7 @@ test('the re-write note names each email failure', () => {
   assert.match(note, /whole email/);
   assert.match(note, /"subject", "preheader", "body", "ps"/);
   // The texts' notes are unchanged in meaning, the Four-Step cap now named right.
-  assert.match(f0RetryNote(['too_long'], { position: 1, formula: 'four_step' }), /320/);
+  assert.match(f0RetryNote(['too_long'], { position: 1, formula: 'four_step' }), /300/);
   assert.match(f0RetryNote(['too_long'], { position: 1 }), /300/);
 });
 

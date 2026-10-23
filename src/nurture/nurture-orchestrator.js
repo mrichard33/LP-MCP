@@ -159,6 +159,7 @@ import { siroConfig, siroModes, siroRecordingUrl } from '../siro/config.js';
 import { postToSlack } from '../slack.js';
 import { isF0EmailRequest, allowsPositionZero, asksPositionZero, f0EmailMode, f0EmailShadow, emailGate, f0EmailOutput, f0InternalPosition, emailFallbackTag } from '../siro/f0-email.js';
 import { testLinkFor } from '../siro/f0-test-link.js';
+import { wantsTextFallback, f0FallbackText } from '../siro/f0-text-fallback.js';
 import { parseWorkflowIds, activeWorkflowDecision } from './workflow-guard.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
@@ -408,6 +409,7 @@ async function runNurtureGenerationInner(request) {
       await safeClearDrafts(request.contact_id, 'no_prompt_match');
       await alertGroupMe(buildErrorCard(request, context, generation_id, 'no_prompt_match',
         `No prompt matched workflow_code=${request.workflow_code} channel=${request.channel} (no active FALLBACK either).`));
+      if (await sendF0TextFallback({ request, f0, context, generation_id, reason: 'no_prompt_match' })) return finishResponse(generation_id, true, null, startedAt);
       return finishResponse(generation_id, false, 'no_prompt_match', startedAt);
     }
   }
@@ -456,6 +458,7 @@ async function runNurtureGenerationInner(request) {
     const genRetries = err.generationRetries || 1;
     await updateStatus(generation_id, 'failed_generation', err.message.slice(0, 200), genRetries);
     await safeClearDrafts(request.contact_id, 'generation_error');
+    if (await sendF0TextFallback({ request, f0, context, generation_id, reason: 'generation_error' })) return finishResponse(generation_id, true, null, startedAt);
     return finishResponse(generation_id, false, 'generation_error', startedAt);
   }
 
@@ -507,12 +510,14 @@ async function runNurtureGenerationInner(request) {
           safetyDetails: safety.details,
           subject: output && output.subject,
         }));
+        if (await sendF0TextFallback({ request, f0, context, generation_id, reason: 'safety_failed_after_retry', failedText: output?.sms_body })) return finishResponse(generation_id, true, null, startedAt);
         return finishResponse(generation_id, false, 'safety_failed_after_retry', startedAt);
       }
     } catch (retryErr) {
       const genRetries = retryErr.generationRetries || 1;
       await updateStatus(generation_id, 'failed_generation', `retry_error:${retryErr.message.slice(0, 200)}`, retryCount + genRetries);
       await safeClearDrafts(request.contact_id, 'retry_error');
+      if (await sendF0TextFallback({ request, f0, context, generation_id, reason: 'retry_error' })) return finishResponse(generation_id, true, null, startedAt);
       return finishResponse(generation_id, false, 'retry_error', startedAt);
     }
   }
@@ -1254,6 +1259,49 @@ async function alertGroupMe(message) {
     await sendGroupMeMessage(message);
   } catch (err) {
     console.warn(`[NurtureOrch] GroupMe alert failed: ${err.message}`);
+  }
+}
+
+/**
+ * The F.0 text fallback (the user, 2026-10-23; src/siro/f0-text-fallback.js).
+ * A Four-Step text that ended with no AI text for a reason that is not a rule
+ * against texting gets the generic Reece Team text, written back like an AI
+ * text with the position's normal wait, so the workflow's "Suppressed (Skip)"
+ * branch (which goes to END) is never taken for it. Shadow turns write drafts
+ * only, as an AI text would. Returns true when the text was written. Never
+ * throws: a failed fallback leaves the suppression as it was.
+ */
+async function sendF0TextFallback({ request, f0, context, generation_id, reason, failedText = null }) {
+  if (request.workflow_code !== F0_WORKFLOW || isF0EmailRequest(request) || !wantsTextFallback(reason)) return false;
+  try {
+    const position = Number(request.sequence_position) || 1;
+    const text = f0FallbackText({
+      position,
+      firstName: context?.lead?.first_name ?? f0?.vars?.first_name ?? '',
+      callWith: f0?.vars?.call_with || '',
+    });
+    const output = {
+      sms_body: text,
+      next_wait_hours: FOUR_STEP_WAIT_HOURS[position] ?? 0,
+      extra_meta: { siro_recording_id: f0?.recordingId || null, position, ghl_position: request.ghl_position ?? null, fallback_text: true, fallback_reason: reason },
+    };
+    if (isShadowTurn({ workflowCode: request.workflow_code, isF0Email: false, testLink: f0?.testLink })) {
+      await writeDraftsOnly(request.contact_id, output, generation_id, 1.0);
+    } else {
+      await writeBackToGHL(request.contact_id, output, generation_id, 1.0);
+    }
+    await markGeneratedReady(generation_id, output, 0, [], null, {
+      ...(request.row_meta || {}),
+      fallback_text: true,
+      fallback_reason: reason,
+      ...(failedText ? { failed_ai_text: String(failedText).slice(0, 600) } : {}),
+      ...(f0?.testLink ? { test_link: { lp_lead_id: f0.testLink.lpLeadId } } : {}),
+    });
+    console.log(`[F0] text fallback sent pos=${position} reason=${reason} contact=${request.contact_id} ${generation_id}`);
+    return true;
+  } catch (err) {
+    console.warn(`[F0] text fallback failed ${generation_id}: ${err.message}`);
+    return false;
   }
 }
 

@@ -951,6 +951,16 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   the day after the demo's ET date, 2h steps, the last one shorter); past it `emailGate` suppresses `no_recording`,
   clears the drafts, and the workflow sends its static email (below). The model is never called without a recording,
   `force_send` included. Every other suppression is as for the texts.
+- **A failed text still sends, and every call invite says why (the user, 2026-10-23).** Mark Test's third Four-Step
+  text ran 324 characters (cap 320), failed twice and was suppressed; the workflow's "Suppressed (Skip)" branch goes to
+  END, so one failed text ended the sequence and the completion event routed the contact into O.0. Now the Four-Step
+  cap is 480 (`F0_FOUR_STEP_SMS_MAX`; the prompt and the re-write note still ask for 300), and a text that ends with no
+  AI text for a non-stop reason (`F0_TEXT_FALLBACK_REASONS`: a failed copy check, generation or prompt) gets the generic
+  Reece Team text (`src/siro/f0-text-fallback.js`, `sendF0TextFallback` in the orchestrator), written back like an AI
+  text with the position's wait (`generated_meta.fallback_text`). A real stop still suppresses and ends. The Reece Team
+  close names the reason for the call, a budget fit or a better deal (`closeGivesReason`, checkF0Copy
+  `no_call_reason`); "deal" is fine on team copy ("a better deal" passes the offer test; the rep-voice rollback keeps
+  the ban). Tests: `scripts/test-f0-text-fallback.js`.
 - **Every unsold demo gets an email (the user, 2026-10-23; replaces "a quiet exit, never a fixed email" for this one
   email, and Part 7's "no static messages" for it).** When the email ends with no AI email and no rule against one
   (`emailFallbackTag`, `F0_EMAIL_FALLBACK_REASONS` in `f0-email.js`: no_recording, F.0 / the email off, the prompt
