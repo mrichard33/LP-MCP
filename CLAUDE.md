@@ -949,8 +949,23 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   route allows it (`coerceSeqPos({ allowZero })`; before, a 0 silently became the field value or 1).
 - **No recording, no email.** The `awaiting_siro` hold is reused with a cap of `F0_EMAIL_HOLD_CAP_ET` (default 08:30 ET
   the day after the demo's ET date, 2h steps, the last one shorter); past it `emailGate` suppresses `no_recording`,
-  clears the drafts and adds the tag `f0-no-recording` once, and the workflow sends its fixed fallback template. The
-  model is never called without a recording, `force_send` included. Every other suppression is as for the texts.
+  clears the drafts, and the workflow sends its static email (below). The model is never called without a recording,
+  `force_send` included. Every other suppression is as for the texts.
+- **Every unsold demo gets an email (the user, 2026-10-23; replaces "a quiet exit, never a fixed email" for this one
+  email, and Part 7's "no static messages" for it).** When the email ends with no AI email and no rule against one
+  (`emailFallbackTag`, `F0_EMAIL_FALLBACK_REASONS` in `f0-email.js`: no_recording, F.0 / the email off, the prompt
+  inactive, a failed generation, copy check or writeback, a failed context build), `runNurtureGeneration` adds the tag
+  `f0-email-fallback` (one place, a throw included) and the workflow sends the static Reece Team email
+  (`docs/f0-v2-static-emails.md`, a GHL template; LP-MCP never writes it). A real stop (sold, a newer lead, rebooked,
+  rehash ended, a team-note DQ, the two-no stop, a person texting, a recent reply, DNC / stop-bot, rehash_owned,
+  wrong_active_workflow) sends nothing. A failed TEXT is still skipped. **Two more emails between the texts, written
+  from the visit the same way (the user: "write personalized when the data is available and use the static as a
+  fallback")**: GHL positions 7 (day 4) and 8 (day 11) by email → internal 6 and 7 (`F0_FOLLOWUP_EMAIL_POSITIONS`,
+  `f0InternalPosition`; `isF0EmailRequest` covers 0, 6 and 7, `isF0FollowupEmail` the last two), prompt rows
+  `F.0-P6-email-V2` / `F.0-P7-email-V2` (`sql/seeds/2026-10-23_f0_v2_followup_emails.sql`, ACTIVE, built by the
+  four-step seed script from the evening email's rules), the same checks, the same fallback tag (static Email 3 / 4).
+  No approval step (the user, 2026-10-23): F.0 v2 goes live without the shadow week. Tests: `scripts/test-f0-email.js`,
+  `scripts/test-f0-followup-emails.js`.
 - **The email**: the model fills the four Four-Step slots from `<visit_facts>` (which, for the email, also carries
   `visited_by`, the sales rep who came out, and is built whatever `F0_FORMULA_MODE` says) and returns
   `{ subject, preheader, body, ps, slots }`; `f0EmailOutput` turns the plain body into escaped `<p>` paragraphs for
@@ -963,8 +978,8 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   subject ≤ 60, preheader ≤ 90 and not the first sentence, body 120–180 words; never money, offer talk or the word
   "deal" (not even the hint), an exclamation, "founder", "your rep", the sales rep named twice or following up, a
   footer / address / unsubscribe line, a sensitive detail, a quote of the rep or Siro's draft copied. The thank-you
-  opener is allowed. Signed "The Reece Team" by the template since 2026-10-23 (no signature in the body, V1 or V2). One re-write, then `suppressed_low_conf`: a quiet exit to
-  position 1, never a fixed email.
+  opener is allowed. Signed "The Reece Team" by the template since 2026-10-23 (no signature in the body, V1 or V2). One re-write, then `suppressed_low_conf`: the static email
+  goes instead (2026-10-23, above).
 - **The greeting name is cleaned, never the raw field (2026-10-22).** The live preview opened "Hi A," because GHL's
   first name was "a" (LP: "AJ / Anita") and any non-empty GHL name won. `greetingName` (`f0-context.js`): a couple's first
   person, a first word under two letters is no name (then LP's lead, then none), two or three typed capitals stay ("AJ");

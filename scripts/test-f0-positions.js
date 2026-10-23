@@ -20,6 +20,8 @@ test('the mapping: email 1 → 0, legacy 0 → 0, texts 2..6 → 1..5', () => {
   }
   assert.equal(f0GhlPosition(0), 1);
   assert.equal(f0GhlPosition(5), 6);
+  assert.equal(f0GhlPosition(6), 7);
+  assert.equal(f0GhlPosition(7), 8);
 });
 
 test('anything else for F.0 is unsupported_position', () => {
@@ -28,7 +30,10 @@ test('anything else for F.0 is unsupported_position', () => {
     { channel: 'sms', sequence_position: 0 },
     { channel: 'email', sequence_position: 2 },
     { channel: 'sms', sequence_position: 7 },
-    { channel: 'email', sequence_position: 7 },
+    // 2026-10-23: email 7 and 8 are the day-4 and day-11 emails
+    // (scripts/test-f0-followup-emails.js); 6 and 9 are not.
+    { channel: 'email', sequence_position: 6 },
+    { channel: 'email', sequence_position: 9 },
     { channel: 'email+sms', sequence_position: 1 },
     { channel: 'sms', sequence_position: '' },
     { channel: 'sms', sequence_position: 2.5 },

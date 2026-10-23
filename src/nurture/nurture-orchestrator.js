@@ -157,7 +157,7 @@ import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from 
 import { newestManualOutbound, lastInboundAt } from '../services/human-takeover-io.js';
 import { siroConfig, siroModes, siroRecordingUrl } from '../siro/config.js';
 import { postToSlack } from '../slack.js';
-import { isF0EmailRequest, allowsPositionZero, asksPositionZero, f0EmailMode, f0EmailShadow, emailGate, f0EmailOutput, f0InternalPosition } from '../siro/f0-email.js';
+import { isF0EmailRequest, allowsPositionZero, asksPositionZero, f0EmailMode, f0EmailShadow, emailGate, f0EmailOutput, f0InternalPosition, emailFallbackTag } from '../siro/f0-email.js';
 import { testLinkFor } from '../siro/f0-test-link.js';
 import { parseWorkflowIds, activeWorkflowDecision } from './workflow-guard.js';
 
@@ -194,7 +194,33 @@ export function isShadowTurn({ workflowCode, isF0Email = false, testLink = null 
 /**
  * Main entry — orchestrate one generation cycle.
  */
-export async function runNurtureGeneration(request) {
+export async function runNurtureGeneration(request, deps = {}) {
+  const inner = deps.inner || runNurtureGenerationInner;
+  const addTag = deps.addTag || addTagOnce;
+  // 2026-10-23 (the user): every unsold demo gets the post-demo email. When the
+  // F.0 email ends with no AI email and no rule against one (emailFallbackTag),
+  // the tag f0-email-fallback tells the workflow to send its static Reece Team
+  // email. One place for every exit, a throw included (the route still
+  // answers 200 with the error).
+  const isEmail = isF0EmailRequest(request);
+  const tagFallback = async (reason, generationId) => {
+    const tag = isEmail ? emailFallbackTag(reason) : null;
+    if (!tag) return;
+    console.log(`[F0] email fallback tag ${reason} ${generationId || '-'}`);
+    await addTag(request.contact_id, tag, null, generationId);
+  };
+  let result;
+  try {
+    result = await inner(request);
+  } catch (err) {
+    await tagFallback('generation_error', null);
+    throw err;
+  }
+  await tagFallback(result?.suppressed_reason, result?.generation_id);
+  return result;
+}
+
+async function runNurtureGenerationInner(request) {
   const generation_id = `gen_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   const startedAt = Date.now();
 
@@ -274,7 +300,7 @@ export async function runNurtureGeneration(request) {
     await stampSiroRecording(generation_id, f0.recordingId);
     let pd = request.force_send !== true ? postDemoInterrupt(f0.interruptInput) : null;
     // The email is never written without the recording, force_send included:
-    // past the cap the workflow sends its fixed fallback template instead.
+    // past the cap the workflow sends its static email instead (f0-email-fallback).
     if (isF0Email && (request.force_send !== true || !f0.facts)) pd = emailGate({ pd, facts: f0.facts });
     if (pd) {
       if (pd?.hold) {
@@ -292,9 +318,8 @@ export async function runNurtureGeneration(request) {
         console.log(JSON.stringify({ level: 'info', type: 'intentional_suppression', status: 'suppressed_interrupt', reason: pd.suppress, terminal: pd.terminal, workflow_code: request.workflow_code, sequence_position: request.sequence_position, ghl_contact_id: request.contact_id, generation_id }));
         await updateStatus(generation_id, 'suppressed_interrupt', pd.suppress);
         await safeClearDrafts(request.contact_id, `interrupt:${pd.suppress}`);
-        // no_recording: the tag tells the workflow to send its fallback
-        // template. Added once (a contact that already has it is left alone).
-        if (pd.tag) await addTagOnce(request.contact_id, pd.tag, context, generation_id);
+        // no_recording: runNurtureGeneration adds f0-email-fallback, so the
+        // workflow sends its static email.
         return finishResponse(generation_id, false, pd.suppress, startedAt);
       }
     }
@@ -704,7 +729,7 @@ export function buildF0ApprovalCard({ request, context, generationId, output, pr
   // email's gate is "AI Msg Send Ready" (the texts' is "AI SMS Send Ready").
   if (isF0EmailRequest(request)) {
     return [
-      `${test}✅ F.0 POST-DEMO EMAIL READY — please review (position 1, the evening of the demo)`,
+      `${test}✅ F.0 POST-DEMO EMAIL READY — please review (position ${request.ghl_position ?? 1}${Number(request.sequence_position) === 6 ? ', day 4' : Number(request.sequence_position) === 7 ? ', day 11' : ', the evening of the demo'})`,
       `${first}${phone ? ` · ${phone}` : ''} · ${prospectLabel(context?.lp?.prospect_id)}`,
       `Prompt: ${prompt?.prompt_code || 'unknown'}`,
       '',

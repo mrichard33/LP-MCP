@@ -18,7 +18,7 @@ import { loadF0Context, applyGreetingName } from './f0-context.js';
 import { postDemoInterrupt } from './f0-interrupts.js';
 import { checkF0Copy, f0RetryNote } from './f0-copy-checks.js';
 import { parseFourStepOutput, dropTrailingSignature, FOUR_STEP_WAIT_HOURS } from './f0-four-step.js';
-import { emailGate, f0EmailOutput, F0_EMAIL_POSITION } from './f0-email.js';
+import { emailGate, f0EmailOutput, F0_EMAIL_POSITION, F0_EMAIL_POSITIONS } from './f0-email.js';
 
 /**
  * @param {{formula?: 'v1'|'four_step', channel?: 'sms'|'email'}} [o]
@@ -29,7 +29,8 @@ import { emailGate, f0EmailOutput, F0_EMAIL_POSITION } from './f0-email.js';
  */
 export async function previewF0Generation(contactId, position, { deps = {}, formula = null, channel = 'sms' } = {}) {
   const email = channel === 'email';
-  const pos = email ? F0_EMAIL_POSITION : Math.min(5, Math.max(1, Number(position) || 1));
+  // 2026-10-23: internal 6 / 7 are the day-4 and day-11 emails.
+  const pos = email ? (F0_EMAIL_POSITIONS.includes(Number(position)) ? Number(position) : F0_EMAIL_POSITION) : Math.min(5, Math.max(1, Number(position) || 1));
   const fourStepPreview = formula === 'four_step';
   const request = { contact_id: contactId, workflow_code: 'F.0', sequence_position: pos, channel: email ? 'email' : 'sms', ...((fourStepPreview || email) ? { include_inactive: true } : {}) };
   const context = await (deps.buildLeadContext || buildLeadContext)(contactId, { skipCache: true, workflow_code: 'F.0' });
