@@ -9,6 +9,10 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 F.0 v2: every unsold demo gets an email (the user).
 
+- **The day-4 and day-11 emails pass their checks.** Their prompts now require
+  an offer sentence ("We may be able to …") before the call question and a
+  question opening that no earlier message used. Before, the day-11 preview
+  failed and would have gone out as the static email; both now pass first try.
 - **A dropped "?" no longer sends the static email.** When the model ends an
   F.0 email's call invite without its "?", it is put back before the checks
   (`closeQuestion`, `src/siro/f0-email.js`). A closing statement is left alone.
