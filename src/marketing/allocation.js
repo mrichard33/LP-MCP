@@ -14,6 +14,11 @@
  *   eligible_markets = {'REECE_HOLD'}       → hold (D4: never spread)
  *   never a market outside eligible_markets
  *
+ * The weight is LEADS CREATED per market (2026-10-23, the user: "if we split
+ * the bill by issued leads, a market that has not issued leads would not be
+ * responsible for any of the marketing cost"); the issuedByMarket / issued_basis
+ * names below are kept from when it was issued leads.
+ *
  * No markets picked (eligible_markets = '{}') means BY SOURCE (the user,
  * 2026-10-13: "we should be able to determine the markets based on the gross
  * issued leads for that source"). Every market where the line's sub-source
@@ -233,7 +238,7 @@ export const CALL_CENTER_KIND_LABEL = Object.freeze({
   canvass: 'canvass appointments it confirmed', demo: 'aged-lead demos it set', sales: 'sales on leads it set',
 });
 
-/** True when the expense names no markets, so its source's issued leads pick them. */
+/** True when the expense names no markets, so its source's leads created pick them. */
 export function splitsBySource(expense) {
   return !(expense?.eligible_markets || []).filter(Boolean).length;
 }
@@ -294,7 +299,7 @@ export function allocateExpense(expense, issuedLookup = () => ({})) {
       markets = marketsFromIssued(issuedByMarket);
       if (!markets.length) {
         markets = [HOLD_MARKET];
-        note = `no ${subs.join(' / ')} issued leads in ${slice.month.slice(0, 7)} yet; split by source once there are (re-run nightly)`;
+        note = `no ${subs.join(' / ')} leads created in ${slice.month.slice(0, 7)} yet; split by source once there are (re-run nightly)`;
       }
     }
     for (const row of allocateSlice({ amount: slice.amount, markets, issuedByMarket })) {

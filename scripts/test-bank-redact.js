@@ -112,7 +112,7 @@ function db(extra = {}) {
   return fakeSupabase({
     marketing_vendors: VENDORS, slack_market_slugs: [], marketing_invoice_documents: [], marketing_expenses: [], marketing_expense_allocations: [], marketing_invoice_skips: [],
     ...extra,
-  }, { rpc: { mkt_issued_counts: async () => [{ market: 'FTMYR_MKT', lp_sub_source: 'Call Center', issued: 10 }] } });
+  }, { rpc: { mkt_lead_counts: async () => [{ market: 'FTMYR_MKT', lp_sub_source: 'Call Center', raw: 10 }] } });
 }
 
 const AI = {

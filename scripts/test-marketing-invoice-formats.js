@@ -189,7 +189,7 @@ test('old .xls / .doc / .msg: unsupported, never a document, one note asking for
 });
 
 test('an n8n payload with only the HTML body part reaches the ledger with its facts', async () => {
-  const supabase = fakeSupabase({ marketing_vendors: [], slack_market_slugs: [], marketing_invoice_documents: [], marketing_expenses: [], marketing_expense_allocations: [] }, { rpc: { mkt_issued_counts: async () => [] } });
+  const supabase = fakeSupabase({ marketing_vendors: [], slack_market_slugs: [], marketing_invoice_documents: [], marketing_expenses: [], marketing_expense_allocations: [] }, { rpc: { mkt_lead_counts: async () => [] } });
   const posts = [];
   const html = '<table><tr><td>Invoice #</td><td>INV-4410</td></tr><tr><td>Service period</td><td>09/01/2026 - 09/30/2026</td></tr><tr><td>Balance Due</td><td>$5,000.00</td></tr></table>';
   const r = await ingestInvoice({ gmail_message_id: 'h1', from: 'ar@vendor.example', subject: 'Invoice INV-4410', received_at: '2026-10-13T12:00:00Z', body_text: '', body_html: html }, {

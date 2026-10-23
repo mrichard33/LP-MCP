@@ -1,8 +1,8 @@
 /**
  * Allocation writer — src/marketing/allocation-io.js
  *
- * The database side of src/marketing/allocation.js: reads gross issued leads
- * (mkt_issued_counts, D1) for each month slice of an expense, runs the pure
+ * The database side of src/marketing/allocation.js: reads leads created
+ * (mkt_lead_counts.raw; issued until 2026-10-23) for each month slice of an expense, runs the pure
  * allocator, and replaces the expense's rows in marketing_expense_allocations.
  * Everything takes `deps.supabase` so it runs against a stub in tests.
  *
@@ -19,19 +19,29 @@ import { createPayrollStore } from '../payroll/store.js';
 
 const LOG = '[MktAlloc]';
 
-/** Gross issued per market for a window, restricted to the expense's sub-sources (none = all). */
-export async function issuedByMarketFor({ from, to, subSources = [] }, { supabase = supabaseDefault } = {}) {
-  const { data, error } = await supabase.rpc('mkt_issued_counts', { p_from: from, p_to: to });
-  if (error) throw new Error(`mkt_issued_counts failed: ${error.message}`);
+/**
+ * Leads CREATED per market for a window, restricted to the expense's
+ * sub-sources (none = all): the weight a lead-source line is split by when the
+ * invoice does not name its market. 2026-10-23 (the user): split by leads
+ * created, not issued: vendors bill per lead delivered, and splitting by issued
+ * leads let a market that issued nothing carry none of the cost (and made every
+ * market's cost per issued lead the same). mkt_lead_counts.raw, the same
+ * branch / assignment market mapping as mkt_issued_counts.
+ */
+export async function leadsByMarketFor({ from, to, subSources = [] }, { supabase = supabaseDefault } = {}) {
+  const { data, error } = await supabase.rpc('mkt_lead_counts', { p_from: from, p_to: to });
+  if (error) throw new Error(`mkt_lead_counts failed: ${error.message}`);
   const wanted = new Set((subSources || []).filter(Boolean));
   const out = {};
   for (const r of data || []) {
     if (!r.market) continue;
     if (wanted.size && !wanted.has(r.lp_sub_source)) continue;
-    out[r.market] = (out[r.market] || 0) + Number(r.issued || 0);
+    out[r.market] = (out[r.market] || 0) + Number(r.raw || 0);
   }
   return out;
 }
+/** Older name, kept for callers; now leads created. */
+export const issuedByMarketFor = leadsByMarketFor;
 
 /** Market per LP lead id, as mkt_issued_counts maps one: the branch map, then the lead's assignment. */
 export async function marketsForLeads(leadIds, { supabase = supabaseDefault } = {}) {
@@ -148,7 +158,7 @@ function monthLastDay(month) {
  * Compute (not write) the allocation rows for an expense. Reads one issued
  * count set per month slice, over the slice's WHOLE calendar month (D1; see
  * allocation.js), then hands a sync lookup to the pure allocator. An expense
- * with no markets picked reads them too: its sub-source's issued leads pick
+ * with no markets picked reads them too: its sub-source's leads created pick
  * the markets (the user, 2026-10-13).
  */
 export async function previewAllocation(expense, deps = {}) {
@@ -165,7 +175,7 @@ export async function previewAllocation(expense, deps = {}) {
   const holdOnly = (expense.eligible_markets || []).length === 1 && expense.eligible_markets[0] === HOLD_MARKET;
   if (!holdOnly && !splitsEvenly(expense) && ((expense.eligible_markets || []).length > 1 || splitsBySource(expense))) {
     for (const s of slices) {
-      counts[s.month] = await issuedByMarketFor({ from: s.month, to: monthLastDay(s.month), subSources: expense.lp_sub_sources }, deps);
+      counts[s.month] = await leadsByMarketFor({ from: s.month, to: monthLastDay(s.month), subSources: expense.lp_sub_sources }, deps);
     }
   }
   return allocateExpense(expense, (month) => counts[month] || {});

@@ -146,7 +146,7 @@ test('recomputeCalculatedCosts reads the approved invoices; approving one refres
   const supabase = fakeSupabase({
     ...BASE, marketing_vendors: [],
     marketing_expenses: [{ id: 'inv1', cost_type: 'invoice', status: 'approved', amount: 10200, period_start: '2026-08-01', period_end: '2026-08-31', eligible_markets: ['ORL_MKT'], lp_sub_sources: ['LeadPilotData'], source_system: 'email_invoice' }],
-  }, { rpc: { mkt_sales_dollars: () => [{ market: 'ORL_MKT', lp_sub_source: 'LeadPilotData', net: 68000 }], mkt_issued_counts: () => [] } });
+  }, { rpc: { mkt_sales_dollars: () => [{ market: 'ORL_MKT', lp_sub_source: 'LeadPilotData', net: 68000 }], mkt_lead_counts: () => [] } });
   await recomputeCalculatedCosts('2026-08', { supabase });
   const { data } = await supabase.from('marketing_expenses').select('*').eq('source_system', 'commission_rule');
   assert.equal(data.length, 1);

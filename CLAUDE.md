@@ -1510,7 +1510,7 @@ because the S5.2 enrollment payload carries it.
 **Marketing cost is a ledger, not an LP field (Mark + Brad Codman, 2026-10-12; `supabase/migrations/20261012222106_158_marketing_cost_ledger.sql`).** Report 136 and LP cost entry
 are retired: nobody types a cost into LP again, and no code reads `mcost_cents` for a cost. The money lives in
 `marketing_expenses` (invoice lines, Lead Gurus feed days, commission rules) and is split per month and market in
-`marketing_expense_allocations` by GROSS ISSUED LEADS (D1: `ever_issued` by `created_at_lp`, `mkt_issued_counts`); Net /
+`marketing_expense_allocations` by LEADS CREATED (`mkt_lead_counts.raw` by `created_at_lp`; gross issued leads until 2026-10-23) when the invoice line names no market; a line that names one goes 100% there; Net /
 Working / Gross $ for COMMISSIONS come from report 133 (`mkt_sales_dollars`, D8; never change it for the view). **The view's
 dollars are by LEAD-CREATED date (2026-10-23, migration `20261023120000`):** Gross = `SUM(lp_jobs.job_value)` on leads created
 in the period, the way LP 136 counts (133 is contract-dated and a day late: ChatBot read $119,724 vs LP's $150,705); Net /
@@ -1619,7 +1619,14 @@ Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_marke
   market where that sub-source had gross issued leads in the slice's month (`splitsBySource` / `marketsFromIssued` in
   `allocation.js`); Edit can still pin markets. A month with none yet (JMJ / Vis PPC, October 2026) goes to `REECE_HOLD`
   with a note in `recommendation_reason`, and the nightly re-run (current + prior month) splits it once leads issue;
-  `recommendHolds` leaves those alone. Only a line with neither markets nor a sub-source is blocked. The issued basis
+  `recommendHolds` leaves those alone. Only a line with neither markets nor a sub-source is blocked.
+  **The weight is LEADS CREATED, not issued (the user, 2026-10-23: "if we split the bill by issued leads, a market that
+  has not issued leads would not be responsible for any of the marketing cost").** `leadsByMarketFor` reads
+  `mkt_lead_counts.raw` (vendors bill per lead delivered; issued-lead weights also made every market's cost per issued
+  lead identical). The columns keep the names `issued_basis` / `issued_total`; the card says "N of M leads created".
+  A line printing its market (Modernize "Account Level - BOCA", HomeBuddy "- South East -" → Fort Lauderdale,
+  "- Central -" → Orlando: `marketFromLineText`) is pinned to it, and an invoice mixing pinned and unpinned lead lines
+  is flagged `some_lines_without_market` (never auto-approved). The basis
   for every slice is its WHOLE calendar month (D1), not just the days it covers: an invoice with no printed period
   sits on its invoice date, and one day of issued leads is almost always zero.
 - **Vendors are data, not code.** JMJ Digital Marketing → Vis PPC (the user, 2026-10-13) was added straight to

@@ -315,7 +315,7 @@ test('feed sync: a placed held day keeps its offices when the feed re-pulls a ne
     ft_daily_summary: [{ date: '2026-08-26', total_spend: 80 }],
     marketing_expenses: [{ id: 'u26', source_system: 'leadgurus_feed', source_ref: '2026-08-26|Unknown', status: 'approved', period_start: '2026-08-26', period_end: '2026-08-26', amount: 70.52, eligible_markets: [], flags: ['unknown_territory', 'auto_assigned'], lp_sub_sources: ['Lead Gurus'], cost_type: 'feed' }],
     marketing_expense_allocations: [],
-  }, { rpc: { mkt_issued_counts: () => [] } });
+  }, { rpc: { mkt_lead_counts: () => [] } });
   await syncFeedExpenses({ from: '2026-08-26', to: '2026-08-26' }, { supabase });
   const row = supabase.tables.marketing_expenses.find((r) => r.id === 'u26');
   assert.equal(Number(row.amount), 80);

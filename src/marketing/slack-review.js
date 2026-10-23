@@ -49,18 +49,18 @@ export function splitLabel(row) {
     const cat = costCategory(row);
     return cat ? `_${COST_CATEGORIES[cat].toLowerCase()} cost, split evenly across all offices_` : '_all offices, split evenly_';
   }
-  if (k === 'by_source') return (row.lp_sub_sources || []).length ? '_markets by issued leads_' : '_no market_';
+  if (k === 'by_source') return (row.lp_sub_sources || []).length ? '_markets by leads created_' : '_no market_';
   return (row.eligible_markets || []).map(marketLabel).join(', ');
 }
 
 /**
  * The ways the Edit form can assign a line (2026-10-14, the user: "I should be
  * able to assign it to either call-center or software, and the amount will be
- * divided among all offices"). A lead source is split by its issued leads or
+ * divided among all offices"). A lead source is split by its leads created or
  * pinned to markets; call center and software are split evenly over every office.
  */
 export const SPLIT_OPTIONS = Object.freeze([
-  ['by_source', 'Lead source: split by its issued leads'],
+  ['by_source', 'Lead source: split by its leads created'],
   ['call_center', 'Call center cost: split evenly across all offices'],
   ['software', 'Software cost: split evenly across all offices'],
   ['markets', 'Lead source: only the markets picked below'],
@@ -145,7 +145,7 @@ const fmt0 = (n) => Math.round(Number(n) || 0).toLocaleString('en-US');
 /**
  * What a split was based on, in words a person reads (2026-10-19, the user could
  * not read "(proportional, 4182700/17951276 issued)"): "$41,827 of $179,513 in
- * sales", "3 of 9 aged-lead demos", "12 of 40 issued leads", "split evenly".
+ * sales", "3 of 9 aged-lead demos", "12 of 40 leads created", "split evenly".
  */
 export function basisText(a) {
   if (!a || a.market === DISPUTED_MARKET) return '';
@@ -156,7 +156,7 @@ export function basisText(a) {
     ? ` ($${fmt0(a.issued_basis)} of $${fmt0(a.issued_total)} in sales)`
     : ` (${fmt0(a.issued_basis)} of ${fmt0(a.issued_total)} ${unit.many})`;
   if (a.rule === 'direct') return '';
-  return ` (${fmt0(a.issued_basis)} of ${fmt0(a.issued_total)} issued leads)`;
+  return ` (${fmt0(a.issued_basis)} of ${fmt0(a.issued_total)} leads created)`;
 }
 
 /** The money a set of allocation rows parks as Disputed. */
@@ -382,7 +382,7 @@ export function buildEditView({ document, vendor, facts, rows = [], vendors = []
     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Each line goes to the market printed on it on the invoice.' }] });
   } else if (split === 'markets') {
     blocks.push(input('markets', 'Markets', { type: 'multi_static_select', action_id: 'mktinv_v_markets', placeholder: { type: 'plain_text', text: 'Pick one or more' }, options: marketOptions, ...(marketInitial.length ? { initial_options: marketInitial } : {}) },
-      hint('One office gets all of it. Several are split by their issued leads. "Hold at company level" parks it unassigned (not split) until you move it.')));
+      hint('One office gets all of it. Several are split by their leads created. "Hold at company level" parks it unassigned (not split) until you move it.')));
   }
   blocks.push(input('remember', 'Remember', { type: 'checkboxes', action_id: 'mktinv_v_remember', options: [rememberOption], ...(rememberInitial.length ? { initial_options: [rememberOption] } : {}) }));
   return {

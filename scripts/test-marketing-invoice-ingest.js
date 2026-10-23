@@ -32,7 +32,7 @@ const INVOICE = `Lead Gurus LLC\nInvoice # LG-9\nInvoice Date: 10/02/2026\nServi
 function db(extra = {}, rpc = {}) {
   return fakeSupabase({ marketing_vendors: VENDORS, slack_market_slugs: SLUGS, marketing_invoice_documents: [], marketing_expenses: [], marketing_expense_allocations: [], marketing_territory_map: [
     { territory: 'FTMYR', market: 'FTMYR_MKT' }, { territory: 'SAR', market: 'SAR_MKT' }, { territory: 'Unknown', market: 'REECE_HOLD' },
-  ], ...extra }, { rpc: { mkt_issued_counts: async () => [{ market: 'FTMYR_MKT', lp_sub_source: 'Lead Gurus', issued: 36 }, { market: 'SAR_MKT', lp_sub_source: 'Lead Gurus', issued: 12 }], ...rpc } });
+  ], ...extra }, { rpc: { mkt_lead_counts: async () => [{ market: 'FTMYR_MKT', lp_sub_source: 'Lead Gurus', raw: 36 }, { market: 'SAR_MKT', lp_sub_source: 'Lead Gurus', raw: 12 }], ...rpc } });
 }
 
 const extractStub = async (buffer, { bodyText }) => ({ kind: 'pdf', text: bodyText ?? buffer.toString('utf8'), meta: { format: 'document', page_count: 1, ocr_pages: 0, engine: 'stub' }, tables: [] });
@@ -217,9 +217,9 @@ test('approve: rows approved by name, allocated, feed vendor trued up, card repl
 // 2026-10-13 (the user): "we should be able to determine the markets based on
 // the gross issued leads for that source". No markets picked → Approve splits
 // by the line's sub-source's issued leads; a month with none waits on hold.
-const MHP_ISSUED = { mkt_issued_counts: async () => [
-  { market: 'FTMYR_MKT', lp_sub_source: 'MyHomePros', issued: 3 }, { market: 'STPET_MKT', lp_sub_source: 'MyHomePros', issued: 1 },
-  { market: 'SAR_MKT', lp_sub_source: 'Lead Gurus', issued: 50 }, { market: null, lp_sub_source: 'MyHomePros', issued: 9 },
+const MHP_ISSUED = { mkt_lead_counts: async () => [
+  { market: 'FTMYR_MKT', lp_sub_source: 'MyHomePros', raw: 3 }, { market: 'STPET_MKT', lp_sub_source: 'MyHomePros', raw: 1 },
+  { market: 'SAR_MKT', lp_sub_source: 'Lead Gurus', raw: 50 }, { market: null, lp_sub_source: 'MyHomePros', raw: 9 },
 ] };
 async function ingestMhp(supabase) {
   const ai = { ...GOOD_AI, vendor_name: 'My Home Pros', vendor_match_id: MHP_ID, lines: [{ description: 'Leads', amount: 1000, lp_sub_source: 'MyHomePros', markets: [], market_evidence: null }] };
@@ -237,11 +237,11 @@ test('no markets picked: Approve splits by the sub-source\'s gross issued leads,
   // Only MyHomePros counts (not Lead Gurus), a lead with no market is ignored, 3:1 → 750 / 250.
   assert.deepEqual(supabase.tables.marketing_expense_allocations.map((a) => [a.market, Number(a.amount), a.rule, a.issued_basis, a.issued_total]).sort(),
     [['FTMYR_MKT', 750, 'proportional', 3, 4], ['STPET_MKT', 250, 'proportional', 1, 4]]);
-  assert.match(JSON.stringify(replies.at(-1).blocks), /markets by issued leads/);
+  assert.match(JSON.stringify(replies.at(-1).blocks), /markets by leads created/);
 });
 
 test('no markets picked and no issued leads that month yet: the money waits on REECE_HOLD with a note', async () => {
-  const supabase = db({}, { mkt_issued_counts: async () => [{ market: 'SAR_MKT', lp_sub_source: 'Lead Gurus', issued: 50 }] });
+  const supabase = db({}, { mkt_lead_counts: async () => [{ market: 'SAR_MKT', lp_sub_source: 'Lead Gurus', raw: 50 }] });
   const r = await ingestMhp(supabase);
   const replies = [];
   const ok = await handleMarketingInvoiceInteraction(parsedClick('approve', r.document_id, { userId: 'U_BRAD', userName: 'brad' }), { supabase, approvers: new Set(['U_BRAD']), reply: async (_u, b) => replies.push(b), signedLink: async () => null });
@@ -250,8 +250,8 @@ test('no markets picked and no issued leads that month yet: the money waits on R
   assert.equal(supabase.tables.marketing_expense_allocations.length, 1);
   assert.equal(a.market, 'REECE_HOLD');
   assert.equal(a.rule, 'hold');
-  assert.match(a.recommendation_reason, /no MyHomePros issued leads in 2026-09 yet/);
-  assert.match(JSON.stringify(replies.at(-1).blocks), /no MyHomePros issued leads/);
+  assert.match(a.recommendation_reason, /no MyHomePros leads created in 2026-09 yet/);
+  assert.match(JSON.stringify(replies.at(-1).blocks), /no MyHomePros leads created/);
 });
 
 test('a line with no markets AND no sub-source still cannot be approved', async () => {

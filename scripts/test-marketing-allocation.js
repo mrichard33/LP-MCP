@@ -106,14 +106,14 @@ test('by source: no markets picked splits over every market with issued leads fo
   assert.deepEqual(two.map((r) => [r.market, r.amount, r.rule]), [['SAR_MKT', 906.15, 'proportional'], ['STPET_MKT', 2718.45, 'proportional']]);
   const none = allocateExpense(e, () => ({}));
   assert.deepEqual(none.map((r) => [r.market, r.amount, r.rule]), [['REECE_HOLD', 3624.6, 'hold']]);
-  assert.match(none[0].note, /no Vis PPC issued leads in 2026-09 yet/);
+  assert.match(none[0].note, /no Vis PPC leads created in 2026-09 yet/);
   assert.throws(() => allocateExpense({ ...e, lp_sub_sources: [] }, () => ({})), /no markets and no sub-source/);
 });
 
 test('the issued basis for a slice is its whole calendar month, not the days the slice covers', async () => {
   const { previewAllocation } = await import('../src/marketing/allocation-io.js');
   const calls = [];
-  const supabase = { rpc: async (_fn, args) => { calls.push(args); return { data: [{ market: 'STPET_MKT', lp_sub_source: 'Vis PPC', issued: 2 }], error: null }; } };
+  const supabase = { rpc: async (_fn, args) => { calls.push(args); return { data: [{ market: 'STPET_MKT', lp_sub_source: 'Vis PPC', raw: 2 }], error: null }; } };
   const rows = await previewAllocation({ id: 'e', amount: 100, period_start: '2026-10-02', period_end: '2026-10-02', lp_sub_sources: ['Vis PPC'], eligible_markets: [] }, { supabase });
   assert.deepEqual(calls, [{ p_from: '2026-10-01', p_to: '2026-10-31' }]);
   assert.deepEqual(rows.map((r) => [r.market, r.amount]), [['STPET_MKT', 100]]);
@@ -229,6 +229,13 @@ test('an invoice line that prints one market goes to that market', () => {
   assert.equal(marketFromLineText('Lake Worth homeowners'), null, 'a capital code only, never prose');
   assert.equal(marketFromLineText('ORL and JAX bundle'), null, 'two markets → split by source as before');
   assert.equal(marketFromLineText('Monthly subscription'), null);
+  // HomeBuddy regions (2026-10-23)
+  assert.equal(marketFromLineText('Reece Windows Florida - South East - WR, Window Replacement, 15 leads @ $130', 'South East'), 'FTLAU_MKT');
+  assert.equal(marketFromLineText('Reece Windows Florida - South East - WR'), 'FTLAU_MKT');
+  assert.equal(marketFromLineText('Reece Windows & Doors - Central - WR (27 leads @ $124)', 'Central'), 'ORL_MKT');
+  assert.equal(marketFromLineText('Reece Windows & Doors - Central - WR'), 'ORL_MKT');
+  assert.equal(marketFromLineText('Leads billed in Central Time'), null, 'a label only, never prose');
+  assert.equal(marketFromLineText('southeast region promo'), null);
   const vendor = { id: 'v', vendor_name: 'Modernize', lp_sub_sources: ['Modernize'], eligible_markets: [] };
   const facts = { invoice_number: '9', total: 300, period_start: '2026-10-09', period_end: '2026-10-15' };
   const analysis = { lines: [
@@ -382,7 +389,7 @@ test('sales: finding MORE than billed splits normally; finding less parks the di
 
 test('the card says what each split was based on, and a decided card with a dispute can settle it', () => {
   assert.equal(basisText({ market: 'SAR_MKT', rule: 'proportional', issued_basis: 3, issued_total: 9, kind: 'demo' }), ' (3 of 9 aged-lead demos)');
-  assert.equal(basisText({ market: 'SAR_MKT', rule: 'proportional', issued_basis: 12, issued_total: 40 }), ' (12 of 40 issued leads)');
+  assert.equal(basisText({ market: 'SAR_MKT', rule: 'proportional', issued_basis: 12, issued_total: 40 }), ' (12 of 40 leads created)');
   assert.equal(basisText({ market: 'SAR_MKT', rule: 'equal' }), ' (split evenly)');
   assert.equal(basisText({ market: DISPUTED_MARKET, rule: 'hold' }), '');
   const allocation = [
@@ -486,7 +493,7 @@ function refreshSeed() {
     ],
     marketing_expense_allocations: [{ expense_id: 'e2', month: '2026-08-01', market: 'ORL_MKT', amount: 1000, rule: 'direct', issued_basis: 0, issued_total: 0 }],
     marketing_vendors: [],
-  }, { rpc: { mkt_issued_counts: () => [] } });
+  }, { rpc: { mkt_lead_counts: () => [] } });
 }
 
 test('decisionFor: posted → approved by the person, all rejected → rejected, open → none', () => {
