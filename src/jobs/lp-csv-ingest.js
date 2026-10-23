@@ -759,6 +759,43 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     }, `caller declared ${expectedPeriod.start}..${expectedPeriod.end}, file says ${snapshotPayload.period_start}..${snapshotPayload.period_end}.`);
   }
 
+  // ── 137 BY MARKET: ONLY MTD, YTD OR AN EXACT CALENDAR MONTH IS STORED ──
+  // (2026-10-23) Cohort re-observation. LP's scheduler has no "N months back"
+  // date function, so Mark runs four DAILY 137 By Market schedules on fixed
+  // day offsets ([DAYOFFSET(-61)]..[DAYOFFSET(-31)/(-32)] and
+  // [DAYOFFSET(-92)]..[DAYOFFSET(-62)/(-63)], subjects "Sales Efficiency by
+  // Market 1..4"). Once a month each window lands exactly on the 1st..last day
+  // of a 31- or 30-day month two or three months back, self-classifies as
+  // scope 'month' and re-observes that cohort (lp_cohort_reobservation). Every
+  // other day the window is an arbitrary range: it would derive scope 'custom',
+  // become a current snapshot of its own and write lp_report_facts for an
+  // odd window. Those files are archived (step 2 already did that) and logged
+  // as 'skipped' — success, so n8n does not report a failure, and no snapshot.
+  //
+  // Scope comes from lp_derive_scope, the same function lp_csv_ingest_begin
+  // calls, so this gate and the stored scope cannot disagree. Before this
+  // change no 137 By Market file had ever derived 'custom'.
+  if (reportType === 'sales_efficiency') {
+    const { data: derivedScope, error: scopeErr } = await supabase.rpc('lp_derive_scope', {
+      p_start: snapshotPayload.period_start,
+      p_end: snapshotPayload.period_end,
+      p_as_of: snapshotPayload.as_of_date,
+    });
+    if (scopeErr) throw new Error(`scope derivation failed: ${scopeErr.message}`);
+    if (derivedScope === 'custom') {
+      const detail = {
+        reason: 'not_calendar_month',
+        period_start: snapshotPayload.period_start,
+        period_end: snapshotPayload.period_end,
+        as_of_date: snapshotPayload.as_of_date,
+        storage_path: storagePath,
+      };
+      await done('skipped', { detail });
+      console.log(`[LPCsv] ${reportType} ${snapshotPayload.period_start}..${snapshotPayload.period_end} is not a calendar month, MTD or YTD; archived, not stored.`);
+      return { success: true, stored: false, skipped: true, ...detail, sha256: sha };
+    }
+  }
+
   // The content key can only be probed here — it is a hash of the PARSED rows,
   // so it does not exist at the pre-parse probe above. See
   // probeExistingContentSnapshot: this is the key that was actually colliding.
