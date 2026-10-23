@@ -1524,7 +1524,7 @@ recomputed the moment a report 133 snapshot lands (`recomputeAfterSalesSnapshot`
 2026-10-19): the 02:30 run read the day-old snapshot (Fort Myers Canvass at 15% × $322,390 against the day's $276,190).
 A campaign with no sub-source reads "Unknown" in the XLSX and on the dashboard, never "(none)" (`campaignLabel`). **Commission rules (the user, 2026-10-19):** Canvass 15% of net is an ESTIMATE until canvasser payroll reports are
 uploaded (rule basis `net_sales_estimate` → rows `provisional` + flags `{estimate}`, `isEstimateRule`), MVP Marketing and
-LeadPilotData 15%; all are lead-source cost. Previous Customer / Customer Referral carry NO cost (the user, 2026-10-23: "leave blank"; the 1% rule is ended, its rows superseded, `sql/seeds/2026-10-23_retire_referral_commission.sql`). Net = jobs released to production (RTP) or
+LeadPilotData 15%; all are lead-source cost. Canvass Sticky carries NO cost (the user, 2026-10-23: no calculated cost for it; dropped from the Canvass rule, its rows superseded, `sql/seeds/2026-10-23_canvass_sticky_no_cost.sql`). Previous Customer / Customer Referral carry NO cost (the user, 2026-10-23: "leave blank"; the 1% rule is ended, its rows superseded, `sql/seeds/2026-10-23_retire_referral_commission.sql`). Net = jobs released to production (RTP) or
 completed, so a commission on net is a commission on RTP'd dollars. Seed: `sql/seeds/2026-10-19_commission_rules_leadpilot_canvass_estimate.sql`. The dashboard and
 Brad's XLSX (`marketing-cost-report`, formulas never typed values) read `v_market_subsource_cost`.
 - **No routing or account number is ever saved (the user, 2026-10-19).** "We do not save any of the Lightfire Routing
