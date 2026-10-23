@@ -2,6 +2,19 @@
 import { z } from 'zod';
 import { railwayQuery, getServiceId } from '../../admin/railway-client.js';
 
+// 2026-10-23: a deploy pauses any running bot simulator / gate job (it resumes
+// on the new instance, src/simulator/sim-job-store.js). The preview lists them;
+// a confirmed call says so. Never blocks, never throws.
+async function simJobsNote() {
+  try {
+    const { simJobsDeployNote } = await import('../simulator-tools.js');
+    return await simJobsDeployNote();
+  } catch (err) {
+    return { running_sim_jobs: null, sim_jobs_note: `could not read running test runs: ${String(err?.message || err).slice(0, 200)}` };
+  }
+}
+const withSimNote = (obj, note) => (note?.running_sim_jobs?.length || note?.running_sim_jobs === null ? { ...obj, ...note } : obj);
+
 // Helper to get project + environment IDs (required by several Railway queries)
 const getProjectId = () => {
   const id = process.env.RAILWAY_PROJECT_ID;
@@ -175,6 +188,7 @@ export function registerRailwayTools(server) {
             name,
             value_length: value.length,
             warning: 'This will trigger an auto-redeploy. Set confirm: true to execute.',
+            ...(await simJobsNote()),
           }, null, 2) }],
         };
       }
@@ -182,6 +196,7 @@ export function registerRailwayTools(server) {
       const sid = getServiceId();
       const projectId = getProjectId();
       const environmentId = getEnvironmentId();
+      const simNote = await simJobsNote();
 
       await railwayQuery(`
         mutation($input: VariableUpsertInput!) {
@@ -198,7 +213,7 @@ export function registerRailwayTools(server) {
       });
 
       return {
-        content: [{ type: 'text', text: JSON.stringify({ success: true, name, action: 'set', note: 'Auto-redeploy triggered.' }, null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(withSimNote({ success: true, name, action: 'set', note: 'Auto-redeploy triggered.' }, simNote), null, 2) }],
       };
     }
   );
@@ -217,12 +232,14 @@ export function registerRailwayTools(server) {
             preview: true,
             action: 'redeploy',
             warning: 'This will redeploy the service from the latest commit. Set confirm: true to execute.',
+            ...(await simJobsNote()),
           }, null, 2) }],
         };
       }
 
       const sid = getServiceId();
       const environmentId = getEnvironmentId();
+      const simNote = await simJobsNote();
 
       await railwayQuery(`
         mutation($serviceId: String!, $environmentId: String!) {
@@ -231,7 +248,7 @@ export function registerRailwayTools(server) {
       `, { serviceId: sid, environmentId });
 
       return {
-        content: [{ type: 'text', text: JSON.stringify({ success: true, action: 'redeploy', service_id: sid }, null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(withSimNote({ success: true, action: 'redeploy', service_id: sid }, simNote), null, 2) }],
       };
     }
   );
@@ -256,10 +273,12 @@ export function registerRailwayTools(server) {
             action: 'rollback',
             target_deployment: deployment_id,
             warning: 'This will roll back to the specified deployment. Set confirm: true to execute.',
+            ...(await simJobsNote()),
           }, null, 2) }],
         };
       }
 
+      const simNote = await simJobsNote();
       await railwayQuery(`
         mutation($deploymentId: String!) {
           deploymentRollback(id: $deploymentId)
@@ -267,7 +286,7 @@ export function registerRailwayTools(server) {
       `, { deploymentId: deployment_id });
 
       return {
-        content: [{ type: 'text', text: JSON.stringify({ success: true, action: 'rollback', deployment_id }, null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(withSimNote({ success: true, action: 'rollback', deployment_id }, simNote), null, 2) }],
       };
     }
   );

@@ -53,6 +53,8 @@ import { runWithSimOverrides } from './sim-overrides.js';
 import { revinThreadEnabled, mergeRevinTurns, simRevinFixture } from '../revin/thread.js';
 import { readRevinTurns } from '../revin/thread-read.js';
 import { captureChatIdentity } from '../live-chat/identity-capture.js';
+import { onShutdown, trackBackground } from '../graceful-shutdown.js';
+import { simJobPersistMode, ownerId, resultKey, pendingUnits, persistableResult, resumeVerdict, versionSummary, HEARTBEAT_MS, STALE_MS, RESUME_DELAY_MS, RESUME_POLL_MS, RETENTION_DAYS } from './sim-job-store.js';
 
 export const SIM_CONTACT_PREFIX = 'sim-';
 
@@ -861,20 +863,47 @@ export function formatTranscript(result) {
   return lines.join('\n');
 }
 
+
 // ── async jobs (SMS turns take ~30s each on a thinking model) ──
 const jobs = new Map();
 const MAX_JOBS = 50;
 
+/** How many times a job runs every scenario (the gate 2 by default, a plain simulation 1). Pure. */
+function runsFor(input) {
+  return Math.max(1, Math.min(4, Number(input.runs) || (input.gate ? 2 : 1)));
+}
+
+/**
+ * 2026-10-23: start a job. With a store (deps.jobStore) and
+ * SIM_JOB_PERSIST_MODE live (the default), every finished conversation is
+ * saved and the job survives a deploy (sim-job-store.js). With the mode off,
+ * or no store (the tests' deps), the job lives in memory exactly as before.
+ */
 export function startSimulationJob(input, deps) {
-  const id = `sim_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const job = { id, status: 'running', started_at: new Date().toISOString(), input, results: [], error: null };
-  jobs.set(id, job);
+  if (deps?.jobStore && simJobPersistMode() === 'live') return startPersistentJob(input, deps);
+  return startMemoryJob(input, deps);
+}
+
+function newJobId() {
+  return `sim_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function keepJob(job) {
+  jobs.set(job.id, job);
   if (jobs.size > MAX_JOBS) jobs.delete(jobs.keys().next().value);
+}
+
+// The job as it ran before 2026-10-23 (SIM_JOB_PERSIST_MODE=off): memory only,
+// lost on a deploy. Kept byte for byte so `off` is the easy undo.
+function startMemoryJob(input, deps) {
+  const id = newJobId();
+  const job = { id, status: 'running', started_at: new Date().toISOString(), input, results: [], error: null };
+  keepJob(job);
   const keys = input.scenario === 'all' ? Object.keys(SCENARIOS) : [input.scenario || null];
   // 2026-10-18 (Phase 1 item 3): the gate runs every scenario `runs` times
   // (default 2; a plain simulation once). job.results is run 1, for the
   // transcripts; the scorecard combines every run (combineRuns).
-  const runs = Math.max(1, Math.min(4, Number(input.runs) || (input.gate ? 2 : 1)));
+  const runs = runsFor(input);
   job.runs = runs;
   job.run_results = [];
   (async () => {
@@ -909,6 +938,290 @@ export function startSimulationJob(input, deps) {
   return job;
 }
 
+/**
+ * Every conversation a job runs, in the order the in-memory job runs them:
+ * run → scenario → channel (the channel filter is runSimulation's). Each has
+ * the stable key `run#/scenario_key/channel` a resume skips by. Pure.
+ */
+export function jobUnits(input) {
+  const keys = input.scenario === 'all' ? Object.keys(SCENARIOS) : [input.scenario || null];
+  const units = [];
+  for (let n = 1; n <= runsFor(input); n++) {
+    for (const key of keys) {
+      // resolveScenario: messages of your own are the 'custom' plan, any scenario name aside.
+      const custom = Array.isArray(input.turns) && input.turns.length;
+      const planKey = custom ? 'custom' : key;
+      const allowed = (!custom && SCENARIOS[key]?.channels) || ['livechat', 'sms'];
+      const channel = input.channel || 'both';
+      const want = channel === 'both' ? allowed : [channel].filter(c => allowed.includes(c));
+      for (const ch of want) units.push({ run: n, scenario: key, channel: ch, key: resultKey(n, planKey, ch) });
+    }
+  }
+  return units;
+}
+
+/** Each run's results, in plan order, from the finished conversations. Pure. */
+export function assembleRuns(units, completed, runs) {
+  const out = Array.from({ length: runs }, () => []);
+  for (const u of units) {
+    const r = completed?.[u.key];
+    if (Array.isArray(r)) out[u.run - 1].push(...r);
+  }
+  return out;
+}
+
+function runsDone(units, completed, runs) {
+  let done = 0;
+  for (let n = 1; n <= runs; n++) {
+    if (units.filter(u => u.run === n).every(u => Object.prototype.hasOwnProperty.call(completed, u.key))) done = n;
+    else break;
+  }
+  return done;
+}
+
+// Shutdown: stop starting conversations, let the one in flight finish inside
+// Railway's drain, and leave every job of ours `interrupted` for the next
+// instance. Chained onto graceful-shutdown.js's hooks, never a second handler.
+let stopping = false;
+let hooksInstalled = false;
+const local = new Map(); // job id → { store, owner }
+
+function installShutdownHooks() {
+  if (hooksInstalled) return;
+  hooksInstalled = true;
+  onShutdown(() => { stopping = true; }, 'start');
+  onShutdown(async () => {
+    for (const [id, { store, owner }] of local) {
+      try {
+        if (await store.update(id, owner, { status: 'interrupted' }, { statuses: ['running'] })) console.log(`[SimJobs] ${id} interrupted by shutdown; the next instance resumes it`);
+      } catch (err) { console.warn(`[SimJobs] ${id} could not be marked interrupted: ${err.message}`); }
+    }
+  }, 'exit');
+}
+
+function startPersistentJob(input, deps) {
+  const units = jobUnits(input);
+  const runs = runsFor(input);
+  const job = { id: newJobId(), status: 'running', started_at: new Date().toISOString(), input, results: [], error: null, runs, run_results: [], runs_done: 0, persisted: true, resume_count: 0, total_units: units.length, done_units: 0 };
+  keepJob(job);
+  driveJob(job, { deps, units, completed: {}, versions: [], fresh: true });
+  return job;
+}
+
+/**
+ * Run (or resume) a persisted job: every unit not yet finished, one at a
+ * time, each saved the moment it finishes. A store that cannot be reached
+ * never fails the run: the job goes on in memory and says so.
+ */
+function driveJob(job, { deps, units, completed, versions, fresh = false }) {
+  const store = deps.jobStore;
+  const owner = ownerId();
+  const runs = job.runs;
+  let persist = true;
+  let lost = false;
+  let beat = null;
+  const refresh = () => {
+    const done = assembleRuns(units, completed, runs);
+    job.results = done[0];
+    job.done_units = units.filter(u => Object.prototype.hasOwnProperty.call(completed, u.key)).length;
+    job.runs_done = runsDone(units, completed, runs);
+  };
+  refresh();
+  installShutdownHooks();
+  (async () => {
+    let meta = {};
+    try { meta = (await deps.evalMeta?.()) || {}; } catch { /* meta is decoration */ }
+    const segment = { deployment: owner, git_sha: meta.git_sha || null, prompt_version: meta.prompt_version || null, at: new Date().toISOString() };
+    const segments = [...(versions || []), segment];
+    try {
+      if (fresh) await store.insert({ id: job.id, kind: job.input.gate ? 'gate' : 'simulate', status: 'running', request: job.input, total_units: units.length, versions: segments, owner_deployment_id: owner, heartbeat_at: new Date().toISOString(), created_at: job.started_at });
+      else await store.update(job.id, owner, { resume_count: job.resume_count, versions: segments }, { statuses: ['running'] });
+    } catch (err) {
+      persist = false;
+      job.persist_error = `not saved; this run is lost on a deploy: ${String(err?.message || err).slice(0, 200)}`;
+      console.warn(`[SimJobs] ${job.id} ${job.persist_error}`);
+    }
+    if (persist) {
+      local.set(job.id, { store, owner });
+      beat = setInterval(() => {
+        store.update(job.id, owner, { heartbeat_at: new Date().toISOString() }, { statuses: ['running'] })
+          .then((ok) => { if (!ok) lost = true; }).catch(() => { /* a missed beat; the next one counts */ });
+      }, HEARTBEAT_MS);
+      beat.unref?.();
+    }
+    const skipped = units.length - pendingUnits(units, completed).length;
+    if (!fresh) console.log(`[SimJobs] ${job.id} resumed (resume ${job.resume_count}): skipping ${skipped} finished conversation(s), ${units.length - skipped} to run`);
+    for (const u of units) {
+      if (Object.prototype.hasOwnProperty.call(completed, u.key)) continue;
+      if (stopping || lost) break;
+      // Tracked, so a deploy's drain waits for the conversation in flight and
+      // its save (up to SHUTDOWN_GRACE_MS, inside Railway's 120 s).
+      const work = (async () => {
+        const res = await runSimulation({ ...job.input, scenario: u.scenario, channel: u.channel }, deps);
+        completed[u.key] = res;
+        refresh();
+        if (!persist) return;
+        try { if (!(await store.record(job.id, owner, u.key, persistableResult(res)))) lost = true; }
+        catch (err) { console.warn(`[SimJobs] ${job.id} ${u.key} not saved (kept in memory, saved at the end): ${err.message}`); }
+      })();
+      trackBackground(work);
+      await work;
+    }
+    if (lost || (stopping && pendingUnits(units, completed).length)) {
+      if (beat) clearInterval(beat);
+      local.delete(job.id);
+      job.status = 'interrupted';
+      if (lost) job.note = 'another instance took this job over';
+      else if (persist) {
+        try { await store.update(job.id, owner, { status: 'interrupted', completed }, { statuses: ['running'] }); } catch { /* the exit hook tries again */ }
+      }
+      return;
+    }
+    const runResults = assembleRuns(units, completed, runs);
+    job.run_results = runResults;
+    try { meta = (await deps.evalMeta?.()) || meta; } catch { /* meta is decoration */ }
+    const cards = runResults.map(r => scoreRun(r, { ...meta, nepq_mode: job.input.nepqMode || 'live' }));
+    const scorecard = runs > 1 ? combineRuns(cards) : cards[0];
+    // The gate result stays honest across a deploy: which job, how often it
+    // resumed, and every build and prompt it ran on.
+    const vs = versionSummary(segments);
+    job.scorecard = { ...scorecard, job_id: job.id, resume_count: job.resume_count, ...(vs.resumed_across_versions ? vs : {}) };
+    if (job.input.gate) {
+      let previous = null;
+      try { previous = await deps.lastEvalRun?.({ nepqMode: job.input.nepqMode || 'live' }); } catch (err) { job.save_error = `last run unreadable: ${String(err?.message || err).slice(0, 200)}`; }
+      job.comparison = job.save_error ? { compared: false, worse: null, reasons: [job.save_error] } : compareScorecards(job.scorecard, previous);
+      // Once per job (CANON.SK.063): a job finished, saved, then resumed again
+      // (its done write lost) must not save a second agentic.bot_eval_run.
+      let saved = false;
+      try { saved = !!(await deps.evalRunExists?.(job.id, job.started_at)); } catch { /* unknown: save */ }
+      if (saved) job.eval_run = 'already saved';
+      else {
+        try { await deps.recordEvalRun?.(job.scorecard, job.comparison, runs > 1 ? cards : null); } catch (err) { job.save_error = `run not saved: ${String(err?.message || err).slice(0, 200)}`; }
+      }
+    }
+    if (beat) clearInterval(beat);
+    local.delete(job.id);
+    job.status = 'done';
+    job.completed_at = new Date().toISOString();
+    if (persist) {
+      try { await store.update(job.id, owner, { status: 'done', completed, scorecard: job.scorecard, comparison: job.comparison || null, error: job.save_error || null }, { statuses: ['running'] }); }
+      catch (err) { console.warn(`[SimJobs] ${job.id} done, but the row was not updated: ${err.message}`); }
+    }
+  })().catch(async (err) => {
+    if (beat) clearInterval(beat);
+    local.delete(job.id);
+    job.status = 'failed';
+    job.error = String(err?.message || err).slice(0, 300);
+    if (persist) { try { await store.update(job.id, owner, { status: 'error', error: job.error, completed }, { statuses: ['running'] }); } catch { /* best effort */ } }
+  });
+}
+
+/** A job rebuilt from its sim_jobs row (read only, or to resume). */
+function jobFromRow(row) {
+  const input = row.request || {};
+  const units = jobUnits(input);
+  const runs = runsFor(input);
+  const completed = row.completed || {};
+  const runResults = assembleRuns(units, completed, runs);
+  return {
+    job: {
+      id: row.id, status: row.status === 'error' ? 'failed' : row.status, started_at: row.created_at, input,
+      results: runResults[0], error: row.error || null, runs, runs_done: runsDone(units, completed, runs),
+      ...(row.status === 'done' ? { run_results: runResults } : {}),
+      scorecard: row.scorecard || undefined, comparison: row.comparison || undefined,
+      persisted: true, resume_count: Number(row.resume_count) || 0, total_units: units.length, done_units: Object.keys(completed).filter(k => units.some(u => u.key === k)).length,
+    },
+    units, completed, versions: Array.isArray(row.versions) ? row.versions : [],
+  };
+}
+
+/**
+ * Claim and resume every job whose heartbeat stopped (a deploy, a crash).
+ * One at a time, atomically (sim_job_claim): two instances never both run one.
+ */
+export async function resumeStaleJobs(deps, { nowMs = Date.now() } = {}) {
+  const store = deps?.jobStore;
+  if (!store || simJobPersistMode() === 'off') return [];
+  const owner = ownerId();
+  const out = [];
+  for (let i = 0; i < 5 && !stopping; i++) {
+    const row = await store.claimStale(owner, STALE_MS);
+    if (!row) break;
+    const verdict = resumeVerdict(row, nowMs);
+    if (!verdict.resume) {
+      await store.update(row.id, owner, { status: 'error', error: verdict.reason }).catch(() => {});
+      console.warn(`[SimJobs] ${row.id} not resumed: ${verdict.reason}`);
+      out.push({ id: row.id, resumed: false, reason: verdict.reason });
+      continue;
+    }
+    const { job, units, completed, versions } = jobFromRow(row);
+    job.status = 'running';
+    job.resume_count = (Number(row.resume_count) || 0) + 1;
+    keepJob(job);
+    driveJob(job, { deps, units, completed, versions });
+    out.push({ id: row.id, resumed: true, resume_count: job.resume_count, skipped: job.done_units, pending: units.length - job.done_units });
+  }
+  return out;
+}
+
+let resumeTimer = null;
+/** Boot: resume stale jobs ~30 s after start (past the deploy overlap), then every 30 s; prune daily. */
+export function startSimJobResumer(deps, { delayMs = RESUME_DELAY_MS, pollMs = RESUME_POLL_MS } = {}) {
+  if (resumeTimer || !deps?.jobStore || simJobPersistMode() === 'off') return null;
+  installShutdownHooks();
+  let lastPrune = 0;
+  const tick = async () => {
+    if (stopping) return;
+    try {
+      const out = await resumeStaleJobs(deps);
+      for (const r of out) if (r.resumed) console.log(`[SimJobs] claimed ${r.id} (resume ${r.resume_count}, ${r.skipped} done, ${r.pending} to run)`);
+      if (Date.now() - lastPrune > 86_400_000) { lastPrune = Date.now(); await deps.jobStore.prune(RETENTION_DAYS); }
+    } catch (err) { console.warn(`[SimJobs] resume check failed: ${err.message}`); }
+  };
+  resumeTimer = setTimeout(() => {
+    tick();
+    const t = setInterval(tick, pollMs);
+    t.unref?.();
+  }, delayMs);
+  resumeTimer.unref?.();
+  return resumeTimer;
+}
+
 export function getSimulationJob(id) {
   return jobs.get(id) || null;
 }
+
+/** Memory first, then the job's saved row (after a deploy). */
+export async function findSimulationJob(id, deps = null) {
+  const mem = jobs.get(id);
+  if (mem) return mem;
+  if (!deps?.jobStore || simJobPersistMode() === 'off') return null;
+  const row = await deps.jobStore.get(id);
+  return row ? { ...jobFromRow(row).job, from_store: true } : null;
+}
+
+/** The jobs a deploy would interrupt: [{ id, kind, status, done, total, pct }]. */
+export async function listActiveSimJobs(deps = null) {
+  const out = new Map();
+  for (const j of jobs.values()) {
+    if (j.status !== 'running') continue;
+    const total = j.total_units || null;
+    out.set(j.id, { id: j.id, kind: j.input?.gate ? 'gate' : 'simulate', status: j.status, done: j.done_units ?? null, total, pct: total ? Math.round(((j.done_units || 0) / total) * 100) : null, persisted: !!j.persisted });
+  }
+  if (deps?.jobStore && simJobPersistMode() === 'live') {
+    for (const r of await deps.jobStore.listOpen()) {
+      out.set(r.id, { id: r.id, kind: r.kind, status: r.status, done: r.done_units, total: r.total_units, pct: r.total_units ? Math.round((r.done_units / r.total_units) * 100) : null, persisted: true });
+    }
+  }
+  return [...out.values()];
+}
+
+/** TESTS ONLY. */
+export function __resetSimJobsForTests() {
+  stopping = false;
+  local.clear();
+  jobs.clear();
+  if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
+}
+/** TESTS ONLY: as a SIGTERM's start hook would. */
+export function __setSimJobsStoppingForTests(v) { stopping = !!v; }

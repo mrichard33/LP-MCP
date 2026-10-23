@@ -2737,6 +2737,21 @@ after our close is read from the previous SENT reply's `bot_message_context.plan
 version rule covers planner copy too: `scripts/test-planner-copy-snapshot.js` snapshots LINES / fixed lines and the
 rehash track's copy, and a change without a `RESPONSE_GENERATOR_VERSION` bump fails.
 
+**Sim jobs survive deploys (2026-10-23; AIOS CANON.IMP.068, CANON.SK.063, CANON.TBL.015).** `simulate_bot_conversation`
+and `run_bot_eval` run inside this service, and a deploy used to kill a 20-30 minute gate run. Each finished
+conversation is now saved in `sim_jobs` (`supabase/migrations/20261023180000_sim_jobs.sql`, keyed
+`run#/scenario_key/channel` in `completed`), with a 15 s heartbeat and `owner_deployment_id` (`RAILWAY_DEPLOYMENT_ID`).
+On SIGTERM (a `graceful-shutdown.js` hook, never a second handler) no new conversation starts, the one in flight
+finishes inside the drain and the job is left `interrupted`. A new instance (30 s after boot, then every 30 s) claims a
+job whose heartbeat is 45 s+ old through `sim_job_claim` (FOR UPDATE SKIP LOCKED: one claimer wins), skips the
+finished keys and runs the rest; three resumes spent or a job 2 h+ old is `error`. The scorecard carries `job_id`,
+`resume_count` and, when the build or prompt changed mid-run, `resumed_across_versions` + `versions`; the
+`agentic.bot_eval_run` event is saved once per job (`evalRunExists`). `get_bot_simulation` / `GET
+/admin/bot-simulate/:id` read the row after a deploy. The Railway redeploy / env var / rollback tools list running jobs
+in their preview and never block. A run on a real contact stores the id only (`persistableResult`). Rows done/error
+are pruned after 30 days. Code: `src/simulator/sim-job-store.js`, the jobs section of `bot-simulator.js`. Kill switch:
+`SIM_JOB_PERSIST_MODE=off` (in-memory jobs, exactly as before). The live chat and SMS bots are untouched.
+
 ## Writing code here
 
 Existing modules carry dated comments explaining *why* a thing is the way it is, usually naming the

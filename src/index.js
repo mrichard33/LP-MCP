@@ -375,7 +375,7 @@ import { logFfmpegStatus } from './ci/recordings.js';
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // 2026-09-26 — website live chat answered synchronously (src/live-chat/).
 import { registerLiveChatRoutes } from './live-chat/index.js';
-import { registerSimulatorRoutes } from './tools/simulator-tools.js';
+import { registerSimulatorRoutes, startSimulatorResumer } from './tools/simulator-tools.js';
 import { registerLeadStageRoutes } from './admin/lead-stage-routes.js';
 import { registerVdrReportRoutes, vdrAuthenticate } from './vdr/report-route.js';
 // 2026-10-01 — answers a live chat message GHL never sent us (a contact merge drops the webhook).
@@ -1094,6 +1094,8 @@ const server = app.listen(PORT, async () => {
   startGhlNoteSweep();
   startGhlCallerReporter();
   startGhlNoteReconciliation();
+  // 2026-10-23: resume bot simulator / gate jobs a deploy interrupted (sim_jobs; SIM_JOB_PERSIST_MODE=off disables).
+  startSimulatorResumer();
   // First field-sync ~60s after boot (was ~9.5 min), then every 15 min.
   setTimeout(async () => {
     try { await withGhlCaller('job:ghl-field-sync', runBulkFieldSync); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); }

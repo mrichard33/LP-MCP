@@ -119,6 +119,12 @@ export const MODES = Object.freeze([
     goLive: 'rehash.would_* events name only OPPFDN leads inside the 30-day window',
     note: 'Puts post-demo leads in the rehash stage and routes their calls to the rehash team.',
   }),
+  m('SIM_JOB_PERSIST_MODE', 'bot', 'enum', OL, 'live', OL_S, {
+    since: '2026-10-23', decider: 'Mark',
+    evidence: { table: 'sim_jobs' },
+    goLive: LIVE_BY_DEFAULT,
+    note: 'Bot simulator / gate jobs are saved per conversation (sim_jobs) and resume on the next instance after a deploy; off = in-memory jobs, lost on a deploy (the rollback).',
+  }),
   m('TURN_LOCK_MODE', 'bot', 'enum', ['shadow', 'live'], 'shadow', { live: ['live'], shadow: ['shadow'] }, {
     since: '2026-10-18', decider: 'Mark',
     evidence: { table: 'bot_turn_locks' },

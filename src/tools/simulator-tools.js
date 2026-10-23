@@ -21,7 +21,8 @@
  */
 import { checkRequestSecret } from '../security/request-auth.js';
 import { z } from 'zod';
-import { SCENARIOS, startSimulationJob, getSimulationJob, formatTranscript } from '../simulator/bot-simulator.js';
+import { SCENARIOS, startSimulationJob, findSimulationJob, listActiveSimJobs, startSimJobResumer, formatTranscript } from '../simulator/bot-simulator.js';
+import { supabaseSimJobStore, simJobPersistMode } from '../simulator/sim-job-store.js';
 import { formatScorecard } from '../simulator/sim-scoring.js';
 import { SIM_MODE_OVERRIDES } from '../simulator/sim-overrides.js';
 
@@ -66,6 +67,17 @@ export const simulatorDeps = {
     if (error) throw new Error(error.message);
     const modeOf = (m) => (m || 'live');
     return (data || []).map(r => r?.payload?.scorecard).find(c => c && modeOf(c.nepq_mode) === modeOf(nepqMode)) || null;
+  },
+  // 2026-10-23: jobs survive a deploy (sim_jobs; SIM_JOB_PERSIST_MODE=off is in-memory, as before).
+  jobStore: supabaseSimJobStore,
+  // Once per job: a resumed gate that already saved its run does not save it twice.
+  evalRunExists: async (jobId, since) => {
+    const { default: supabase } = await import('../supabase.js');
+    let q = supabase.from('system_events').select('id').eq('event_type', EVAL_RUN_EVENT).eq('payload->scorecard->>job_id', jobId);
+    if (since) q = q.gte('created_at', since);
+    const { data, error } = await q.limit(1);
+    if (error) throw new Error(error.message);
+    return (data || []).length > 0;
   },
   recordEvalRun: async (scorecard, comparison, runCards = null) => {
     const { emitEvent } = await import('../event-emitter.js');
@@ -130,15 +142,44 @@ export function parseSimRequest({ scenario = null, messages_json = null, channel
   return { ...(Object.keys(simModes).length ? { simModes } : {}), scenario: turns ? null : scenario, turns, persona, title, channel, nepqMode: nepq_mode, contactId: contact_id || null, leadStageMode: lead_stage_mode || null, kbExemplarMode: kb_exemplar_mode || null, includeRevinThread: revin, ...(runs != null && runs !== '' ? { runs: Number(runs) } : {}), turnLockMode: turn_lock_mode || null };
 }
 
-async function waitFor(job, seconds) {
+// 'interrupted' is a job between two deploys: it resumes, so it is still pending.
+const pending = (job) => job.status === 'running' || job.status === 'interrupted';
+
+async function waitFor(job, seconds, deps = null) {
   const until = Date.now() + Math.min(Math.max(0, seconds), 100) * 1000;
-  while (job.status === 'running' && Date.now() < until) await new Promise(r => setTimeout(r, 1000));
+  while (pending(job) && Date.now() < until) {
+    await new Promise(r => setTimeout(r, 1000));
+    // A job read from its saved row (after a deploy) is re-read; one in memory updates itself.
+    if (deps && job.from_store) job = (await findSimulationJob(job.id, deps).catch(() => null)) || job;
+  }
   return job;
+}
+
+/** What a deploy would interrupt, for the Railway tools' preview (2026-10-23). Never throws. */
+export async function simJobsDeployNote(deps = simulatorDeps) {
+  try {
+    const running = await listActiveSimJobs(deps);
+    if (!running.length) return { running_sim_jobs: [] };
+    const persisted = simJobPersistMode() === 'live' && running.every(j => j.persisted);
+    return {
+      running_sim_jobs: running.map(j => ({ id: j.id, kind: j.kind, status: j.status, pct_done: j.pct })),
+      sim_jobs_note: persisted
+        ? `${running.length} test run(s) will pause and resume after deploy.`
+        : `${running.length} test run(s) will be LOST on this deploy (SIM_JOB_PERSIST_MODE=off or not saved).`,
+    };
+  } catch (err) {
+    return { running_sim_jobs: null, sim_jobs_note: `could not read running test runs: ${String(err?.message || err).slice(0, 200)}` };
+  }
+}
+
+/** Boot (src/index.js): resume test runs a deploy interrupted. */
+export function startSimulatorResumer(deps = simulatorDeps) {
+  return startSimJobResumer(deps);
 }
 
 function render(job, format) {
   if (format === 'json') return text(job);
-  const head = `Simulation ${job.id}: ${job.status}${job.error ? ` (${job.error})` : ''} — ${job.results.length} conversation(s)${job.runs > 1 ? ` · run ${Math.min(job.runs, (job.runs_done || 0) + (job.status === 'running' ? 1 : 0))} of ${job.runs} (transcripts below are run 1)` : ''}`;
+  const head = `Simulation ${job.id}: ${job.status}${job.status === 'interrupted' ? ' (a deploy paused it; the next instance resumes it)' : ''}${job.resume_count ? ` · resumed ${job.resume_count}x` : ''}${job.error ? ` (${job.error})` : ''} — ${job.results.length} conversation(s)${job.runs > 1 ? ` · run ${Math.min(job.runs, (job.runs_done || 0) + (job.status === 'running' ? 1 : 0))} of ${job.runs} (transcripts below are run 1)` : ''}`;
   const card = job.scorecard ? [formatScorecard(job.scorecard, job.comparison || null) + (job.save_error ? `\n(${job.save_error})` : '')] : [];
   return text([head, ...card, ...job.results.map(formatTranscript)].join('\n\n'));
 }
@@ -176,7 +217,7 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       try { req = parseSimRequest(args); } catch (err) { return text({ error: err.message }); }
       const job = startSimulationJob(req, deps);
       if (args.wait_seconds) await waitFor(job, args.wait_seconds);
-      return job.status === 'running' ? text({ job_id: job.id, status: 'running', next: 'call get_bot_simulation with this job_id' }) : render(job, 'text');
+      return pending(job) ? text({ job_id: job.id, status: 'running', next: 'call get_bot_simulation with this job_id' }) : render(job, 'text');
     },
   );
 
@@ -222,9 +263,10 @@ export function registerSimulatorTools(server, deps = simulatorDeps) {
       wait_seconds: z.number().optional().describe('Wait up to this many seconds (max 100) for a running job.'),
     },
     async ({ job_id, format = 'text', wait_seconds = 0 }) => {
-      const job = getSimulationJob(job_id);
-      if (!job) return text({ error: `no simulation ${job_id} (jobs live in memory and are lost on a deploy)` });
-      if (wait_seconds) await waitFor(job, wait_seconds);
+      let job;
+      try { job = await findSimulationJob(job_id, deps); } catch (err) { return text({ error: `simulation ${job_id} unreadable: ${err.message}` }); }
+      if (!job) return text({ error: `no simulation ${job_id}${simJobPersistMode() === 'off' ? ' (SIM_JOB_PERSIST_MODE=off: jobs live in memory and are lost on a deploy)' : ''}` });
+      if (wait_seconds) job = await waitFor(job, wait_seconds, deps);
       return render(job, format);
     },
   );
@@ -259,10 +301,11 @@ export function registerSimulatorRoutes(app, deps = simulatorDeps) {
     const job = startSimulationJob({ ...parsed, gate: true }, deps);
     return res.status(202).json({ job_id: job.id, status_url: `/admin/bot-simulate/${job.id}` });
   });
-  app.get('/admin/bot-simulate/:id', (req, res) => {
+  app.get('/admin/bot-simulate/:id', async (req, res) => {
     if (!authed(req, res)) return;
-    const job = getSimulationJob(req.params.id);
-    if (!job) return res.status(404).json({ error: 'not found (jobs are in memory and lost on a deploy)' });
+    let job;
+    try { job = await findSimulationJob(req.params.id, deps); } catch (err) { return res.status(503).json({ error: `unreadable: ${err.message}` }); }
+    if (!job) return res.status(404).json({ error: 'not found' });
     if (req.query.format === 'text') return res.type('text/plain').send([`Simulation ${job.id}: ${job.status}`, ...(job.scorecard ? [formatScorecard(job.scorecard, job.comparison || null)] : []), ...job.results.map(formatTranscript)].join('\n\n'));
     return res.json(job);
   });
