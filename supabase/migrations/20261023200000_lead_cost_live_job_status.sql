@@ -18,19 +18,6 @@
 -- Mkt % stays total cost / net (LP 136's Mkt %).
 -- ROLLBACK: re-run the CREATE OR REPLACE VIEW in 20261023120000.
 
-CREATE OR REPLACE VIEW only appends): cc_issued =
--- issued leads set by a LightFire agent (the user, 2026-10-23: LightFire only,
--- because the Call Center line holds only LightFire Partners invoices). Same
--- rule as isLightFireLpSetter (src/batting-average.js): an "LF" tag on LP's
--- set_by_name ("Deer - LF, Craig", "Edwards-LF, Monique", "Clarke LF, ..."), or
--- the name on the ci_agent_map lightfire roster (older untagged "Deer, Craig").
--- The dashboard spreads Call Center cost across sources by it, in TypeScript.
---
--- NOT changed: mkt_sales_dollars() / mkt_sales_snapshot(). src/marketing/
--- commission.js computes the Canvass / MVP / referral commissions from them.
--- ROLLBACK: re-run the CREATE OR REPLACE VIEW in 20261012222106 after
--- DROP VIEW v_market_subsource_cost (it cannot drop the new column in place).
-
 CREATE OR REPLACE VIEW v_market_subsource_cost AS
 WITH alloc AS (
   SELECT a.id, a.expense_id, a.month, a.market, COALESCE(a.lp_sub_source, '(none)') AS lp_sub_source,
