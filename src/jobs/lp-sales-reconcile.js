@@ -134,15 +134,17 @@ export async function reconcileProspect(prospect, { dryRun, deps }) {
   return diff;
 }
 
-async function walkAll(fetch, idOf, label) {
+// Each page is reconciled as it arrives, so a pass a deploy cuts short has
+// still fixed everything it read (a full pass is ~20 minutes of LP paging).
+async function walkEach(fetch, idOf, label, onPage) {
   const walker = createPageWalker({ fetch, pageSize: PAGE_SIZE, idOf, label });
-  const out = [];
+  let pages = 0;
   for (;;) {
     const page = await walker.next(); // throws on a hard failure: a truncated list is not a complete one
     if (page.done) break;
-    out.push(...page.items);
+    await onPage(page.items);
+    if (++pages % 20 === 0) console.log(`${label} ${pages} pages read`);
   }
-  return out;
 }
 
 export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn = {}) {
@@ -187,22 +189,25 @@ export async function runSalesReconcile({ from, to, dryRun = true } = {}, depsIn
     }));
   };
 
-  // 1. Every lead LP lists as entered in the period (a week either side: LP's
-  //    date filter reads `dateentered`, LP 136 reads `entrydate`, and they differ).
-  const prospects = await walkAll(
+  // 1. Every lead LP lists as entered in the period. LP's date filter reads
+  //    `dateentered`, LP 136 reads `entrydate`; they differ by a day at most
+  //    (lead 571626: entered 8/31 15:10, entry date 9/1), so two days either side.
+  await walkEach(
     ({ PageSize, StartIndex }) => d.getLeads({
-      startdate: addDays(period.from, -7), enddate: addDays(period.to, 2), options: 0, PageSize, StartIndex,
+      startdate: addDays(period.from, -2), enddate: addDays(period.to, 2), options: 0, PageSize, StartIndex,
     }).then(extractArray),
     (r) => r?.cst_id ?? null, '[SalesReconcile:leads]',
+    async (items) => {
+      stats.lp_prospects += items.length;
+      for (const p of items) {
+        for (const l of getField(p, 'leads', 'Leads') || []) {
+          const ed = String(getField(l, 'entrydate', 'EntryDate') || '').slice(0, 10);
+          if (ed >= period.from && ed <= period.to) stats.lp_leads_in_period++;
+        }
+      }
+      await runPool(items, handle);
+    },
   );
-  stats.lp_prospects = prospects.length;
-  for (const p of prospects) {
-    for (const l of getField(p, 'leads', 'Leads') || []) {
-      const ed = String(getField(l, 'entrydate', 'EntryDate') || '').slice(0, 10);
-      if (ed >= period.from && ed <= period.to) stats.lp_leads_in_period++;
-    }
-  }
-  await runPool(prospects, handle);
 
   console.log(`[SalesReconcile] phase 1 (leads entered): ${JSON.stringify({ ...stats, samples: stats.samples.slice(0, 5) })}`);
 
