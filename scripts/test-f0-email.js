@@ -236,8 +236,11 @@ test('the rehash rep is the follower on the lead, else the custom value, else Re
   assert.equal(await resolveRehashRepFirst('c1', { env, deps: { getContact: async () => ({ followers: ['u2'] }), getCustomValue: async () => 'John Manieri' } }), 'Maria');
   assert.equal(await resolveRehashRepFirst('c1', { env, deps: { getContact: async () => ({ followers: [] }), getCustomValue: async () => 'John Manieri' } }), 'John');
   assert.equal(await resolveRehashRepFirst('c1', { env, deps: { getContact: async () => null, getCustomValue: async () => null } }), 'Reece Team');
-  // A follower with no configured name: the GHL user record.
-  assert.equal(await resolveRehashRepFirst('c1', { env, deps: { getContact: async () => ({ followers: ['u9'] }), getUserName: async () => 'Sam', getCustomValue: async () => 'John' } }), 'Sam');
+  // A team follower with no configured name: the GHL user record.
+  const env9 = { ...env, REHASH_TEAM_USER_IDS: `${env.REHASH_TEAM_USER_IDS},u9` };
+  assert.equal(await resolveRehashRepFirst('c1', { env: env9, deps: { getContact: async () => ({ followers: ['u9'] }), getUserName: async () => 'Sam', getCustomValue: async () => 'John' } }), 'Sam');
+  // A follower off the rehash team is never the rep (2026-10-23): the custom value.
+  assert.equal(await resolveRehashRepFirst('c1', { env, deps: { getContact: async () => ({ followers: ['u9'] }), getUserName: async () => 'Reece', getCustomValue: async () => 'John' } }), 'John');
 });
 
 const NOW = Date.parse('2026-10-21T01:00:00Z');

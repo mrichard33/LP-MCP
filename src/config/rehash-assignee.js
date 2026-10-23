@@ -58,8 +58,8 @@ export const ASSIGNED_TO_USER_FIELD_ID = '7YkTgCb9IXsoQWDsP50E';
  * rep a FOLLOWER and leaves the owner as the Reece team user, so the bot's sends
  * and a person's sends stay apart; a fixed John Manieri id here would ignore
  * whoever the workflow actually put on the lead.
- *   1. a follower on the contact (one on REHASH_TEAM_USER_IDS first, when several)
- *   2. the "Assigned To (User ID)" custom field
+ *   1. a follower on the contact (with `team`: only one on REHASH_TEAM_USER_IDS)
+ *   2. the "Assigned To (User ID)" custom field (with `team`: only a team member)
  *   3. null: the caller keeps its old default (the Rehash rep)
  * @param {object|null} contact  a GHL contact (followers, customFields)
  * @param {Set<string>} [team]   rehash team user ids, to rank several followers
@@ -69,10 +69,17 @@ export function rehashRepFor(contact, team = null) {
   const clean = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
   const followers = (Array.isArray(contact.followers) ? contact.followers : [])
     .map((f) => clean(typeof f === 'string' ? f : f?.id || f?.userId)).filter(Boolean);
-  if (followers.length) return followers.find((f) => team?.has(f)) || followers[0];
+  // With a team given, only a team member counts (2026-10-23): Mark Test's only
+  // follower was a "Reece …" GHL user, and the F.0 texts invited "a quick call
+  // with Reece". A non-team follower or field value falls through to null, so
+  // the caller keeps its default (the Rehash rep). No team: any follower, as before.
+  const onTeam = (id) => !team?.size || team.has(id);
+  const follower = followers.find((f) => team?.has(f)) || (team?.size ? null : followers[0]);
+  if (follower) return follower;
   const field = (Array.isArray(contact.customFields) ? contact.customFields : [])
     .find((f) => f?.id === ASSIGNED_TO_USER_FIELD_ID);
-  return clean(field?.value ?? field?.fieldValue);
+  const fieldId = clean(field?.value ?? field?.fieldValue);
+  return fieldId && onTeam(fieldId) ? fieldId : null;
 }
 
 /**

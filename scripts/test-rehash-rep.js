@@ -20,9 +20,12 @@ test('a follower on the lead is the rep', () => {
   assert.equal(rehashRepFor({ followers: ['repA'], assignedTo: AI_USER }), 'repA');
 });
 
-test('several followers: the one on the rehash team wins, else the first', () => {
+test('several followers: the one on the rehash team wins; with a team, never one off it', () => {
   assert.equal(rehashRepFor({ followers: ['sales1', 'repB'] }, new Set(['repB'])), 'repB');
-  assert.equal(rehashRepFor({ followers: ['sales1', 'repB'] }, new Set(['other'])), 'sales1');
+  // 2026-10-23: a follower off the rehash team is never the rep (Mark Test's "Reece …" follower).
+  assert.equal(rehashRepFor({ followers: ['sales1', 'repB'] }, new Set(['other'])), null);
+  assert.equal(rehashRepFor({ followers: ['sales1'], customFields: field(JOHN) }, new Set([JOHN])), JOHN);
+  assert.equal(rehashRepFor({ followers: [], customFields: field('sales1') }, new Set([JOHN])), null);
   assert.equal(rehashRepFor({ followers: [{ id: 'repC' }] }), 'repC');
 });
 
@@ -44,7 +47,7 @@ test('callAssigneeFor: a named assignee wins, then the rep on the lead, never on
 
 test('the calendar is read for the follower, and their first name comes from GHL', async () => {
   const seen = [];
-  const r = await readRehashCallSlots({ contactId: 'c1', timezone: 'America/New_York', env: { REHASH_CALENDAR_ID: 'cal' } }, {
+  const r = await readRehashCallSlots({ contactId: 'c1', timezone: 'America/New_York', env: { REHASH_CALENDAR_ID: 'cal', REHASH_TEAM_USER_IDS: `${JOHN},repA` } }, {
     getContact: async () => ({ followers: ['repA'], assignedTo: AI_USER }),
     getUserName: async (id) => (id === 'repA' ? 'Dana' : null),
     fetchFreeSlots: async (_cal, o) => { seen.push(o.userId); return { slots: [{ iso: '2026-10-16T14:00:00Z' }, { iso: '2026-10-16T15:00:00Z' }] }; },
@@ -54,6 +57,19 @@ test('the calendar is read for the follower, and their first name comes from GHL
   assert.deepEqual(seen, ['repA']);
   assert.equal(r.rep, 'repA');
   assert.equal(r.repName, 'Dana');
+});
+
+test('a rep off the rehash team is never read: the calendar is John\'s (2026-10-23)', async () => {
+  // 24 rehash contacts carried the Reece Team user in "Assigned To (User ID)".
+  const seen = [];
+  await readRehashCallSlots({ contactId: 'c1', timezone: 'America/New_York', env: { REHASH_CALENDAR_ID: 'cal' } }, {
+    getContact: async () => ({ followers: [], customFields: field(AI_USER) }),
+    getUserName: async () => 'Reece',
+    fetchFreeSlots: async (_cal, o) => { seen.push(o.userId); return { slots: [] }; },
+    selectOfferableSlots: (av) => ({ slots: av.slots }),
+    isOpen: () => true,
+  });
+  assert.deepEqual(seen, [JOHN]);
 });
 
 test('ghlUserFirstName: first word of the name, null on a failed read, never throws', async () => {
@@ -67,7 +83,7 @@ test('the follow-up task goes to the rep on the lead, else the rehash team defau
   assert.equal(followUpTask({ label: 'in November', untilIso: '2026-11-02T14:00:00Z' }, {}).assignedTo, JOHN);
   const posted = [];
   await filePostDemoFollowUp({ contactId: 'c1', deferral: { untilIso: '2026-11-02T14:00:00Z', label: 'in November' } }, {
-    env: {}, log: () => {},
+    env: { REHASH_TEAM_USER_IDS: `${JOHN},repF` }, log: () => {},
     getContact: async () => ({ followers: [], customFields: field('repF') }),
     ghlFetch: async (m, path, body) => { if (path.endsWith('/tasks')) posted.push(body); return {}; },
     applyGHLTag: async () => {}, addGHLNote: async () => {},

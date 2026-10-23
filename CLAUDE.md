@@ -649,7 +649,7 @@ owner when that owner is on the rehash team (`REHASH_TEAM_USER_IDS`), else the R
 named (`callAssigneeFor`, `src/config/rehash-assignee.js`).
 **The rehash rep is the follower on the lead (the user, 2026-10-15).** GHL's rehash workflow now adds the rep as a
 FOLLOWER (the owner stays the Reece team user) and removes them after 30 days itself. `rehashRepFor` (`rehash-assignee.js`):
-a follower (one on `REHASH_TEAM_USER_IDS` first) → the "Assigned To (User ID)" field (`7YkTgCb9IXsoQWDsP50E`; the live
+a follower on `REHASH_TEAM_USER_IDS` (never one off it, 2026-10-23) → the "Assigned To (User ID)" field (same rule) (`7YkTgCb9IXsoQWDsP50E`; the live
 rehash contact had no `followers` in the API but this field set) → null, and the caller keeps John Manieri as the
 default. It picks the Rehash Call assignee, the calendar read (`readRehashCallSlots`, first name from GHL's user record
 when `REHASH_TEAM_USER_NAMES` has none) and the post-demo follow-up task. `release_rehash_owner` now normally does nothing.
@@ -917,8 +917,12 @@ Seven rulings. Each change is behind its own flag in `src/mode-registry.js`; the
   the team's and the texts John's ("If I could …", "- John"), so one conversation came from two senders and the bot read
   as John while John texted the lead himself. Team = version-3 rows (`F.0-P[1-5]-<variant>-V3`, variant_label
   `four-step-team`, `sql/seeds/2026-10-23_f0_v2_four_step_team_voice.sql`, seeded INACTIVE): "we", never "I"; the call
-  is with `{{siro.call_with}}` (the follower first, else the custom value, else "our team"); position 5 signs
-  " - Reece Team". `f0FormulaAllows`: four_step + team reads version 3, rep version 2, v1 neither. `checkF0Copy`
+  is with `{{siro.call_with}}` (the email's rep: the custom value first, else a rehash-team follower, else "our team");
+  position 5 signs " - Reece Team". **One rep name, never "Reece" (2026-10-23).** Mark Test's preview invited "a quick
+  call with Reece": its only follower was a "Reece …" user, and `rehashRepFor` took any follower when none was on the
+  team. With a team set it now takes only a `REHASH_TEAM_USER_IDS` follower or field value (24 rehash contacts carried
+  the Reece Team user in "Assigned To (User ID)"), else null and the caller's default (John); `cleanRepFirst` reads
+  "Reece" as no name; team texts read `resolveEmailRepFirst`, like the email. `f0FormulaAllows`: four_step + team reads version 3, rep version 2, v1 neither. `checkF0Copy`
   formula 'four_step' voice 'team' fails `first_person`, `signed_as_person`, `signature_in_body`, `call_names_other`
   and, at position 5, `missing_signature`. Go-live: activate the V3 rows (the UPDATE in the seed's header) with the
   `F0_FORMULA_MODE=four_step` flip. Rollback: `F0_TEXT_VOICE=rep`.

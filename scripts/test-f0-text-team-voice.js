@@ -134,15 +134,27 @@ const deps = ({ customValue = null, followers = [] } = {}) => ({
   readSiroRows: async () => [ROW], getCustomValue: async () => customValue, getContact: async () => ({ followers }), ensureRecordingForLead: async () => 'none',
 });
 
-test('loadF0Context: a Four-Step text in team voice calls with the follower, else the custom value, else "our team"', async () => {
-  const follower = await loadF0Context(CONTEXT, REQ, { env: ENV, nowMs: NOW, deps: deps({ customValue: 'John', followers: ['u2'] }) });
-  assert.equal(follower.vars.text_voice, 'team');
+test('loadF0Context: a Four-Step text in team voice calls with the email\'s rep: the custom value, else a rehash-team follower, else "our team"', async () => {
+  const both = await loadF0Context(CONTEXT, REQ, { env: ENV, nowMs: NOW, deps: deps({ customValue: 'John', followers: ['u2'] }) });
+  assert.equal(both.vars.text_voice, 'team');
+  assert.equal(both.vars.call_with, 'John');
+  const follower = await loadF0Context(CONTEXT, REQ, { env: ENV, nowMs: NOW, deps: deps({ followers: ['u2'] }) });
   assert.equal(follower.vars.call_with, 'Maria');
   const value = await loadF0Context(CONTEXT, REQ, { env: ENV, nowMs: NOW, deps: deps({ customValue: 'John' }) });
   assert.equal(value.vars.call_with, 'John');
   const none = await loadF0Context(CONTEXT, REQ, { env: ENV, nowMs: NOW, deps: deps() });
   assert.equal(none.vars.call_with, 'our team');
   assert.doesNotMatch(JSON.stringify(none.vars.call_with), /\{\{|Reece Team/);
+});
+
+test('loadF0Context: never "a quick call with Reece" (Mark Test, 2026-10-23)', async () => {
+  // Mark Test's only follower was a "Reece …" GHL user, off the rehash team.
+  const offTeam = await loadF0Context(CONTEXT, REQ, { env: ENV, nowMs: NOW, deps: { ...deps({ customValue: 'John', followers: ['reeceUser'] }), getUserName: async () => 'Reece' } });
+  assert.equal(offTeam.vars.call_with, 'John');
+  const noValue = await loadF0Context(CONTEXT, REQ, { env: ENV, nowMs: NOW, deps: { ...deps({ followers: ['reeceUser'] }), getUserName: async () => 'Reece' } });
+  assert.equal(noValue.vars.call_with, 'our team');
+  const reeceValue = await loadF0Context(CONTEXT, REQ, { env: ENV, nowMs: NOW, deps: deps({ customValue: 'Reece' }) });
+  assert.equal(reeceValue.vars.call_with, 'our team');
 });
 
 test('loadF0Context: rep voice and the v1 formula carry no text voice', async () => {
