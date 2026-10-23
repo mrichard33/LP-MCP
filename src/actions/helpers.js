@@ -75,7 +75,9 @@ export async function ghlFetch(method, path, body = null, rateOpts = {}) {
     method,
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
-      'Version': '2021-07-28',
+      // 2026-10-23: an endpoint that only takes another API version (the
+      // appointment notes take 2021-04-15) passes rateOpts.version.
+      'Version': rateOpts.version || '2021-07-28',
       'Content-Type': 'application/json',
       'Accept': 'application/json',
     },

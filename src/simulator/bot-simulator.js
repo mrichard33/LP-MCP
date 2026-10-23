@@ -37,6 +37,7 @@ import { humanTakeoverMode, takeoverDecision } from '../agentic/human-takeover.j
 import { rehashDealHintMode } from '../agentic/rehash-nepq.js';
 import { rehashBookingFix, rehashBetterPrice } from '../agentic/rehash-flags.js';
 import { rehashOwned, rehashOwnedMode, ownedDecision } from '../agentic/rehash-owned.js';
+import { rehashOwnedAnswerMode } from '../agentic/rehash-owned-answer.js';
 import { rehashPauseMode, pauseDecision, pauseOutcome } from '../agentic/rehash-pause.js';
 import { conversationComplete } from '../agentic/conversation-complete.js';
 import { rehashTeamUserIds } from '../agentic/rehash-state.js';
@@ -368,6 +369,11 @@ export const SCENARIOS = Object.freeze({
   rehash_paused_after_manual: { title: 'Rehash: John texts by hand, the lead closes ("see you tomorrow"): the bot stays out', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I have a question about the proposal', { manual: 'Jim this is John. We can come by tomorrow at 10am to go over the price, does that work?', team: true }, 'Sounds good, see you tomorrow'] },
   rehash_pause_open_question: { title: 'Rehash: John texts by hand, the lead asks "what time again?": the bot answers after the pause', family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I have a question about the proposal', { manual: 'Jim this is John. We can come by tomorrow to go over the price.', team: true }, 'What time again?'] },
   rehash_owned_after_booking: { title: 'Rehash: a lead John owns (rehash-owned) gets no bot message', family: 'rehash', persona: REHASH_OWNED_LEAD, channels: ['sms'], turns: ['Any update on the price?'] },
+  // 2026-10-23 (Mark, Kim Turko review): after the Rehash Call is booked the bot
+  // answers a direct question briefly and stops; her email-only reply gets nothing.
+  rehash_owned_direct_question: { title: 'Rehash: an owned lead\'s direct question gets a short answer, no question back', family: 'rehash', persona: REHASH_OWNED_LEAD, channels: ['sms'], turns: ['What does the warranty cover?'] },
+  rehash_owned_email_only: { title: 'Rehash: an owned lead who sends only an email address gets no reply (Kim Turko)', family: 'rehash', persona: REHASH_OWNED_LEAD, channels: ['sms'], turns: ['Turkokim@gmail.com'] },
+  rehash_owned_change_request: { title: 'Rehash: an owned lead who asks to move the call is told John will know', family: 'rehash', persona: REHASH_OWNED_LEAD, channels: ['sms'], turns: ['can we move it to 2?'] },
   // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
   rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', family: 'rehash', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
@@ -553,7 +559,7 @@ export async function simulateLiveChat(plan, { nepqMode = 'live', productionDeps
  * The send handler's side effects are reported from the generator's flags
  * (hand-off, booking companion), never run.
  */
-export async function simulateSms(plan, { nepqMode = 'live', generate, buildRealContext = null, nowMs = Date.now(), maxAttempts = 2, leadStageMode: stageModeOverride = null, turnLockMode: lockModeOverride = null } = {}) {
+export async function simulateSms(plan, { nepqMode = 'live', generate, buildRealContext = null, nowMs = Date.now(), maxAttempts = 2, leadStageMode: stageModeOverride = null, turnLockMode: lockModeOverride = null, ownedAnswer = null } = {}) {
   const contactId = plan.contactId || `${SIM_CONTACT_PREFIX}sms-${plan.key}-${nowMs}`;
   // A real contact's record, read once (dry run: nothing is written to it).
   const realBase = plan.contactId && buildRealContext ? await buildRealContext(plan.contactId) : null;
@@ -629,6 +635,24 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     // memory. A held turn assumes the 15 quiet minutes pass, unless the script's
     // next item is another team message (that one restarts the pause).
     const gate = simRehashGate({ p, thread, teamManuals, inboundAt: at, nextIsTeamManual: !!queue[0]?.team, rehashCallBooked: simRehashCallBooked });
+    // 2026-10-23 (Mark, Kim Turko review): an owned lead's direct question gets
+    // the answer-only reply (rehash-owned-answer.js), a move or cancel request
+    // the one line for John; anything else stays skipped. No Slack card here.
+    if (gate.skip && gate.reason === 'rehash_owned' && rehashOwnedAnswerMode() === 'live') {
+      const t0a = Date.now();
+      const answered = await (ownedAnswer || simOwnedAnswer)({ contactId, text, thread: thread.slice(0, -1), nowMs: Date.parse(at) });
+      if (answered) {
+        thread.push({ direction: 'outbound', channel: 'sms', text: answered.message, type: 'text', timestamp: new Date(Date.parse(at) + 30000).toISOString() });
+        if (claim.claimed === true) await releaseTurn({ contactId, turnKey, ownerActionId: `sim-${i}`, outcome: 'sent' }, lockDeps);
+        transcript.push({
+          turn: i + 1, customer: text, bot: [answered.message], error: null, intent: null, nepq: null, stage: null,
+          would_do: answered.kind === 'change_request' ? [{ kind: 'would_post_rehash_change_card', reason: 'move_or_cancel' }] : [],
+          seconds: Math.round((Date.now() - t0a) / 100) / 10, rehash_gate: { ...gate, decision: 'answer_only', skip: false, answer_only: answered.kind },
+          turn_lock: { mode: lockMode, key: turnKey, claimed: claim.claimed },
+        });
+        continue;
+      }
+    }
     if (gate.skip) {
       if (claim.claimed === true) await releaseTurn({ contactId, turnKey, ownerActionId: `sim-${i}`, outcome: gate.reason }, lockDeps);
       transcript.push({ turn: i + 1, customer: text, bot: null, error: null, intent: null, nepq: null, would_do: [], stage: null, seconds: 0, rehash_gate: gate, turn_lock: { mode: lockMode, key: turnKey, claimed: claim.claimed } });
@@ -728,8 +752,22 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     rehash_booking_fix: rehashBookingFix() ? 'on' : 'off', rehash_better_price: rehashBetterPrice() ? 'on' : 'off',
     // 2026-10-21: rehash pause + ownership + voice.
     rehash_owned_mode: rehashOwnedMode(), rehash_pause_mode: rehashPauseMode(), rehash_voice_mode: rehashVoiceMode(),
+    rehash_owned_answer_mode: rehashOwnedAnswerMode(),
     transcript,
   };
+}
+
+/**
+ * The send handler's answer-only reply for an owned lead (2026-10-23), with the
+ * real classifier and writer and NO Slack card. null = the turn stays skipped.
+ */
+async function simOwnedAnswer({ contactId, text, thread, nowMs }) {
+  const { classifyOwnedQuestion, writeOwnedAnswer } = await import('../services/rehash-owned-answer-io.js');
+  const cls = await classifyOwnedQuestion(text);
+  if (cls.kind !== 'question' && cls.kind !== 'change_request') return null;
+  return writeOwnedAnswer({ contactId, text, kind: cls.kind, rep: 'John', thread, nowMs }, {
+    notifyChange: async () => ({ posted: false, reason: 'simulated' }),
+  });
 }
 
 /**

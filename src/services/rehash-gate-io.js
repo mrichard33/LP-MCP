@@ -35,6 +35,8 @@ import {
   conversationComplete, readModelVerdict, COMPLETION_SYSTEM, completionPrompt,
 } from '../agentic/conversation-complete.js';
 import { manualOutbounds, readOurSends } from './human-takeover-io.js';
+import { rehashOwnedAnswerMode } from '../agentic/rehash-owned-answer.js';
+import { classifyOwnedQuestion } from './rehash-owned-answer-io.js';
 
 const NOT_A_CONVERSATION = new Set(['workflow', 'bulk_actions', 'campaign']);
 
@@ -109,11 +111,26 @@ export function inRehash({ tags, fromNumber, currentLead, env = process.env, now
 /**
  * One verdict for one send to a contact.
  * @param {{ contactId, actionId?, channel?, tags?: string[]|null, fromNumber?, inboundAt?: string|null,
- *           proactive?: boolean, priorPause?: object|null, nowMs?: number, env? }} a
+ *           proactive?: boolean, priorPause?: object|null, nowMs?: number, env?,
+ *           inboundText?: string|null, answerable?: boolean }} a
+ *   answerable: this send is an AI-written reply to the lead's own inbound
+ *   (`inboundText`), so an owned lead's direct question may be answered.
  * @returns {Promise<{ verdict: 'send'|'skip'|'hold', reason?, retryAt?, pause?, shadow?: object,
- *                     rehash?: boolean, owned?: object, firedPause?: object }>}
+ *                     rehash?: boolean, owned?: object, firedPause?: object,
+ *                     answerOnly?: { kind: 'question'|'change_request', reason: string, by: string } }>}
  */
 export async function runRehashGate(a = {}, deps = {}) {
+  const out = await runRehashGateInner(a, deps);
+  // 2026-10-23: an owned lead's direct question goes out only when the pause
+  // (below the ownership check) also said send.
+  if (out?.answerOnlyPending) {
+    const { answerOnlyPending, ...rest } = out;
+    return rest.verdict === 'send' ? { ...rest, answerOnly: answerOnlyPending } : rest;
+  }
+  return out;
+}
+
+async function runRehashGateInner(a = {}, deps = {}) {
   const env = a.env || process.env;
   const nowMs = a.nowMs || Date.now();
   const ownedMode = rehashOwnedMode(env);
@@ -135,6 +152,7 @@ export async function runRehashGate(a = {}, deps = {}) {
   const rehash = inRehash({ tags: a.tags ?? null, fromNumber: a.fromNumber || null, currentLead, env, nowMs });
   if (rehash !== true) return { verdict: 'send', rehash };
   const shadow = {};
+  let answerOnlyPending = null;
 
   // ── A. John owns the lead ───────────────────────────────────────
   if (ownedMode !== 'off') {
@@ -146,13 +164,35 @@ export async function runRehashGate(a = {}, deps = {}) {
     if (decision !== 'send') {
       const payload = { reason: owned.reason, detail: owned.detail || null, message_id: a.messageId || null, channel: a.channel || null };
       if (decision === 'skip') {
-        log(`[RehashOwned] ⏭️ ${contactId} action ${a.actionId}: owned (${owned.reason}) — no bot message`);
-        emit('rehash.owned_skip', payload, `rehash_owned_skip_${a.actionId ?? contactId}`);
-        return { verdict: 'skip', reason: REHASH_OWNED_SKIP_REASON, rehash, owned };
+        // 2026-10-23 (Mark, Kim Turko review): nothing proactive, but the lead's
+        // own direct question gets a short answer, and a move or cancel request
+        // gets one line for John (src/agentic/rehash-owned-answer.js).
+        const answerMode = rehashOwnedAnswerMode(env);
+        if (answerMode !== 'off' && a.answerable && !a.proactive && String(a.inboundText || '').trim()) {
+          const cls = await (d.classifyOwnedQuestion || classifyOwnedQuestion)(a.inboundText);
+          if (cls.kind === 'question' || cls.kind === 'change_request') {
+            if (answerMode === 'live') {
+              log(`[RehashOwned] 💬 ${contactId} action ${a.actionId}: owned (${owned.reason}) — answer only (${cls.kind}, ${cls.reason})`);
+              emit('rehash.owned_answer_only', { ...payload, kind: cls.kind, classified_by: cls.by, classify_reason: cls.reason }, `rehash_owned_answer_only_${a.actionId ?? contactId}`);
+              answerOnlyPending = { kind: cls.kind, reason: cls.reason, by: cls.by };
+            } else {
+              log(`[RehashOwned] shadow: ${contactId} action ${a.actionId}: owned — live would answer only (${cls.kind}); nothing sent`);
+              payload.would_answer_only = cls.kind;
+            }
+          } else {
+            payload.not_answered = cls.reason;
+          }
+        }
+        if (!answerOnlyPending) {
+          log(`[RehashOwned] ⏭️ ${contactId} action ${a.actionId}: owned (${owned.reason}) — no bot message`);
+          emit('rehash.owned_skip', payload, `rehash_owned_skip_${a.actionId ?? contactId}`);
+          return { verdict: 'skip', reason: REHASH_OWNED_SKIP_REASON, rehash, owned };
+        }
+      } else {
+        log(`[RehashOwned] shadow: ${contactId} action ${a.actionId}: owned (${owned.reason}); live would send nothing`);
+        emit('rehash.owned_would_skip', payload, `rehash_owned_would_skip_${a.actionId ?? contactId}`);
+        shadow.rehash_owned_would_skip = { reason: owned.reason };
       }
-      log(`[RehashOwned] shadow: ${contactId} action ${a.actionId}: owned (${owned.reason}); live would send nothing`);
-      emit('rehash.owned_would_skip', payload, `rehash_owned_would_skip_${a.actionId ?? contactId}`);
-      shadow.rehash_owned_would_skip = { reason: owned.reason };
     }
   }
 
@@ -196,13 +236,14 @@ export async function runRehashGate(a = {}, deps = {}) {
           if (prior) emit('rehash.pause_fired', { ...evPayload, outcome: reason, reason }, `rehash_pause_fired_${a.actionId ?? contactId}`);
           return { verdict: 'skip', reason, rehash, pause };
         } else if (outcome === 'fire') {
-          return await firePause({ a, d, supabase, log, emit, contactId, teamUserIds, pause, evPayload, shadow, rehash,
+          const fired = await firePause({ a, d, supabase, log, emit, contactId, teamUserIds, pause, evPayload, shadow, rehash,
             answeredSinceMs: Number.isFinite(inboundMs) ? inboundMs : Date.parse(pause.started_at) });
+          return answerOnlyPending ? { ...fired, answerOnlyPending } : fired;
         }
       }
     }
   }
-  return { verdict: 'send', rehash, ...(Object.keys(shadow).length ? { shadow } : {}) };
+  return { verdict: 'send', rehash, ...(Object.keys(shadow).length ? { shadow } : {}), ...(answerOnlyPending ? { answerOnlyPending } : {}) };
 }
 
 /** The pause ran out with no newer team message: read the thread once. */

@@ -38,6 +38,7 @@
  */
 
 import { isPlaceholderName, cleanDisplayName } from '../services/identity-extraction.js';
+import { isRehashCallTitle } from './rehash-call-format.js';
 
 /**
  * Calendar ID → the name to put in an appointment title.
@@ -156,13 +157,18 @@ export function applyAppointmentFormat(body, contact = {}) {
     return { title: body?.title || null, addressPopulated: false };
   }
 
-  const title = buildAppointmentTitle({
-    firstName: contact.firstName,
-    lastName: contact.lastName,
-    calendarId: body?.calendarId,
-    calendarName: body?.title,
-  });
-  if (title) body.title = title;
+  // 2026-10-23 (Kim Turko): a Rehash Call's title already carries the name
+  // ("Reece Best-Offer Call: Kim Turko"). Prepending it again made
+  // "Kim Turko - Rehash Call - Kim Turko". Leave that title alone.
+  if (!isRehashCallTitle(body?.title)) {
+    const title = buildAppointmentTitle({
+      firstName: contact.firstName,
+      lastName: contact.lastName,
+      calendarId: body?.calendarId,
+      calendarName: body?.title,
+    });
+    if (title) body.title = title;
+  }
 
   const address = buildAppointmentAddress(contact);
   if (address) body.address = address;

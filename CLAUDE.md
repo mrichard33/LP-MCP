@@ -1044,6 +1044,37 @@ queued a send after John set DND; every bot text was credited in GHL to John. Ma
   turn), `rehash_price_compare_any_attempt`. Rollback, one variable each: `REHASH_PAUSE_MODE=off`, `REHASH_OWNED_MODE=off`,
   `REHASH_VOICE_MODE=rep`.
 
+## Rehash Call booking fixes (Mark, 2026-10-23; Kim Turko review)
+
+Kim Turko (fnGjYEvok31f46ZmnZQW) booked a Rehash Call with the bot and then got the post-booking email ask and, after a
+reply with only her email, "Where are you at with it?"; both were `rehash.owned_would_skip` (REHASH_OWNED_MODE shadow).
+Her appointment read "Kim Turko - Rehash Call - Kim Turko", status new, no note. Now, each behind its own switch:
+- **An owned lead gets answers to direct questions only (`REHASH_OWNED_ANSWER_MODE` off|shadow|live, default shadow;
+  needs `REHASH_OWNED_MODE=live`).** In `runRehashGate`, an owned skip becomes `answerOnly` only for an AI-written reply
+  to the lead's own text (`answerable`; a rule's fixed text such as the email ask is proactive and stays skipped).
+  `classifyOwnedInbound` (`src/agentic/rehash-owned-answer.js`, the ONE home of these rules): a move/cancel →
+  `change_request` ("Got it, I'll let John know." + 🔁 card in #contact-rehash, `notifyRehashChangeRequest`); "?" or a
+  question form → `question`; email/phone only or a thank-you → nothing; else one `owned_direct_question` model call,
+  failing closed. The send handler writes the reply (`writeOwnedAnswerForSend`: our FAQ answers, `finishOwnedAnswer`
+  drops any "?", time, day or call to action, max 2 sentences + "John will cover the rest on your call.") and sends it
+  as a provided message, so no companion rides on it. John's 15-minute pause still holds it. Live chat keeps the plain
+  skip. Events `rehash.owned_answer_only` / `rehash.owned_skip` (`would_answer_only` in shadow).
+- **No post-booking email ask after a Rehash Call** (`post_booking_email_ask_skipped_rehash`).
+- **Title `Reece Best-Offer Call: {First Last}`** (`REHASH_CALL_TITLE_MODE`, default on; `rehash-call-format.js`); the
+  formatter leaves it alone (`isRehashCallTitle`). The calendar's NAME stays "Rehash Call" everywhere else.
+- **Created confirmed** (`REHASH_CALL_AUTO_CONFIRM`, default on): the one exception to the 2026-08-15 "born new" rule
+  (`creationStatus` in `buildAppointmentBody`, and after the Confirmation Call → Rehash Call move). In-place moves never
+  touch status.
+- **Internal rep note** (`REHASH_CALL_NOTES_MODE` off|shadow|live, default live): after the read-back,
+  `writeRehashCallNote` (`src/services/rehash-call-note-io.js`, pure shape in `src/appointments/rehash-call-note.js`)
+  posts `POST /calendars/appointments/{id}/notes` (API version 2021-04-15, `ghlFetch(…, { version })`), first line
+  "Booked by Reece Chatbot" (GHL cannot set Booked By), under 700 characters, model fills only what the thread says;
+  a refusal falls back to a contact note named for the appointment. Never the description (the lead sees it).
+- Calendar description: `scripts/set-rehash-calendar-description.js` (dry run; `--apply` writes `PUT /calendars/{id}`).
+Gate: `rehash_owned_answer_mode`; scenarios `rehash_owned_direct_question`, `rehash_owned_email_only`,
+`rehash_owned_change_request` (`SCORING_VERSION` 2026-10-23.1). Tests: `scripts/test-rehash-owned.js`,
+`scripts/test-rehash-call-booking.js`.
+
 ## Revin: every text it sends or receives, one thread per contact (2026-10-19)
 
 Until now all we kept of Revin AI's texting was its ~160-character LP summary note (`note_origin = 'lp_revin'`, still

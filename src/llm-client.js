@@ -103,6 +103,11 @@ const FUNCTION_GROUPS = {
   // 2026-10-21 (rehash pause): "is anything left to answer?" after a rehash
   // rep's manual texts. Analysis, never customer text; one yes/no JSON.
   conversation_complete: 'decision_engine', // src/agentic/conversation-complete.js
+  // 2026-10-23 (Kim Turko): "is this a direct question?" for a rehash lead John
+  // owns, only when the words decide nothing. One yes/no JSON, never customer text.
+  owned_direct_question: 'decision_engine', // src/services/rehash-owned-answer-io.js
+  // 2026-10-23: the internal note on a Rehash Call for the rep. Never a customer.
+  rehash_call_note: 'decision_engine',    // src/services/rehash-call-note-io.js
   message_score: 'decision_engine',      // src/message-content-scorer.js (legacy MESSAGE_SCORE_MODEL)
   intent_classifier: 'decision_engine',  // src/knowledge/intent-classifier.js
   // Call Intelligence — structured extraction from a call transcript.
@@ -155,6 +160,7 @@ const FUNCTION_GROUPS = {
   nurture_generator: 'customer_facing',  // src/nurture/nurture-generator.js
   agentic_callback: 'customer_facing',   // src/agentic-callback-message.js
   follow_up_checkin: 'customer_facing',  // src/agentic/follow-up-checkin.js (2026-10-16)
+  owned_answer: 'customer_facing',       // src/agentic/rehash-owned-answer.js (2026-10-23)
   appt_notification: 'customer_facing',  // src/notifications/appointment-body-generator.js (legacy APPT_NOTIFICATION_MODEL)
   cancellation_body: 'customer_facing',  // src/notifications/cancellation-body-generator.js
   // Sales-board announcement. Not a customer message, but it is read by the

@@ -110,6 +110,7 @@ import supabase from '../../supabase.js';
 import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appointment-field-sync.js';
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../../appointments/slot-check.js';
 import { applyAppointmentFormatForContact } from '../../appointments/format-contact.js';
+import { creationStatus, rehashCallTitle, rehashCallTitleOn, rehashCallNotesMode } from '../../appointments/rehash-call-format.js';
 import { claimAppointmentCreate, releaseAppointmentCreate } from '../../services/appointment-sync-claim.js';
 import { buildApptEventIdempotencyKey } from '../../services/appt-event-dedup.js';
 import { recordBookedStage } from '../../services/lead-stage-io.js';
@@ -551,10 +552,16 @@ function buildAppointmentBody(payload, contactId) {
   // decision_makers_present ∈ {Yes, Solo Owner}. Before this, a model-authored
   // companion could assert 'confirmed' on a booking whose existence had never
   // been verified (contact gUihunGyOa6SiGbJCJ3K, action 320924).
+  //
+  // 2026-10-23 (Mark, Kim Turko review) — the ONE exception: a Rehash Call is
+  // born 'confirmed' (REHASH_CALL_AUTO_CONFIRM, default on). It is a phone call
+  // with the rehash rep, so there is no decision-maker gate to wait on, and a
+  // "new" call sat on John's calendar looking unconfirmed. A caller's own
+  // status is still ignored: the calendar decides, never the payload.
   const requestedStatus = payload.status || 'new';
-  const status = 'new';
-  if (requestedStatus !== 'new') {
-    console.warn(`[ActionExecutor] appointment status forced to 'new' at creation (requested '${requestedStatus}') — confirmation is a separate transition.`);
+  const status = creationStatus({ isRehashCall: isRehashCalendarId(calendarId) });
+  if (requestedStatus !== status && requestedStatus !== 'new') {
+    console.warn(`[ActionExecutor] appointment status forced to '${status}' at creation (requested '${requestedStatus}') — confirmation is a separate transition.`);
   }
   const assignedUserId = payload.assigned_user_id || null;
   const ignoreFreeSlotValidation = !!payload.ignore_free_slot_validation;
@@ -691,6 +698,9 @@ export async function executeBookAppointment(action, context) {
       console.log(`[ActionExecutor] ↪️ ${contactId} is in rehash — call moved from Confirmation Call to Rehash Call (${rehashCal})`);
       calendarId = rehashCal;
       body.calendarId = rehashCal;
+      // 2026-10-23: the move makes it a Rehash Call, born confirmed.
+      status = creationStatus({ isRehashCall: true });
+      body.appointmentStatus = status;
     } else if (!isRehashCalendarId(calendarId)) {
       const reason = isGhlOnlyCalendarId(calendarId) ? 'skipped_rehash_no_calendar' : 'skipped_rehash_visit';
       console.log(`[ActionExecutor] ⛔ ${reason}: ${contactId} is in rehash — nothing booked on ${calendarId}`);
@@ -994,7 +1004,11 @@ export async function executeBookAppointment(action, context) {
     const calName = payload.calendar_name
       || Object.keys(CALENDAR_MAP).find((n) => CALENDAR_MAP[n] === calendarId)
       || 'Appointment';
-    body.title = ghlName ? `${calName} - ${ghlName}` : calName;
+    // 2026-10-23 (Mark): a Rehash Call reads "Reece Best-Offer Call: {name}".
+    // The calendar keeps its name "Rehash Call" everywhere else.
+    body.title = isRehashCalendarId(calendarId) && rehashCallTitleOn()
+      ? rehashCallTitle(ghlName)
+      : (ghlName ? `${calName} - ${ghlName}` : calName);
     if (!ghlName) {
       console.warn(`[ActionExecutor] appointment title: contact ${contactId} has no name on the GHL record — using calendar name alone rather than a payload-supplied name.`);
     }
@@ -1251,7 +1265,23 @@ export async function executeBookAppointment(action, context) {
 
   // v1.1 (2026-07-24 Engelke incident) — sequence the email ask to its own
   // message AFTER the booking lands. Idempotent + best-effort; never blocks.
-  await enqueuePostBookingEmailAsk(contactId, action, context);
+  // 2026-10-23 (Mark, Kim Turko review): never after a Rehash Call. John owns
+  // the lead once the call is booked, and the bot sends nothing proactive.
+  if (isRehashCalendarId(calendarId)) {
+    console.log(`[ActionExecutor] post_booking_email_ask_skipped_rehash: ${contactId} (appt ${appointmentId})`);
+  } else {
+    await enqueuePostBookingEmailAsk(contactId, action, context);
+  }
+
+  // 2026-10-23 (Mark): the rep's internal note on a Rehash Call — who booked it
+  // and a short summary of the conversation. Fire-and-forget after the
+  // read-back: it never blocks or fails the booking, and it is an appointment
+  // NOTE (internal), never the description, which the lead can see.
+  if (isRehashCalendarId(calendarId) && rehashCallNotesMode() !== 'off') {
+    trackBackground(import('../../services/rehash-call-note-io.js')
+      .then(({ writeRehashCallNote }) => writeRehashCallNote({ contactId, appointmentId, startTime, mode: rehashCallNotesMode() }))
+      .catch((err) => console.warn(`[ActionExecutor] rehash call note failed for ${contactId} (fail-soft): ${err.message}`)));
+  }
 
   return {
     action: 'appointment_booked',

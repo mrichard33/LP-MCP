@@ -22,6 +22,7 @@
 import { rehashCalendarId } from '../knowledge/booking-calendar-router.js';
 import { callAssigneeFor, rehashRepFor } from '../config/rehash-assignee.js';
 import { rehashTeamUserIds } from './rehash-state.js';
+import { creationStatus, rehashCallTitle } from '../appointments/rehash-call-format.js';
 
 export const REHASH_CALL_SLOT_MODES = Object.freeze(['off', 'shadow', 'live']);
 export const REHASH_CALL_MINUTES = 15;
@@ -153,8 +154,10 @@ export function rehashCallBooking({ slot, calendarId, rep, env = process.env }) 
       calendar_name: 'Rehash Call',
       start_time: slot.iso,
       duration_minutes: rehashCallMinutes(env),
-      title: 'Rehash Call',
-      status: 'new',
+      // 2026-10-23 (Mark): the handler rebuilds the title from the GHL name and
+      // sets the status from the calendar; these match what it writes.
+      title: rehashCallTitle(null),
+      status: creationStatus({ isRehashCall: true, env }),
       rehash_call: true,
       ...(rep ? { assigned_user_id: rep } : {}),
     },

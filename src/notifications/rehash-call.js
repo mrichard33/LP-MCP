@@ -18,7 +18,7 @@
  * Fail-soft: the reply already went out. Nothing here throws.
  */
 
-import { formatRehashCallCard, rehashCallIdempotencyKey, rehashSlackChannel, ghlContactUrl, formatRehashQuoteCard, formatRehashConcernCard, rehashReplyIdempotencyKey } from '../agentic/rehash.js';
+import { formatRehashCallCard, rehashCallIdempotencyKey, rehashSlackChannel, ghlContactUrl, formatRehashQuoteCard, formatRehashConcernCard, formatRehashChangeCard, rehashReplyIdempotencyKey } from '../agentic/rehash.js';
 import { classifyRehashReply, rehashIntentRoutingEnabled } from '../agentic/rehash-intent.js';
 import { rehashOwnedMode } from '../agentic/rehash-owned.js';
 
@@ -119,6 +119,13 @@ const REPLY_CARDS = {
     title: 'REHASH QUOTE REQUEST',
     lost: (who) => `${who} asked for their quote. Someone needs to send it.`,
   },
+  // 2026-10-23 (Kim Turko review): an owned lead asked to move or cancel.
+  change: {
+    format: formatRehashChangeCard,
+    eventType: 'agentic.f0_rehash_change_requested',
+    title: 'REHASH CALL CHANGE REQUEST',
+    lost: (who) => `${who} asked to move or cancel their Rehash Call. Someone on the rehash team needs to reach out.`,
+  },
   concern: {
     format: formatRehashConcernCard,
     eventType: 'agentic.f0_rehash_concern',
@@ -160,6 +167,14 @@ async function postReplyCard(kind, { contactId, text, contact = {}, repName = nu
 export async function notifyRehashQuoteRequest(args, deps = null, { env = process.env, nowMs = Date.now() } = {}) {
   try { return await postReplyCard('quote', args, deps, { env, nowMs }); } catch (err) {
     console.warn(`[RehashCall] quote card failed for ${args?.contactId}: ${err.message}`);
+    return { posted: false, reason: `error: ${err.message}` };
+  }
+}
+
+/** 🔁 REHASH CALL CHANGE REQUEST → #contact-rehash. Fail-soft, never throws. */
+export async function notifyRehashChangeRequest(args, deps = null, { env = process.env, nowMs = Date.now() } = {}) {
+  try { return await postReplyCard('change', args, deps, { env, nowMs }); } catch (err) {
+    console.warn(`[RehashCall] change card failed for ${args?.contactId}: ${err.message}`);
     return { posted: false, reason: `error: ${err.message}` };
   }
 }
