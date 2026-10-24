@@ -114,15 +114,35 @@ test('every approved disclosure variant passes the guard unblocked', () => {
   }
 });
 
-test('the PR #1016 wording that caused this test still fails the guard', () => {
-  // The regression itself. If this ever stops being blocked, the guard has
-  // been weakened and the 2026-07-03 incident is back in reach.
-  const shipped1016 =
-    "Yes — I'm a digital representative for Reece, here to help however I can. " +
-    "If you'd rather speak with a live person, I can get that set up. What can I help you with?";
-  const result = guardDisclosure(shipped1016);
-  assert.equal(result.blocked, true, 'the "live person" wording must still be caught');
-  assert.equal(result.body, DISCLOSURE_FALLBACK);
+test('2026-10-24 (the user): an OFFER of a real person passes; a CLAIM to be one is still blocked', () => {
+  // The user's ruling: the script offers a person ("If you'd like to speak to a
+  // real person, I can get you a live person"). The guard reads offer shapes
+  // out first (HUMAN_OFFER_RX), so the PR #1016 offer now passes too.
+  for (const offer of [
+    "If you'd rather speak with a live person, I can get that set up.",
+    "If you'd like to speak to a real person, I can get you a live person.",
+    'Happy to connect you with a live person on our team.',
+    'Want me to get you a real person?',
+  ]) assert.equal(guardDisclosure(offer).blocked, false, `false positive on offer: ${offer}`);
+  // The 2026-07-03 incident and every claim shape stay blocked, beside an offer too.
+  for (const claim of [
+    'Real person here, Steve',
+    "I'm a real person, and I can get you a live person if you like.",
+    "you're talking to a live rep",
+    'Our live person will keep helping you here.',
+    "I'm not a bot. If you'd like to speak to a real person, I can get you a live person.",
+  ]) {
+    const g = guardDisclosure(claim);
+    assert.equal(g.blocked, true, `claim not caught: ${claim}`);
+    assert.equal(g.body, DISCLOSURE_FALLBACK);
+  }
+});
+
+test("2026-10-24 (the user): the script says digital assistant and offers a live person", () => {
+  const script = APPROVED_DISCLOSURE_VARIANTS.standard;
+  assert.match(script, /^Fair question\. I'm Reece's digital assistant\./);
+  assert.match(script, /If you'd like to speak to a real person, I can get you a live person\.$/);
+  assert.match(DISCLOSURE_FALLBACK, /digital assistant/);
 });
 
 test('the approved variants are actually rendered into the system prompt', () => {

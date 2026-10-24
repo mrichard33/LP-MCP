@@ -1134,6 +1134,22 @@ Gate: `rehash_owned_answer_mode`; scenarios `rehash_owned_direct_question`, `reh
 `rehash_owned_change_request` (`SCORING_VERSION` 2026-10-23.2: a rehash-gate skip is not `no_reply`). Tests: `scripts/test-rehash-owned.js`,
 `scripts/test-rehash-call-booking.js`.
 
+## "Are you AI?" and the Reece Team voice (the user, 2026-10-24)
+
+**The Reece Team stays the voice** ("I think it may be better to use Reece Team"): `REHASH_VOICE_MODE=team` and
+`F0_TEXT_VOICE=team` stay as they are; the assistant voice below is built and switched off. **"Digital assistant is a
+better word than AI. Then say if you would like to speak to a real person I can get you a live person."** The one
+approved script (`APPROVED_DISCLOSURE_VARIANTS.standard`, both bots) is "Fair question. I'm Reece's digital assistant. I
+handle first replies so nobody's left waiting, and someone on our team sees every conversation. If you'd like to speak
+to a real person, I can get you a live person." An OFFER of a person is not a claim to be one: `guardDisclosure` reads
+`HUMAN_OFFER_RX` shapes out ("speak to a real person", "get you a live person") before `HUMAN_CLAIM_PATTERNS` run, so
+"I'm a real person", "real person here", "our live person will help" and "you're talking to a live rep" are still
+replaced by `DISCLOSURE_FALLBACK` (now "digital assistant" too). A yes to the offer is a callback request (the analyzer's
+STANDING OFFER rule lists the new words). **Never guess, in the Reece Team voice too:** the rehash team line says "I
+don't know, I'll have John get back to you" and returns `ask_rep`; `repQuestionFor` files it for `team` and
+`assistant` (task, note, card, as below). Gate: `are_you_a_real_person` (both bots), `rehash_are_you_ai` and
+`rehash_unknown_question` in team voice (`SCORING_VERSION` 2026-10-24.2); prompt v2.18.0.
+
 ## John's virtual assistant (the user, 2026-10-24)
 
 "If asked if you're AI, you could say, 'You're John's assistant.' Never lie or give an answer that you do not know.
