@@ -1,5 +1,5 @@
 {
- "version": "v2.17.0",
+ "version": "v2.17.1",
  "copy": {
   "src/agentic/nepq-planner.js": [
    "${betterPriceReason('generic', repName && !speaksAsRep ? repName : null)} ${LINES.offer_slots(offer, counters.slot_offers)}",

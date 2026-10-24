@@ -47,6 +47,7 @@ test('the playbook: the assistant voice names the rep, offers come from the rep;
   const a = P.postDemoRehash(null, { assistantRep: 'John', betterPrice: true }).join('\n');
   assert.match(a, /You are John's virtual assistant/);
   assert.match(a, /NEVER GUESS/);
+  assert.match(a, /Never a pronoun for John/);
   assert.match(a, /If John could get you a better price/);
   assert.doesNotMatch(a, /"If I could get you a better price/);
   const t1 = P.postDemoRehash(null, { teamVoiceRep: 'John', betterPrice: true }).join('\n');

@@ -303,6 +303,10 @@ function assistantTextFailures(body, { position, callWith = null, salesRepFirstN
   if (new RegExp(`\\b(?:I(?:'|’)?m|I\\s+am|this\\s+is|it(?:'|’)s)\\s+${r}\\b(?!(?:'|’)s)`, 'i').test(content)) fail.push('claims_to_be_rep');
   if (position === 1 && !new RegExp(`\\b${r}(?:'|’)s\\s+(?:virtual\\s+)?assistant\\b`, 'i').test(content)) fail.push('assistant_not_introduced');
   if (/\b[Ii]f I could\b|\bI\s+(?:may|might|can|could)\s+(?:be\s+able\s+to\s+)?(?:get|fit|beat|bring|lower|find)\b/.test(content)) fail.push('assistant_price_offer');
+  // 2026-10-24 (preview GHL 2-3): "if he could", "a quick call with him". The rep
+  // is named again, never given a pronoun (the user's standing rule). Only the
+  // shapes that point at the rep: a lead's spouse ("once she has seen it") is fine.
+  if (/\b(?:call|talk|chat|speak|meet)\s+with\s+(?:him|her)\b|\b(?:if|so|and|when|that)\s+(?:he|she)\s+(?:could|can|may|might|will|would)\b|\b(?:he|she)(?:'|’)(?:ll|d)\b/i.test(content)) fail.push('rep_pronoun');
   return { fail, content };
 }
 
@@ -472,6 +476,7 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep',
     call_names_other: 'The call invite names only the rep given in CALL WITH.',
     claims_to_be_rep: 'You are <CALL WITH>\'s assistant, never <CALL WITH>: never "I\'m <CALL WITH>" or a sign-off with that name alone.',
     assistant_not_introduced: 'Say early in this first text that you are <CALL WITH>\'s assistant (for example "this is <CALL WITH>\'s assistant at Reece").',
+    rep_pronoun: 'Never he, him, his, she or her for <CALL WITH>: say "<CALL WITH>" again ("a quick call with <CALL WITH>").',
     assistant_price_offer: 'The price offer is <CALL WITH>\'s, not yours: "If <CALL WITH> could …" or "we may be able to …", never "If I could" or "I may be able to get you".',
     email_output: 'Answer as JSON: {"subject", "preheader", "body", "ps", "slots": {"hesitation", "affirm", "reframe", "if_i_could"}}.',
   };

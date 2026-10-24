@@ -1161,7 +1161,8 @@ Schedule calls on John's calendar for him." Post-demo leads only; every pre-demo
   version but 2/3 under `F0_FORMULA_MODE=v1`. With no rep name the context uses the team rows. `checkF0Copy` voice
   'assistant': `claims_to_be_rep`, `assistant_not_introduced` (position 1 says whose assistant is writing),
   `assistant_price_offer`, `signed_as_person`, `signature_in_body`, `missing_signature` (position 5 signs " - John's
-  assistant"), `call_names_other`, plus the team voice's `no_call_reason`. The fallback text has assistant copy. The
+  assistant"), `call_names_other`, `rep_pronoun` ("with him", "if he could": the rep is named again, a lead's spouse
+  may still be "she"), plus the team voice's `no_call_reason`. The fallback text has assistant copy. The
   emails stay the Reece Team's (`F0_EMAIL_VOICE`).
 - Gate: `rehash_voice_mode: 'assistant'`; scenarios `rehash_are_you_ai`, `rehash_unknown_question`, `rehash_book_john`
   (`SCORING_VERSION` 2026-10-24.1; the simulator records `would_file_rep_question`). Tests:
