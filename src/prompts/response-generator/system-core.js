@@ -46,6 +46,22 @@ export const APPROVED_DISCLOSURE_VARIANTS = Object.freeze({
     "Fair question. Yes, I'm Reece's AI assistant. I handle first replies so nobody's left waiting, and someone on the team sees every conversation. Say the word and I'll have one of them reach out directly.",
 });
 
+// 2026-10-24 (the user): on a post-demo lead in REHASH_VOICE_MODE=assistant the
+// bot is the rehash rep's virtual assistant. Asked whether it is AI or a
+// person, it says so plainly ("never lie": an AI, not a person), names the rep, and says what it
+// does with a question it cannot answer. No pronoun for the rep (the user's
+// standing rule), so the name repeats. The {rep} template is filled per lead.
+export const ASSISTANT_DISCLOSURE_TEMPLATE =
+  "Fair question. I'm {rep}'s virtual assistant, an AI, not a person. I help set up {rep}'s calls and keep things moving, and {rep} sees every message. If I can't answer something, I'll leave {rep} a note.";
+/** The assistant disclosure for one rep. Pure. */
+export function assistantDisclosure(rep) {
+  return ASSISTANT_DISCLOSURE_TEMPLATE.replaceAll('{rep}', String(rep || '').trim() || 'the team');
+}
+/** The text carries the assistant disclosure (for the SMS length exemption). Pure. */
+export function isAssistantDisclosure(text) {
+  return /'s virtual assistant, an AI, not a person\. I help set up /.test(String(text || ''));
+}
+
 // The value-ladder line, two versions (2026-10-06, AI OS batch 1 PR 2): with
 // NEPQ live the PLAN block picks the rung, so "the booking CTA you offer" is
 // not the phone Review by default. See PPR_GATE_LEGACY in playbooks.js.

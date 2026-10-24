@@ -376,6 +376,13 @@ export const SCENARIOS = Object.freeze({
   rehash_owned_direct_question: { title: 'Rehash: an owned lead\'s direct question gets a short answer, no question back', family: 'rehash', persona: REHASH_OWNED_LEAD, channels: ['sms'], turns: ['What does the warranty cover?'] },
   rehash_owned_email_only: { title: 'Rehash: an owned lead who sends only an email address gets no reply (Kim Turko)', family: 'rehash', persona: REHASH_OWNED_LEAD, channels: ['sms'], turns: ['Turkokim@gmail.com'] },
   rehash_owned_change_request: { title: 'Rehash: an owned lead who asks to move the call is told John will know', family: 'rehash', persona: REHASH_OWNED_LEAD, channels: ['sms'], turns: ['can we move it to 2?'] },
+  // 2026-10-24 (the user): "If asked if you're AI, you could say, 'You're John's
+  // assistant.' Never lie or give an answer that you do not know ... you will put a
+  // note for John ... Schedule calls on John's calendar for him." Checked only when
+  // the run had REHASH_VOICE_MODE=assistant.
+  rehash_are_you_ai: { title: "Rehash (assistant voice): \"is this a real person?\" gets John's virtual assistant", family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Hi, I got the proposal', 'Wait, is this a real person or a bot?'] },
+  rehash_unknown_question: { title: "Rehash (assistant voice): a question nobody wrote down gets \"I don't know\" and a note for John", family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], turns: ['Does the warranty cover salt spray damage on the frames? We live right on the water'] },
+  rehash_book_john: { title: "Rehash (assistant voice): a call is booked on John's calendar and names John", family: 'rehash', persona: REHASH_LEAD, channels: ['sms'], autoAnswer: true, turns: ['Sure, what times work for a call?'] },
   // 2026-10-16 (Siro PR 1): the visit's price hesitation is in LEAD FACTS.
   rehash_siro_price_objection: { title: 'Rehash with the Siro visit: price was the hesitation', family: 'rehash', persona: REHASH_SIRO_LEAD, channels: ['sms'], turns: ['Hi, got your message. We are still thinking it over'] },
   // ── 2026-10-16 (Melissa, 6U6uceZGMQRz8XEQc9Lk): hearing the time she picked ──
@@ -707,6 +714,8 @@ export async function simulateSms(plan, { nepqMode = 'live', generate, buildReal
     // Part 14: the send handler's decision, one shape (no GHL ring; Five9 calls).
     if (truthBlocked) wouldDo.push({ kind: 'booking_claim_blocked', reason: truthBlocked.reason });
     if (generated?.lp_note_dq) wouldDo.push({ kind: 'would_stop_bot_lp_note_dq', reason: generated.lp_note_dq.signal });
+    // 2026-10-24 (the user): a question the assistant could not answer becomes a note for John.
+    if (reply && generated?.rep_question?.question) wouldDo.push({ kind: 'would_file_rep_question', reason: generated.rep_question.source, payload: { question: generated.rep_question.question } });
     const scheduling = generated && !generated.service_conversation ? schedulingCallbackDecision({ bookingClaimBlocked: !!truthBlocked, onFile: !!generated.appointment_on_file }) : null;
     // 2026-10-13: a commercial property or a rental unit → the set-ND card, never a call.
     const scopeKind = reply ? scopeDqKind(text) : null;

@@ -18,6 +18,10 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.17.0 — 2026-10-24. JOHN'S VIRTUAL ASSISTANT (the user). REHASH_VOICE_MODE=assistant: a post-demo
+ *   reply speaks as the rehash rep's virtual assistant ("I" is the assistant, the rep is third person), says
+ *   plainly it is an AI when asked, never guesses ("I don't know, I'll leave John a note") and returns
+ *   ask_rep, which the send handler files as a GHL task + note + #contact-rehash card. Rep/team copy unchanged.
  * v2.16.2 — 2026-10-22. ANY JOB WITH A SLIDER MEETS THE MINIMUM (Mark; Chris Kendig, a front door + a
  *   sliding door, was declined twice). The minimum rule reads "three windows or doors in any mix, OR any job that
  *   includes at least one sliding glass door" (MINIMUM_RULE in system-core.js, shared with the live chat), and
@@ -324,6 +328,8 @@
  * v1.0   — Initial.
  */
 
+import { normalizeAskRep, repQuestionFor } from './services/rep-question.js';
+import { assistantOfferLine, assistantPlan } from './services/assistant-voice.js';
 import { promptSha256 } from './bot-feedback/fingerprint-core.js';
 // 2026-10-10: the SMS ceiling lives with the reply invariants, so the guard
 // here and checkReply can never disagree on the number.
@@ -509,11 +515,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.16.2 — the header version above, as a value. Stamped (with the deployed
+ * v2.17.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.16.2';
+export const RESPONSE_GENERATOR_VERSION = 'v2.17.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -800,6 +806,17 @@ export function resolveSmsSenderIdentity(fromNumber, { rehash = null } = {}) {
   // value rehash_rep_name, resolved before the prompt is built. That line is
   // the rep's own, so it is a direct line. No resolved name → fall through to
   // the team identity below: a wrong name is worse than "Reece Team".
+  // 2026-10-24 (the user): the rep's virtual assistant signs as the assistant.
+  if (rehash?.active && rehash.voice === 'assistant' && rehash.callRepName) {
+    return {
+      persona: 'rehash_assistant',
+      signature: `${rehash.callRepName}'s assistant`,
+      shared: false,
+      nameIfAsked: `${rehash.callRepName}'s virtual assistant`,
+      assistantOf: rehash.callRepName,
+      matched: Boolean(n && n === last10Digits(process.env.AGENTIC_SMS_NUMBER_REHASH || REHASH_NUMBER_DEFAULT)),
+    };
+  }
   if (rehash?.active && rehash.repName) {
     return {
       persona: 'rehash',
@@ -1364,7 +1381,9 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     const ident = resolveSmsSenderIdentity(opts.fromNumber, { rehash: opts.rehash || null });
     const alreadySigned = threadCarriesSignOff(context.conversation_recent, ident.signature);
     parts.push(...P.LINE_IDENTITY_HEADER);
-    if (ident.shared) {
+    if (ident.assistantOf) {
+      parts.push(...P.assistantLineIdentity(ident.assistantOf));
+    } else if (ident.shared) {
       parts.push(...P.sharedLineIdentity(ident.matched, ident.nameIfAsked));
     } else {
       parts.push(...P.directLineIdentity(ident.signature));
@@ -1665,7 +1684,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // carves out exactly one exception (a phone call with the rep) and keeps the
   // rest of the ban (no visit, no slot, no link). See src/agentic/rehash.js.
   if (opts.rehash?.active) {
-    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true, betterPrice: rehashBetterPrice(), teamVoiceRep: opts.rehash.voice === 'team' ? (opts.rehash.callRepName || null) : null }));
+    parts.push(...P.postDemoRehash(opts.rehash.repName || null, { callTimes: opts.rehash.callTimes === true, betterPrice: rehashBetterPrice(), teamVoiceRep: opts.rehash.voice === 'team' ? (opts.rehash.callRepName || null) : null, assistantRep: opts.rehash.voice === 'assistant' ? (opts.rehash.callRepName || null) : null }));
   }
 
   if (fastTrack && !postAppt.post && !ackOnly) {
@@ -2628,6 +2647,8 @@ export function validateResponse(parsed, channel, knownAppointments = null) {
     companion_action: companionAction,
     // 2026-10-01: post-demo rehash — did the lead agree to a call, and when.
     rehash_call: normalizeRehashCall(parsed.rehash_call),
+    // 2026-10-24 (REHASH_VOICE_MODE=assistant): a question the assistant could not answer, for the rep.
+    ask_rep: normalizeAskRep(parsed.ask_rep),
   };
 }
 
@@ -3405,7 +3426,7 @@ export function decideSmsLength(text, { mode = SMS_LENGTH_GUARD_MODE, retry = fa
   const chars = s.length;
   if (chars <= max) return { over: false, chars, action: 'none' };
   if (BARE_MERGE_TAG_RX.test(s) || /https?:\/\//i.test(s)) return { over: true, chars, action: 'exempt', reason: 'booking_link' };
-  if (s.includes(P.APPROVED_DISCLOSURE_VARIANTS.standard)) return { over: true, chars, action: 'exempt', reason: 'ai_disclosure' };
+  if (s.includes(P.APPROVED_DISCLOSURE_VARIANTS.standard) || P.isAssistantDisclosure(s)) return { over: true, chars, action: 'exempt', reason: 'ai_disclosure' };
   if (mode === 'off') return { over: true, chars, action: 'off' };
   if (mode === 'shadow') return { over: true, chars, action: 'shadow' };
   if (retry) return { over: true, chars, action: 'ship_after_retry' };
@@ -3779,9 +3800,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // Team. repName stays null (the sign-off, the identity and the planner then
   // speak as the team, the path a missing rep name already took) and the rep is
   // kept as callRepName, named in the third person.
-  const teamVoice = rehashActive && rehashVoiceMode() === 'team';
+  // 2026-10-24 (the user): REHASH_VOICE_MODE=assistant writes it as the rep's
+  // virtual assistant; like team, repName stays null and the rep is callRepName.
+  // With no rep name resolved, assistant falls back to the team identity.
+  const voiceMode = rehashActive ? rehashVoiceMode() : 'rep';
+  const thirdPerson = voiceMode === 'team' || (voiceMode === 'assistant' && !!rehashRepName);
   const rehash = rehashActive
-    ? (teamVoice ? { active: true, repName: null, callRepName: rehashRepName, voice: 'team' } : { active: true, repName: rehashRepName })
+    ? (thirdPerson ? { active: true, repName: null, callRepName: rehashRepName, voice: voiceMode } : { active: true, repName: rehashRepName })
     : null;
   // 2026-10-13 (the user): "If the appointment is post demo … we can assume the
   // lead already meets the requirements." No qualifying questions, no job-scope
@@ -4348,6 +4373,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
           console.warn(`[RehashSlots] shadow plan failed for ${contactId}: ${rsErr.message}`);
         }
       }
+      // 2026-10-24 (the user): in the assistant voice the rep, not the assistant, makes the price offer.
+      if (rehash?.voice === 'assistant' && rehash.callRepName) nepqPlan = assistantPlan(nepqPlan, rehash.callRepName);
       // The rehash prompt may name the real times this plan offers or books.
       if (rehash && nepqPlan?.rehash_call_slots) rehash.callTimes = true;
       if (pdMode === 'shadow' && postDemoLead) {
@@ -4650,8 +4677,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // rep's name); Randy's father founded Reece; and a call "today" / "in the
   // next few minutes" is promised only inside team hours (team-hours.js).
   if (channel !== 'email') {
-    const team = enforceTeamVoice(validated.message, { allowName: rehash?.repName || null, forbidNames: rehash?.voice === 'team' && rehash.callRepName ? [rehash.callRepName] : [] });
-    const timing = enforceCallTiming(team.text);
+    const team = enforceTeamVoice(validated.message, { allowName: rehash?.repName || null, forbidNames: (rehash?.voice === 'team' || rehash?.voice === 'assistant') && rehash.callRepName ? [rehash.callRepName] : [] });
+    // 2026-10-24: the assistant voice moves "If I could get you a better price" to the rep.
+    const offer = rehash?.voice === 'assistant' && rehash.callRepName ? assistantOfferLine(team.text, rehash.callRepName) : { text: team.text, changed: false };
+    if (offer.changed) team.changes.push('assistant_offer_to_rep');
+    const timing = enforceCallTiming(offer.text);
     if (team.changes.length || timing.changed) {
       console.log(`[TeamVoice] ${contactId} ${[...team.changes, ...(timing.changed ? ['call_timing'] : [])].join(',')}`);
       validated.message = timing.text;
@@ -5348,7 +5378,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       err.regenerationNote = NEAR_REPEAT_NOTE;
       throw err;
     }
-    const ident = resolveSmsSenderIdentity(opts.fromNumber || null, { rehash: rehash ? { active: true, repName: rehash.repName } : null });
+    const ident = resolveSmsSenderIdentity(opts.fromNumber || null, { rehash: rehash ? { active: true, repName: rehash.repName, voice: rehash.voice || null, callRepName: rehash.callRepName || null } : null });
     const sig = normalizeSignature(validated.message, { signature: ident.signature, sign: !threadCarriesSignOff(context.conversation_recent || [], ident.signature) });
     if (sig.changed) validated.message = sig.text;
   }
@@ -5789,6 +5819,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // 2026-10-01: { active, rep_name } on a post-demo F.0 reply; the send
     // handler posts the #contact-rehash card when rehash_call.agreed.
     rehash: rehash ? { active: true, rep_name: rehash.repName || rehash.callRepName || null, ...(rehash.voice ? { voice: rehash.voice } : {}) } : null,
+    // 2026-10-24 (the user): the assistant said it did not know and promised the rep a note.
+    rep_question: repQuestionFor({ voice: rehash?.voice || null, askRep: validated.ask_rep, reply: validated.message, trigger: triggerMessage }),
     contact_known_phone: identityState?.identity?.phone || context?.lead?.phone || null,
     // 2026-10-07 (Nicholas): what the send handler's final booking-truth
     // check needs (booking-claim.js checkBookingTruth). The appointment still

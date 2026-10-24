@@ -3,6 +3,7 @@
 // and its Reece Team version (Mark, 2026-10-22): node scripts/build-f0-four-step-seed.mjs sql/seeds/2026-10-22_f0_v2_email_prompt_team_voice.sql
 // and the texts in the Reece Team voice (the user, 2026-10-23): node scripts/build-f0-four-step-seed.mjs sql/seeds/2026-10-23_f0_v2_four_step_team_voice.sql
 // and the day-4 / day-11 emails (the user, 2026-10-23): node scripts/build-f0-four-step-seed.mjs sql/seeds/2026-10-23_f0_v2_followup_emails.sql
+// and the texts as the rep's virtual assistant (the user, 2026-10-24): node scripts/build-f0-four-step-seed.mjs sql/seeds/2026-10-24_f0_v2_four_step_assistant_voice.sql
 import fs from 'node:fs';
 
 const out = process.argv[2];
@@ -16,6 +17,9 @@ const VARIED_SEED = /four_step_varied_close\.sql$/.test(String(out || ''));
 // version-3 rows (node scripts/build-f0-four-step-seed.mjs
 // sql/seeds/2026-10-23_f0_v2_four_step_team_voice.sql).
 const TEAM_TEXT_SEED = /four_step_team_voice\.sql$/.test(String(out || ''));
+// 2026-10-24 (the user): the same texts as the rehash rep's virtual assistant,
+// as 35 new version-4 rows.
+const ASSISTANT_TEXT_SEED = /four_step_assistant_voice\.sql$/.test(String(out || ''));
 const q = (s) => `$f0$${s}$f0$`;
 
 const RULES = `THE POST-DEMO RULES (never break these):
@@ -693,6 +697,145 @@ on conflict (prompt_code) do update set
   updated_at = now();
 `);
   console.log(`${teamRows.length} rows (version 3, Reece Team voice)`);
+  process.exit(0);
+}
+
+// ── the Four-Step texts as the rep's virtual assistant (the user, 2026-10-24) ──
+// "If asked if you're AI, you could say, 'You're John's assistant.' Never lie
+// ... your job is to really be John's assistant." The 35 Reece Team rows with
+// the voice changed: "I" is the assistant (CALL WITH's virtual assistant), the
+// rep is always named in the third person, the FIRST text says whose assistant
+// is writing, the price offer is the rep's ("If John could …", "we may be able
+// to …"), never the assistant's own, and position 5 signs " - John's
+// assistant". F0_TEXT_VOICE=assistant reads them (version 4); with no rep name
+// found the context falls back to the team rows. Checked by checkF0Copy formula
+// 'four_step', voice 'assistant'.
+const ASSISTANT_RULES = RULES.replace(
+  /^- Sign the message at the very end[^\n]*$/m,
+  '- Write as CALL WITH\'s virtual assistant at Reece: "I" is you, the assistant; CALL WITH is always named in the third person, never "I". Never say or imply you are CALL WITH or a person, and never sign with CALL WITH\'s name alone. Positions 1 to 4 end on the call question with nothing after it; position 5 signs " - CALL WITH\'s assistant" (for example " - John\'s assistant") at the very end.',
+);
+
+const ASSISTANT_FOUR_STEP_NOTES = `FOUR-STEP NOTES (these read with the rules above):
+- CALL WITH is the rep you are the assistant of, and the person the call is with. At positions 1 to 4 the text ENDS with one question asking for a quick call with CALL WITH, named exactly as given: add nothing after it. Position 5 signs " - CALL WITH's assistant" at the end.
+- POSITION 1 says who is writing, right after the first name: "this is CALL WITH's assistant at Reece." (your words, the same meaning). Later texts do not repeat it.
+- The price offer is CALL WITH's, never yours: "If John could fit this into your budget …", "John may be able to get you a better deal", "we may be able to …". Never "If I could …" or "I may be able to get you …": an assistant cannot offer a price.
+- Never use a sensitive detail from the visit, even if it reached you: no death or loss, illness, health, hospital, divorce, a lost job, debt or money trouble, or age. A happy family detail ("family visiting for Christmas") may stay.
+- <visit_facts> holds no price on purpose. Never guess one.`;
+
+const ASSISTANT_CORE = TEAM_CORE
+  .replace('You write ONE text from the Reece Team to a homeowner after an in-home visit. Write as the team: "we", "us", "our", never "I".',
+    'You write ONE text to a homeowner after an in-home visit, as CALL WITH\'s virtual assistant at Reece. "I" is you, the assistant; CALL WITH is named in the third person.')
+  .replace('Step 4 is a STRATEGY, not a script. "If we could …, would you be open to a quick call with John?" is the idea; never send it word for word every time. Word the close your own way and differently in every message: never reuse the wording of a close listed in EARLIER CLOSES, and say "if we could" at most once in the whole conversation.',
+    'Step 4 is a STRATEGY, not a script. "If John could …, would you be open to a quick call with John?" is the idea; never send it word for word every time. Word the close your own way and differently in every message: never reuse the wording of a close listed in EARLIER CLOSES, and say "if John could" or "if we could" at most once in the whole conversation.')
+  .replace('Other ways to say it: "If there\'s a way to …, would a quick call with John be worth it?", "We may be able to …. Would you be open to a quick call with John to see?", "Would a quick call with John help, to see if we can …?"',
+    'Other ways to say it: "If there\'s a way to …, would a quick call with John be worth it?", "John may be able to …. Would you be open to a quick call with John to see?", "Would a quick call with John help, to see if we can …?"')
+  .replace('"We may be able to fit this into your budget, and maybe get you a better deal. Would a quick call with John make sense?"',
+    '"John may be able to fit this into your budget, and maybe get you a better deal. Would a quick call with John make sense?"');
+
+const ASSISTANT_POSITION = {
+  ...TEAM_POSITION,
+  1: `${TEAM_POSITION[1] || POSITION[1]} Right after the first name, say you are CALL WITH's assistant at Reece.`,
+  4: TEAM_POSITION[4].replace('to see if we can fit it into their budget', 'to see if CALL WITH can fit it into their budget'),
+  5: 'POSITION 5 (the last text): NO question at all. A warm close that leaves the door open, signed " - CALL WITH\'s assistant" (for example " - John\'s assistant"). Do not use "If John could". Slots may all be null except "reframe" when a visit is on file.',
+};
+
+const toAssistant = (t) => String(t)
+  .replace(/\bWe may be able to\b/g, 'John may be able to')
+  .replace(/\bIf we could\b/g, 'If John could')
+  .replace(/\bWe would like to see if we can\b/g, 'John would like to see if he can')
+  .replace(/\bwe will leave it here for now\b/g, 'I will leave it here for now')
+  .replace(/\bwe are a text away\b/g, 'I am a text away')
+  .replace(/ - Reece Team$/, " - John's assistant");
+const introduce = (t) => String(t).replace(/^(\w+), (\w)/, (_, n, c) => `${n}, this is John's assistant at Reece. ${c.toUpperCase()}`);
+const ASSISTANT_EXAMPLES = Object.fromEntries(Object.entries(TEAM_EXAMPLES).map(([k, v]) => [k, { ...v, good: toAssistant(v.good) }]));
+// "John would like to see if he can" names a pronoun for the rep (the user's standing rule): the trust example is rewritten whole.
+ASSISTANT_EXAMPLES.trust = { ...ASSISTANT_EXAMPLES.trust, good: 'Rosa, wanting to be sure who you let work on your home is completely fair. You said keeping the storms out of the back bedrooms mattered most. John may be able to fit this into your budget. Is a quick call with John worth a few minutes?' };
+const ASSISTANT_COMMON_BAD = [
+  ["James, this is John. If I could get you a better price, would a quick call make sense? - John", 'written as the rep, not as the assistant, and the assistant offering a price'],
+  ["James, I may be able to get you a better deal. Would a quick call with John help?", 'the assistant offering the price itself (the offer is John\'s)'],
+  ['James, the windows are still worth doing. Would a quick call with John make sense?', 'a call with no reason why'],
+  ...COMMON_BAD,
+];
+const ASSISTANT_P_EXAMPLES = Object.fromEntries(Object.entries(TEAM_P_EXAMPLES).map(([k, v]) => [k, toAssistant(v)]));
+
+function assistantSystem(pos, variant) {
+  const ex = ASSISTANT_EXAMPLES[variant];
+  const good = pos === 1 ? introduce(ex.good) : pos === 2 ? ex.good : ASSISTANT_P_EXAMPLES[pos];
+  const bads = [...ex.bad, ...ASSISTANT_COMMON_BAD.filter(([b]) => !ex.bad.some(([x]) => x === b))];
+  return [
+    ASSISTANT_CORE,
+    '',
+    `STORY ANGLE for this variant: ${ANGLE[variant]}`,
+    '',
+    ASSISTANT_POSITION[pos],
+    '',
+    ASSISTANT_RULES,
+    '',
+    ASSISTANT_FOUR_STEP_NOTES,
+    '',
+    'Return JSON only: {"slots": {"hesitation", "affirm", "reframe", "if_i_could"}, "text"}. Every slot is a string or null.',
+    '',
+    `EXAMPLES (the shape to aim for; use THIS lead's facts and THIS lead's CALL WITH, never the example's):`,
+    `- GOOD${pos <= 2 ? ` (${variant})` : ` (position ${pos})`}: ${good}`,
+    ...bads.map(([b, why]) => `- BAD, ${why}: "${b}"`),
+  ].join('\n');
+}
+
+if (ASSISTANT_TEXT_SEED) {
+  const assistantRows = [];
+  for (let pos = 1; pos <= 5; pos++) {
+    for (const v of variants) {
+      assistantRows.push(`  (${q(`F.0-P${pos}-${v}-V4`)}, 'F.0', 'sms', ${pos}, ${FILTER[v]}::text[],
+   ${q(assistantSystem(pos, v))},
+   ${q(TEAM_USER)},
+   ${q(SCHEMA)}::jsonb, 1500, 0.7, true, 4, ${q('four-step-assistant')},
+   ${q(`F.0 v2 Four-Step as the rehash rep's virtual assistant (the user, 2026-10-24). Position ${pos}, variant ${v}, next wait ${WAIT[pos]}h (set in code: FOUR_STEP_WAIT_HOURS). Read only with F0_FORMULA_MODE=four_step and F0_TEXT_VOICE=assistant.`)})`);
+    }
+  }
+  const header = `-- F.0 v2 Four-Step texts as the rehash rep's virtual assistant (the user, 2026-10-24) — agentic_messaging_prompts.
+--
+-- "If asked if you're AI, you could say, 'You're John's assistant.' Never lie
+-- ... your job is to really be John's assistant." These 35 rows are the
+-- version-3 Reece Team texts (sql/seeds/2026-10-23_f0_v2_four_step_team_voice.sql)
+-- with the voice changed: "I" is CALL WITH's virtual assistant, the rep is named
+-- in the third person, the first text says whose assistant is writing, the price
+-- offer is the rep's ("If John could …"), and position 5 signs " - John's
+-- assistant". checkF0Copy formula 'four_step', voice 'assistant' fails
+-- claims_to_be_rep, assistant_not_introduced (position 1),
+-- assistant_price_offer, signed_as_person, signature_in_body, missing_signature
+-- (position 5) and call_names_other. The emails stay the Reece Team's.
+--
+-- Version 4, variant_label 'four-step-assistant'. Inserted ACTIVE: only
+-- F0_FORMULA_MODE=four_step AND F0_TEXT_VOICE=assistant reads them
+-- (nurture-prompt-selector.js), so the variable is the switch and
+-- F0_TEXT_VOICE=team the rollback. With no rep name found the context uses the
+-- team rows.
+--
+-- Idempotent: ON CONFLICT (prompt_code) updates the copy in place and never
+-- touches active. Built by scripts/build-f0-four-step-seed.mjs.
+
+insert into public.agentic_messaging_prompts
+  (prompt_code, workflow_code, channel, sequence_position, objection_filter,
+   system_prompt, user_prompt_template, output_schema, max_tokens, temperature, active, version, variant_label, notes)
+values
+`;
+  fs.writeFileSync(out, `${header}${assistantRows.join(',\n')}
+on conflict (prompt_code) do update set
+  workflow_code = excluded.workflow_code,
+  channel = excluded.channel,
+  sequence_position = excluded.sequence_position,
+  objection_filter = excluded.objection_filter,
+  system_prompt = excluded.system_prompt,
+  user_prompt_template = excluded.user_prompt_template,
+  output_schema = excluded.output_schema,
+  max_tokens = excluded.max_tokens,
+  temperature = excluded.temperature,
+  version = excluded.version,
+  variant_label = excluded.variant_label,
+  notes = excluded.notes,
+  updated_at = now();
+`);
+  console.log(`${assistantRows.length} rows (version 4, the rep's virtual assistant)`);
   process.exit(0);
 }
 

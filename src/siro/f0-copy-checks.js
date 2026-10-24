@@ -276,6 +276,36 @@ function teamTextFailures(body, { position, callWith = null, salesRepFirstName =
   return { fail, content };
 }
 
+// The Four-Step texts as the rehash rep's virtual assistant (the user,
+// 2026-10-24; F0_TEXT_VOICE=assistant): "I" is the assistant and the rep is
+// named in the third person. It is never the rep ("I'm John", "- John"), the
+// first text says whose assistant is writing, the price offer is the rep's
+// ("If John could …", "we may be able to …"), never the assistant's own ("If I
+// could get you a better price"), positions 1-4 end on the call question naming
+// the rep, and position 5 asks nothing and signs " - John's assistant".
+function assistantTextFailures(body, { position, callWith = null, salesRepFirstName = null } = {}) {
+  const fail = [];
+  const text = String(body || '').trim();
+  const rep = String(callWith || '').trim();
+  const r = escRx(rep || 'John');
+  let content = text;
+  if (position < CLOSE_POSITION) {
+    const team = teamVoiceFailures(text, { callWith: rep || null, salesRepFirstName });
+    fail.push(...team.fail.filter(f => f !== 'first_person'));
+    content = team.content;
+  } else {
+    const sig = text.match(new RegExp(`\\s*[-–—]?\\s*${r}(?:'|’)s\\s+(?:virtual\\s+)?assistant\\s*\\.?\\s*$`, 'i'));
+    if (sig) {
+      content = text.slice(0, sig.index).trim();
+      if (/[—–]/.test(sig[0])) fail.push('em_dash');
+    } else fail.push(PERSON_SIGNATURE_RX.test(text) ? 'signed_as_person' : 'missing_signature');
+  }
+  if (new RegExp(`\\b(?:I(?:'|’)?m|I\\s+am|this\\s+is|it(?:'|’)s)\\s+${r}\\b(?!(?:'|’)s)`, 'i').test(content)) fail.push('claims_to_be_rep');
+  if (position === 1 && !new RegExp(`\\b${r}(?:'|’)s\\s+(?:virtual\\s+)?assistant\\b`, 'i').test(content)) fail.push('assistant_not_introduced');
+  if (/\b[Ii]f I could\b|\bI\s+(?:may|might|can|could)\s+(?:be\s+able\s+to\s+)?(?:get|fit|beat|bring|lower|find)\b/.test(content)) fail.push('assistant_price_offer');
+  return { fail, content };
+}
+
 /**
  * @param {string} text
  * @param {{facts?: object|null, position: number, repFirstName?: string,
@@ -306,6 +336,12 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
     fail.push(...team.fail);
     body = team.content;
   }
+  const assistantText = fourStep && voice === 'assistant';
+  if (assistantText) {
+    const a = assistantTextFailures(body, { position, callWith, salesRepFirstName: facts?.rep_first_name || null });
+    fail.push(...a.fail);
+    body = a.content;
+  }
 
   const questions = (body.match(/\?/g) || []).length;
   // The email counts its question across every part (emailFailures).
@@ -323,7 +359,7 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
   // 2026-10-23 (the user): "a better deal" is the reason for the call on the
   // Reece Team copy ("deal" is fine). Only those words are taken out before
   // the offer test: an amount, a percent or a discount in the sentence still fails.
-  if (voice === 'team') offerText = offerText.replace(TEAM_DEAL_REASON_RX, '');
+  if (voice === 'team' || voice === 'assistant') offerText = offerText.replace(TEAM_DEAL_REASON_RX, '');
   if (findOfferTalk(offerText, { hintUsed: !hintAllowed }).length) fail.push('offer_talk');
   if (POST_DEMO_REBUTTAL_RX.test(body)) fail.push('rebuttal');
   if (UNPROMISED_FOLLOW_UP_RX.test(body)) fail.push('unpromised_follow_up');
@@ -338,7 +374,7 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
   if (!email && GENERIC_OPENER_RX.test(body)) fail.push('generic_opener');
   // Four-Step positions 1-4 end on the call question naming the rep instead;
   // the email's sign-off is the GHL template's.
-  if (repFirstName && !email && !teamText && !(fourStep && position < CLOSE_POSITION) && !signedBy(body, repFirstName)) fail.push('missing_signature');
+  if (repFirstName && !email && !teamText && !assistantText && !(fourStep && position < CLOSE_POSITION) && !signedBy(body, repFirstName)) fail.push('missing_signature');
   // Ruling 7 (2026-10-19): never a death, an illness, divorce, a lost job,
   // debt or age, whatever the formula.
   const sensitiveText = email ? [subject, preheader, body, ps].filter(Boolean).join('\n') : body;
@@ -361,7 +397,7 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
     fail.push(...fourStepFailures(body, { facts, position: 1, repFirstName: team ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName, voice }));
     if (!facts) fail.push('no_visit_facts');
   } else if (fourStep) {
-    fail.push(...fourStepFailures(body, { facts, position, repFirstName: teamText ? (callWith || F0_TEAM_CALL_FALLBACK) : repFirstName, slots, firstName, voice: teamText ? 'team' : 'rep' }));
+    fail.push(...fourStepFailures(body, { facts, position, repFirstName: teamText ? (callWith || F0_TEAM_CALL_FALLBACK) : assistantText ? (callWith || repFirstName) : repFirstName, slots, firstName, voice: teamText || assistantText ? 'team' : 'rep' }));
   } else if (facts && position <= 3) {
     const want = personalizationTokens(facts);
     const have = new Set(tokens(body));
@@ -375,6 +411,7 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
   const email = formula === 'email';
   const teamEmail = email && voice === 'team';
   const teamText = formula === 'four_step' && voice === 'team';
+  const assistantText = formula === 'four_step' && voice === 'assistant';
   const why = {
     too_long: `Keep it under ${F0_SMS_MAX} characters.`,
     question_count: email ? 'Ask exactly one question in the whole email (subject, preheader, body and P.S.): the call invite at the end of the body.'
@@ -394,7 +431,7 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     emoji: 'No emoji.',
     em_dash: 'No dashes like — or –.',
     generic_opener: 'Do not open with "thanks for having us" or "just checking in".',
-    missing_signature: teamText ? 'Sign " - Reece Team" at the very end.' : 'Sign with the rep first name at the very end.',
+    missing_signature: teamText ? 'Sign " - Reece Team" at the very end.' : assistantText ? 'Sign " - <CALL WITH>\'s assistant" at the very end.' : 'Sign with the rep first name at the very end.',
     signature_in_body: teamText ? 'End the text on the call question, with nothing after it: no sign-off and no name.'
       : 'End the body on the call question. No sign-off and no name after it: the template signs the email.',
     not_personalized: 'Name one specific thing from their visit.',
@@ -427,8 +464,12 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     no_visit_facts: 'There is no visit on file.',
     first_person: 'Write as the Reece Team: "we", "us", "our". Never "I", "me" or "my".',
     signed_as_person: teamText ? 'Never sign as a person: the last text signs " - Reece Team" and the others end on the call question.'
+      : assistantText ? 'Never sign as <CALL WITH>: the last text signs " - <CALL WITH>\'s assistant" and the others end on the call question.'
       : 'Never sign as a person, and write no sign-off at all: the body ends on the call question and the template signs the email.',
     call_names_other: 'The call invite names only the rep given in CALL WITH.',
+    claims_to_be_rep: 'You are <CALL WITH>\'s assistant, never <CALL WITH>: never "I\'m <CALL WITH>" or a sign-off with that name alone.',
+    assistant_not_introduced: 'Say early in this first text that you are <CALL WITH>\'s assistant (for example "this is <CALL WITH>\'s assistant at Reece").',
+    assistant_price_offer: 'The price offer is <CALL WITH>\'s, not yours: "If <CALL WITH> could …" or "we may be able to …", never "If I could" or "I may be able to get you".',
     email_output: 'Answer as JSON: {"subject", "preheader", "body", "ps", "slots": {"hesitation", "affirm", "reframe", "if_i_could"}}.',
   };
   const line = (f) => why[f] || (f.startsWith('slot_not_in_text:') ? `Use the ${f.split(':')[1]} slot's words in the text.` : f);

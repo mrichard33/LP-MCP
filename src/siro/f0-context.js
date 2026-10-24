@@ -273,11 +273,16 @@ export async function loadF0Context(context, request, { env = process.env, deps 
   // follower). The follower-first read printed "a quick call with Reece" for a
   // lead whose follower was a "Reece …" user (2026-10-23). None found: "a quick
   // call with our team". Rep voice keeps the follower-first read (the rollback).
-  const textVoice = !email && modes.f0Formula === 'four_step' ? modes.f0TextVoice : null;
-  const teamText = textVoice === 'team';
-  const rehashRepFirst = teamEmail || teamText
+  // 2026-10-24 (the user): F0_TEXT_VOICE=assistant writes as the rep's virtual
+  // assistant, which needs a rep to be the assistant of: with no rep name found
+  // the texts fall back to the Reece Team voice (never "our team's assistant").
+  const wantVoice = !email && modes.f0Formula === 'four_step' ? modes.f0TextVoice : null;
+  const teamLike = teamEmail || wantVoice === 'team' || wantVoice === 'assistant';
+  const rehashRepFirst = teamLike
     ? (await resolveEmailRepFirst(request.contact_id, { env, deps })) || ''
     : await resolveRehashRepFirst(request.contact_id, { env, deps });
+  const textVoice = wantVoice === 'assistant' && !rehashRepFirst ? 'team' : wantVoice;
+  const teamText = textVoice === 'team' || textVoice === 'assistant';
   const textCallWith = teamText ? rehashRepFirst || null : null;
   const followupTextLive = modes.followupText === 'live';
   const vars = {

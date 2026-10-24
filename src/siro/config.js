@@ -30,7 +30,7 @@ const OSL = ['off', 'shadow', 'live'];
 const OL = ['off', 'live'];
 export const F0_FORMULAS = ['v1', 'four_step'];
 export const F0_EMAIL_VOICES = ['team', 'rep'];
-export const F0_TEXT_VOICES = ['team', 'rep'];
+export const F0_TEXT_VOICES = ['team', 'rep', 'assistant'];
 
 // 2026-10-19: a bot-gate run may try SIRO_CONTEXT_MODE, SIRO_FOLLOWUP_TEXT_MODE
 // and F0_FORMULA_MODE without Railway (src/simulator/sim-overrides.js). Outside

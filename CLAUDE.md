@@ -1134,6 +1134,39 @@ Gate: `rehash_owned_answer_mode`; scenarios `rehash_owned_direct_question`, `reh
 `rehash_owned_change_request` (`SCORING_VERSION` 2026-10-23.2: a rehash-gate skip is not `no_reply`). Tests: `scripts/test-rehash-owned.js`,
 `scripts/test-rehash-call-booking.js`.
 
+## John's virtual assistant (the user, 2026-10-24)
+
+"If asked if you're AI, you could say, 'You're John's assistant.' Never lie or give an answer that you do not know.
+It's okay to say you don't know ... you will put a note for John, and your job is to really be John's assistant.
+Schedule calls on John's calendar for him." Post-demo leads only; every pre-demo contact keeps the Reece Team.
+- **Replies: `REHASH_VOICE_MODE=assistant`** (rep | team | assistant; team is the rollback). The rehash line becomes
+  `{ repName: null, callRepName: John, voice: 'assistant' }`: "I" is the assistant, John is third person, never a
+  pronoun for John. Sign-off "— John's assistant" (`resolveSmsSenderIdentity` persona `rehash_assistant`). Asked
+  whether it is AI, it opens with `assistantDisclosure(rep)` (`system-core.js`: "… John's virtual assistant, an AI,
+  not a person …"), exempt from the SMS length cap (`isAssistantDisclosure`); `guardDisclosure` is unchanged.
+  `enforceTeamVoice({ forbidNames })` still rewrites "I'm John". The price offer is John's: `assistantOfferLine` /
+  `assistantPlan` (`src/services/assistant-voice.js`) turn "If I could …" / "I may be able to …" into "If John could …"
+  in the plan's reference lines and as a last pass on the reply (`assistant_offer_to_rep`). Calls still book on the
+  Rehash Call calendar for the rep (`rehashCallBooking`), unchanged.
+- **"I don't know, I'll leave John a note" is backed by a note.** The reply writer is told never to guess and to
+  return `ask_rep` (the lead's question); `repQuestionFor` (`src/services/rep-question.js`) also files the lead's own
+  message when the reply PROMISED a note and the model returned none. After the send, `fileRepQuestion`
+  (`rep-question-io.js`) writes a GHL task for the rep on the lead (`rehashRepFor`, else the first
+  `REHASH_TEAM_USER_IDS` id) due the next business day 12:00 ET, a contact note and ONE ❓ card in #contact-rehash
+  (a failed post is an #ops-alerts line), once per contact per question (audit `rep_question`, 30 days). An owned
+  lead's answer-only fallback files the same note. Never Five9, never a text to the lead. Assistant voice only.
+- **F.0 texts: `F0_TEXT_VOICE=assistant`** (team | rep | assistant). Version-4 rows `F.0-P[1-5]-<variant>-V4`
+  (`four-step-assistant`, `sql/seeds/2026-10-24_f0_v2_four_step_assistant_voice.sql`, built by the seed script,
+  inserted ACTIVE: only this value reads them). Apply the seed only AFTER the deploy: the old picker reads any
+  version but 2/3 under `F0_FORMULA_MODE=v1`. With no rep name the context uses the team rows. `checkF0Copy` voice
+  'assistant': `claims_to_be_rep`, `assistant_not_introduced` (position 1 says whose assistant is writing),
+  `assistant_price_offer`, `signed_as_person`, `signature_in_body`, `missing_signature` (position 5 signs " - John's
+  assistant"), `call_names_other`, plus the team voice's `no_call_reason`. The fallback text has assistant copy. The
+  emails stay the Reece Team's (`F0_EMAIL_VOICE`).
+- Gate: `rehash_voice_mode: 'assistant'`; scenarios `rehash_are_you_ai`, `rehash_unknown_question`, `rehash_book_john`
+  (`SCORING_VERSION` 2026-10-24.1; the simulator records `would_file_rep_question`). Tests:
+  `scripts/test-rehash-assistant-voice.js`, `-rep-question-note`, `-f0-assistant-voice`.
+
 ## Revin: every text it sends or receives, one thread per contact (2026-10-19)
 
 Until now all we kept of Revin AI's texting was its ~160-character LP summary note (`note_origin = 'lp_revin'`, still

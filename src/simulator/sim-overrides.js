@@ -36,7 +36,7 @@ export const SIM_MODE_OVERRIDES = Object.freeze({
   // rep's manual message pauses the bot 15 minutes, and the rehash reply's voice.
   rehashOwnedMode: ['off', 'shadow', 'live'],
   rehashPauseMode: ['off', 'shadow', 'live'],
-  rehashVoiceMode: ['rep', 'team'],
+  rehashVoiceMode: ['rep', 'team', 'assistant'],
   // 2026-10-23 (Kim Turko): an owned lead's direct question gets a short answer.
   rehashOwnedAnswerMode: ['off', 'shadow', 'live'],
 });

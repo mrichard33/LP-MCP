@@ -43,7 +43,10 @@ const last10 = (raw) => {
 // rep, signed with their first name); team = signed "— Reece Team", the rep
 // named in the third person ("John can give you a quick call"). Default rep
 // until the gate has run with team.
-export const REHASH_VOICE_MODES = Object.freeze(['rep', 'team']);
+// 2026-10-24 (the user): assistant = written as the rehash rep's virtual
+// assistant ("I" is the assistant, the rep in the third person), signed
+// "— John's assistant"; asked if it is AI, "I'm John's virtual assistant".
+export const REHASH_VOICE_MODES = Object.freeze(['rep', 'team', 'assistant']);
 export function rehashVoiceMode(env = process.env) {
   const v = String(simModeOverrides().rehashVoiceMode ?? env?.REHASH_VOICE_MODE ?? '').trim().toLowerCase();
   return REHASH_VOICE_MODES.includes(v) ? v : 'rep';

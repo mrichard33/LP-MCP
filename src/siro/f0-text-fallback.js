@@ -38,15 +38,29 @@ const FALLBACK_LINES = Object.freeze({
   5: () => 'we will leave it here for now. If anything changes, we are a text away. - Reece Team',
 });
 
+// 2026-10-24 (the user; F0_TEXT_VOICE=assistant): the same texts as the rehash
+// rep's virtual assistant. The first says whose assistant is writing, the price
+// offer is the rep's, never the assistant's, and the last signs " - John's assistant".
+const ASSISTANT_LINES = Object.freeze({
+  1: (w) => `this is ${w}'s assistant at Reece. Thanks again for having us out. If ${w} could fit this into your budget, or find you a better deal, would a quick call make sense?`,
+  2: (w) => `we know a project like this is a big decision. ${w} may be able to get you a better deal than you think. Would a short call with ${w} help?`,
+  3: (w) => `picture the work done and off your list. If a better deal would help it fit your budget, is a quick call with ${w} worth a few minutes?`,
+  4: (w) => `the door is still open whenever you are ready. Could a short call with ${w} help find a way to fit your budget?`,
+  5: (w) => `we will leave it here for now. If anything changes, we are a text away. - ${w}'s assistant`,
+});
+
 /**
  * The generic text for an internal F.0 text position (1-5). `callWith` is the
  * rehash rep's first name or "our team"; `firstName` the cleaned greeting name
  * ('' or null = none). Pure.
  */
-export function f0FallbackText({ position, firstName = '', callWith = '' } = {}) {
+export function f0FallbackText({ position, firstName = '', callWith = '', voice = 'team' } = {}) {
   const pos = Math.min(5, Math.max(1, Number(position) || 1));
-  const who = String(callWith || '').trim() || 'our team';
-  const line = FALLBACK_LINES[pos](who);
+  const rep = String(callWith || '').trim();
+  const who = rep || 'our team';
+  // The assistant needs a rep to be the assistant of; none named reads as the team.
+  const assistant = voice === 'assistant' && rep && rep.toLowerCase() !== 'our team';
+  const line = (assistant ? ASSISTANT_LINES : FALLBACK_LINES)[pos](who);
   const name = String(firstName || '').trim();
   return name ? `${name}, ${line}` : `${line.charAt(0).toUpperCase()}${line.slice(1)}`;
 }
