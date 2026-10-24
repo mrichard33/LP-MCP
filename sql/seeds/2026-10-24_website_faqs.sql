@@ -4,11 +4,11 @@
 -- every answer below was reviewed in the doc above. 26 new answers and 12 additions were approved as written; 23
 -- rulings were made (8 keep the bot's answer and change nothing; the rest are below, worded per the chat rulings):
 --   * specials, financing, PACE, the SAH grant amount: named, never a number (the user: "Name them, no numbers").
---   * hurricane-proof: the website's words (LIB-P01). The impact-only rule stands: the website only says
---     "impact-resistant glass options" (LIB-P03 / LIB-P15).
+--   * hurricane-proof and insurance KEEP the bot's wording (the user, 2026-10-24: "Keep this: old 'no window is
+--     hurricane-proof' and insurance wording"): LIB-P01 and LIB-I01 are not touched. The impact-only rule stands:
+--     the website only says "impact-resistant glass options" (LIB-P03 / LIB-P15).
 --   * phone 866-717-8582; tax credit keeps "Regency line, QMID E1P4" (row 16, unchanged).
---   * insurance "may help lower ... your insurance company decides the final number" (the pairing the insurance
---     guard in src/agentic/discovery-discipline.js requires); UV up to 95%; licensed and insured; background checked
+--   * UV up to 95%; licensed and insured; background checked
 --     and drug tested (said of the CREWS: never "employees", GTD 7.6 hard line 11); both brands; most installed in
 --     about 6 weeks; widened doorways / ADA doors.
 -- KB-02 (styles) is updated in place; every other addition is its own row (it answers a different question).
@@ -395,12 +395,6 @@ WHERE NOT EXISTS (SELECT 1 FROM kb_faqs WHERE kb_key = 'WEB-45');
 
 -- ── rulings: existing rows updated in place ───────────────────────────
 UPDATE kb_faqs
-   SET canonical_answer = $$Yes. Our impact windows are built to be hurricane-proof: the laminated glass is so strong a bowling ball can't break through it, and they're approved for the High Velocity Hurricane Zone, including Miami-Dade.$$,
-       notes = coalesce(notes, '') || $$ | ruling (the user, 2026-10-24): use the website's words. Replaces "No window is hurricane-proof".$$ || ' || prior 2026-10-24: ' || canonical_answer,
-       updated_at = now()
- WHERE kb_key = 'LIB-P01' AND canonical_answer <> $$Yes. Our impact windows are built to be hurricane-proof: the laminated glass is so strong a bowling ball can't break through it, and they're approved for the High Velocity Hurricane Zone, including Miami-Dade.$$;
-
-UPDATE kb_faqs
    SET canonical_answer = $$Yes. Every window and door we sell is a hurricane impact window or door, with impact-resistant glass options for every opening. A specialist checks each opening and matches it to the right impact product for your home and your area's code.$$,
        notes = coalesce(notes, '') || $$ | ruling (the user, 2026-10-24): the website says "impact-resistant glass options"; impact only stands (2026-10-13).$$ || ' || prior 2026-10-24: ' || canonical_answer,
        updated_at = now()
@@ -425,12 +419,6 @@ UPDATE kb_faqs
  WHERE kb_key = 'LIB-C02' AND canonical_answer <> $$Yes. Reece is a licensed and insured Florida contractor, CGC#1507607, with Florida-certified installers and an A+ rating from the BBB.$$;
 
 UPDATE kb_faqs
-   SET canonical_answer = $$Impact windows may help lower your premium and can qualify you for wind-mitigation discounts. Your insurance company decides the final number, so your agent is the best person to confirm what applies to your policy.$$,
-       notes = coalesce(notes, '') || $$ | ruling (the user, 2026-10-24): the website says may lower premiums or qualify for discounts; paired with the carrier-decides line the insurance guard requires.$$ || ' || prior 2026-10-24: ' || canonical_answer,
-       updated_at = now()
- WHERE kb_key = 'LIB-I01' AND canonical_answer <> $$Impact windows may help lower your premium and can qualify you for wind-mitigation discounts. Your insurance company decides the final number, so your agent is the best person to confirm what applies to your policy.$$;
-
-UPDATE kb_faqs
    SET canonical_answer = $$Yes, we offer financing, including no-interest options and PACE, so you can protect your home now and pay over time. A specialist walks you through the terms at the visit.$$,
        notes = coalesce(notes, '') || $$ | ruling (the user, 2026-10-24): name the financing, no numbers. Replaces "0% APR".$$ || ' || prior 2026-10-24: ' || canonical_answer,
        updated_at = now()
@@ -438,7 +426,6 @@ UPDATE kb_faqs
 
 -- ── check (expect web_rows = 45, every updated flag true) ───────────────────
 SELECT (SELECT count(*) FROM kb_faqs WHERE kb_key LIKE 'WEB-%' AND active) AS web_rows,
-       (SELECT canonical_answer LIKE '%hurricane-proof%' FROM kb_faqs WHERE kb_key = 'LIB-P01') AS p01,
+       (SELECT canonical_answer LIKE 'No window is hurricane-proof%' FROM kb_faqs WHERE kb_key = 'LIB-P01') AS p01_kept,
        (SELECT canonical_answer LIKE '%no-interest%' FROM kb_faqs WHERE kb_key = 'LIB-X06') AS x06,
-       (SELECT canonical_answer LIKE '%decides the final number%' FROM kb_faqs WHERE kb_key = 'LIB-I01') AS i01,
        (SELECT canonical_answer LIKE '%Bay and bow%' OR canonical_answer LIKE '%bay and bow%' FROM kb_faqs WHERE kb_key = 'KB-02') AS kb02;

@@ -7,19 +7,19 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-10-24
 
-**The bot knows what reecewindows.com says (the user reviewed every answer).** 45 new answers and 8 updated
+**The bot knows what reecewindows.com says (the user reviewed every answer).** 45 new answers and 6 updated
 ones, from the review doc. Highlights:
 
 - New answers on window styles, energy, security, the install process, permits, prep for install day, cleanup,
   wall repairs, offices, Reece Builders, past work and reviews, the hurricane guide and the VA SAH grant.
 - The phone number the bot gives is **866-717-8582**.
 - Financing and specials are named (no-interest options, PACE, seasonal specials) **with no numbers**.
-- "Hurricane-proof" is now allowed in the website's words. Every window we sell is still impact.
-- Insurance: impact windows "may help lower your premium", always with "your insurance company decides the
-  final number".
+- Kept as they were (the user): "No window is hurricane-proof" and the insurance answer. Every window we sell is
+  still impact.
 - UV up to 95%, most windows installed in about 6 weeks, crews background checked and drug tested, licensed and
   insured, both window brands, widened doorways for a wheelchair.
-- A new bot-gate test checks the phone number, financing with no numbers, and hurricane-proof.
+- A new bot-gate test checks the phone number, financing with no numbers, and that the bot never says our windows
+  are hurricane-proof.
 
 **The Reece Team stays the voice (the user).** The "John's assistant" voice is built but stays switched off.
 

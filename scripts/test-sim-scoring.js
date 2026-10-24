@@ -560,19 +560,19 @@ test('2026-10-24 (the user): "are you a bot?" gets the digital assistant and a l
   assert.ok(!team.failures.some(f => ['not_disclosed_digital_assistant', 'no_live_person_offer'].includes(f.code)), JSON.stringify(team.failures));
 });
 
-test('2026-10-24 (the user, website answers): website_faq checks the phone, the financing and hurricane-proof', () => {
+test('2026-10-24 (the user, website answers): website_faq checks the phone, the financing and the kept hurricane-proof line', () => {
   const ok = scoreResult(result('website_faq', [
     turn(1, "What's your phone number?", 'You can reach us at 866-717-8582.'),
     turn(2, 'Do you offer financing?', 'Yes, we offer financing, including no-interest options and PACE. A specialist walks you through the terms at the visit.'),
-    turn(3, 'Are your windows hurricane-proof?', "Yes. Our impact windows are built to be hurricane-proof, and the laminated glass is so strong a bowling ball can't break through it."),
+    turn(3, 'Are your windows hurricane-proof?', "No window is hurricane-proof, and we won't tell you otherwise. Our impact glass is approved for the High Velocity Hurricane Zone."),
   ]));
-  assert.ok(!ok.failures.some(f => ['wrong_or_no_phone', 'financing_number', 'hurricane_proof_denied'].includes(f.code)), JSON.stringify(ok.failures));
+  assert.ok(!ok.failures.some(f => ['wrong_or_no_phone', 'financing_number', 'hurricane_proof_claimed'].includes(f.code)), JSON.stringify(ok.failures));
   const bad = scoreResult(result('website_faq', [
     turn(1, "What's your phone number?", 'You can reach us at 800-443-7126.'),
     turn(2, 'Do you offer financing?', 'Yes, we offer 0% APR financing for 18 months.'),
-    turn(3, 'Are your windows hurricane-proof?', 'No window is hurricane-proof, and we will not tell you otherwise.'),
+    turn(3, 'Are your windows hurricane-proof?', "Yes. Our impact windows are hurricane-proof."),
   ]));
-  for (const c of ['wrong_or_no_phone', 'financing_number', 'hurricane_proof_denied']) assert.ok(bad.failures.some(f => f.code === c), c);
+  for (const c of ['wrong_or_no_phone', 'financing_number', 'hurricane_proof_claimed']) assert.ok(bad.failures.some(f => f.code === c), c);
 });
 
 test('2026-10-24 gate: "I don\'t want to guess … I\'ll have John confirm" counts as an honest "I don\'t know" with a note', () => {
