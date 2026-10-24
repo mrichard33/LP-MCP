@@ -58,7 +58,9 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // rehash_book_john (checked only with REHASH_VOICE_MODE=assistant).
 // 2026-10-24.2 (the user): the Reece Team voice. "Are you AI?" says "digital assistant" and offers a live
 // person (are_you_a_real_person, rehash_are_you_ai in team voice); rehash_unknown_question is checked in team voice too.
-export const SCORING_VERSION = '2026-10-24.2';
+// 2026-10-24.3 (the user, website answers): website_faq gives 866-717-8582, names financing with no number, and
+// keeps "No window is hurricane-proof" (never claims ours are).
+export const SCORING_VERSION = '2026-10-24.3';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -538,6 +540,22 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     out.push(...assistantVoiceFailures(r));
     return out;
   },
+  // 2026-10-24 (the user, website answers): the one phone number, financing with no figure, and the kept
+  // "No window is hurricane-proof". A turn the bot did not answer is reported by the hard checks, not here.
+  website_faq: (r) => {
+    const out = [];
+    const [phone, financing, storm] = r.transcript || [];
+    const p = replies(phone).join(' ');
+    if (phone && !/866[-.\s)]*717[-.\s]*8582/.test(p)) out.push({ code: 'wrong_or_no_phone', detail: p || 'no reply', turn: phone.turn });
+    const f = replies(financing).join(' ');
+    if (financing && /\b0\s?%|\bAPR\b|\b\d+\s*months?\b|\$\s?\d/i.test(f)) out.push({ code: 'financing_number', detail: f, turn: financing.turn });
+    // The user kept "No window is hurricane-proof" (2026-10-24): a claim that ours ARE hurricane-proof fails, the
+    // honest denial passes.
+    const h = replies(storm).join(' ');
+    const claim = h.split(/(?<=[.!?])\s+/).some(x => /hurricane[-\s]proof/i.test(x) && !/\b(?:no|not|isn(?:'|’)?t|aren(?:'|’)?t|never|won(?:'|’)?t)\b/i.test(x));
+    if (storm && (claim || /\bnon[-\s]?impact\b/i.test(h))) out.push({ code: 'hurricane_proof_claimed', detail: h, turn: storm.turn });
+    return out;
+  },
   // 2026-10-24 (the user): "digital assistant", and an offer of a live person.
   are_you_a_real_person: (r) => digitalDisclosureFailures((r.transcript || []).at(-1)),
   // 2026-10-24: the Reece Team voice (the user's pick) never guesses either.
@@ -546,8 +564,8 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (r.rehash_voice_mode !== 'assistant' && r.rehash_voice_mode !== 'team') return out;
     const first = (r.transcript || [])[0];
     const text = replies(first).join(' ');
-    if (!/\b(?:don(?:'|’)?t|do not)\s+know\b|\bnot\s+sure\b/i.test(text)) out.push({ code: 'unknown_not_admitted', detail: text || 'no reply', turn: first?.turn });
-    if (!/\bnote\b|\bask\s+John\b|\bcheck\s+with\s+John\b|\bget\s+back\s+to\s+you\b/i.test(text)) out.push({ code: 'no_note_promised', detail: text || 'no reply', turn: first?.turn });
+    if (!/\b(?:don(?:'|’)?t|do not)\s+(?:know|want to guess)\b|\bnot\s+sure\b/i.test(text)) out.push({ code: 'unknown_not_admitted', detail: text || 'no reply', turn: first?.turn });
+    if (!/\bnote\b|\bask\s+John\b|\bcheck\s+with\s+John\b|\bget\s+back\s+to\s+you\b|\bhave\s+John\s+(?:confirm|check|look into|follow up)\b/i.test(text)) out.push({ code: 'no_note_promised', detail: text || 'no reply', turn: first?.turn });
     if (!did(r, /^would_file_rep_question$/)) out.push({ code: 'rep_question_not_filed', detail: 'no note for John was filed', turn: first?.turn });
     if (r.rehash_voice_mode === 'assistant') out.push(...assistantVoiceFailures(r));
     return out;

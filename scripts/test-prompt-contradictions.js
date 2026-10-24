@@ -240,24 +240,24 @@ test('the FINANCING script carries no em dash, in every prompt variant', () => {
   }
 });
 
-// ─── Mark's 0% APR ruling (2026-09-25, reconfirmed 2026-10-10) ──────
-// The bot may say Reece offers 0% APR financing, and NO other rate, term,
-// monthly payment or financing figure. PR #1236 removed 0% APR from the FAQ
-// because the prompt said "NEVER quote rates or terms" with no exception; the
-// prompt was the side that was wrong.
+// ─── Financing: name it, never a number (the user, 2026-10-24) ───────
+// Supersedes Mark's 0% APR ruling (2026-09-25 / 2026-10-10) in the prompt: the
+// bot names the options (no-interest, PACE) and states no rate, term or other
+// figure. The bare "NEVER quote rates or terms" ban stays gone, because it gave
+// the model nothing to say (PR #1236).
 
-test('every system prompt variant states the 0% APR exception, never the bare ban', () => {
+test('every system prompt variant names the financing options with no number, never the bare ban', () => {
   for (const [label, sys] of [['legacy', smsSystem('off')], ['NEPQ live', smsSystem('live')], ['live chat', chatSystem('live')]]) {
-    assert.ok(sys.includes('0% APR financing'), `${label}: no 0% APR in the prompt`);
     assert.ok(!sys.includes('NEVER quote rates or terms.'), `${label}: the bare ban is back`);
-    assert.ok(sys.includes('- FINANCING: "Yes, we offer 0% APR financing, and the rep walks you through exactly what fits during the visit." You may say 0% APR financing is available (Mark\'s ruling, 2026-09-25). Beyond that, NEVER quote a rate, a term, a monthly payment or any other financing figure.'), `${label}: FINANCING script`);
+    assert.ok(sys.includes('- FINANCING: "Yes, we offer financing, including no-interest options and PACE, and a specialist walks you through what fits during the visit." Name the options, never a number'), `${label}: FINANCING script`);
+    assert.ok(!sys.includes('we offer 0% APR financing'), `${label}: the old 0% APR script is back`);
   }
 });
 
-test('the NEPQ plan block allows 0% APR as the one financing figure', async () => {
+test('the NEPQ plan block names financing with no figure', async () => {
   const { NEPQ_ALWAYS } = await import('../src/prompts/response-generator/nepq-backbone.js');
   const first = NEPQ_ALWAYS[0];
-  assert.match(first, /any financing figure \(the one exception: you may say 0% APR financing is available when they ask about financing\)/);
+  assert.match(first, /any financing figure \(when they ask about financing, name the options, no-interest and PACE, never a number/);
   assert.match(first, /a monthly payment/);
 });
 

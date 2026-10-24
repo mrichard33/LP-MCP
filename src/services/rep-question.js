@@ -10,7 +10,7 @@
 // a promise with no `ask_rep` still files one, from the lead's own message.
 // Pure; the filing is rep-question-io.js.
 
-const NOTE_PROMISE_RX = /\b(?:I'?ll|I will|[Ww]e'?ll|[Ww]e will|[Ll]et me)\s+(?:leave|put|drop|pass|make|send)\b[^.?!]{0,40}\bnote\b|\b(?:I'?ll|I will|[Ww]e'?ll|[Ww]e will|[Ll]et me)\s+(?:ask|check with|pass (?:this|that|it|your question) (?:on |along )?to|flag (?:this|that|it) for)\s+[A-Z][a-z]+|\b(?:I'?ll|I will|[Ww]e'?ll|[Ww]e will)\s+have\s+[A-Z][a-z]+\s+(?:get back to you|answer)/;
+const NOTE_PROMISE_RX = /\b(?:I'?ll|I will|[Ww]e'?ll|[Ww]e will|[Ll]et me)\s+(?:leave|put|drop|pass|make|send)\b[^.?!]{0,40}\bnote\b|\b(?:I'?ll|I will|[Ww]e'?ll|[Ww]e will|[Ll]et me)\s+(?:ask|check with|pass (?:this|that|it|your question) (?:on |along )?to|flag (?:this|that|it) for)\s+[A-Z][a-z]+|\b(?:I'?ll|I will|[Ww]e'?ll|[Ww]e will)\s+have\s+[A-Z][a-z]+\s+(?:get back to you|answer|confirm|check|look into|follow up)/;
 
 /** The reply promises the rep a note or a question. Pure. */
 export function promisesRepNote(reply) {
