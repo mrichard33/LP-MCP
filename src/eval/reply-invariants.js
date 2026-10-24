@@ -35,9 +35,10 @@ import { isLeadSignOff } from '../agentic/sign-off.js';
 import { dropUnaskedCallOffer, leadWantsCall, isMoneyFigure, URGENCY_RX, CLAIMS_RX, POST_DEMO_REBUTTAL_RX, UNPROMISED_FOLLOW_UP_RX } from '../agentic/nepq-planner.js';
 import { sentenceAsks } from '../agentic/post-demo-email.js';
 import { isComparisonQuestion } from '../agentic/rehash-nepq.js';
+import { APPROVED_DISCLOSURE_VARIANTS, isAssistantDisclosure } from '../prompts/response-generator/system-core.js';
 
 /** Bump when a check is added or changed, so scorecards from two versions are not compared as one. */
-export const INVARIANTS_VERSION = '2026-10-19.1';
+export const INVARIANTS_VERSION = '2026-10-24.1';
 
 /** The prompt's own SMS ceiling (CHANNEL CONSTRAINTS: "320 max"). */
 export const SMS_MAX_CHARS = 320;
@@ -132,7 +133,10 @@ export function checkReply(reply, ctx = {}) {
 
   // The prompt caps an SMS at 320 characters; nothing checked it (4 of 261 sent
   // SMS in 30 days ran over, max 411; audit 2026-10-09).
-  if (ctx.channel === 'sms' && text.length > SMS_MAX_CHARS) fail('sms_too_long', `${text.length} chars (max ${SMS_MAX_CHARS})`);
+  // The approved "are you AI?" script is exempt from the cap, as it is in the generator (smsLengthCheck,
+  // 'ai_disclosure'): the 2026-10-24 replay flagged three honest disclosures as too long.
+  const disclosure = text.includes(APPROVED_DISCLOSURE_VARIANTS.standard) || isAssistantDisclosure(text);
+  if (ctx.channel === 'sms' && text.length > SMS_MAX_CHARS && !disclosure) fail('sms_too_long', `${text.length} chars (max ${SMS_MAX_CHARS})`);
 
   // ── the two bots (SMS, live chat) ─────────────────────────────────────
   // The voice, money, pressure and one-ask rules are the bots' rules: an email

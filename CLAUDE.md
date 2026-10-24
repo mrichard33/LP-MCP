@@ -1134,6 +1134,31 @@ Gate: `rehash_owned_answer_mode`; scenarios `rehash_owned_direct_question`, `reh
 `rehash_owned_change_request` (`SCORING_VERSION` 2026-10-23.2: a rehash-gate skip is not `no_reply`). Tests: `scripts/test-rehash-owned.js`,
 `scripts/test-rehash-call-booking.js`.
 
+## Website answers in the KB (the user's review, 2026-10-24)
+
+`sql/seeds/2026-10-24_website_faqs.sql`: every answer the user approved in the review doc
+(`scripts/website-kb-extract.js` read reecewindows.com) is a `kb_faqs` row, `WEB-01`..`WEB-45`, plus 8 rows updated
+in place. The rulings that change what the bot may say:
+- **Money: name it, never a number.** Financing (no-interest options, PACE), seasonal specials (free installation,
+  trade-in value) and the SAH grant ("the VA sets the maximum each year") are named; no rate, month count, payment,
+  amount or deadline. This supersedes saying "0% APR" (LIB-X06, the FINANCING script, nepq-backbone); the
+  `isMoneyFigure` exception for "0% APR" stays in code as a harmless allowance. `MONEY_RX` is unchanged.
+- **"Hurricane-proof" is allowed for the product, in the website's words** (LIB-P01: "built to be hurricane-proof
+  ... a bowling ball can't break through it"). This supersedes the banned.js line and the compliance hard reject
+  (kb_embeddings 3289/3293/3296, `2026-10-24_kb_embeddings_website_rulings.sql`). Never a promise about what a
+  storm will do to their home. Mark's product-knowledge skill still says never; it is his to edit.
+- **Impact only stands.** The website says "impact-resistant glass options", which LIB-P03 / LIB-P15 now carry;
+  `job-scope.js` still corrects any "non-impact" claim.
+- **Insurance "may help lower your premium"**, always with "your insurance company decides the final number" (the
+  pairing `findInsuranceOutcomeClaims` in `discovery-discipline.js` requires). Never "will".
+- **Two figures join the allowed references:** UV up to 95%, most windows installed within about 6 weeks
+  (kb_embeddings 3294/3297).
+- **Phone: 866-717-8582** (not 800-443-7126). Tax credit stays "the Regency line, QMID E1P4" (row 16).
+- Crews are "background checked and drug tested", said of the CREWS, never "employees" or "in-house" (GTD 7.6 hard
+  line 11 is unchanged).
+Kept as the bot had them (the user): roofing, the roof warranty, years in business, own employees, door-only jobs,
+wood doors, glass breakage, Florida-only. Gate scenario `website_faq` (SCORING_VERSION 2026-10-24.3); prompt v2.19.0.
+
 ## "Are you AI?" and the Reece Team voice (the user, 2026-10-24)
 
 **The Reece Team stays the voice** ("I think it may be better to use Reece Team"): `REHASH_VOICE_MODE=team` and

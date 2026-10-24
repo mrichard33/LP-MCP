@@ -29,7 +29,8 @@ test('the version was bumped for the new check and the cap is the prompt\'s 320'
   // 2026-10-15.1: warranty_claim_without_file (Jeff Clark).
   // 2026-10-15.2: post_demo_rebuttal / _unbacked_follow_up / question_after_post_demo_stop (Shawn Eastman).
   // 2026-10-19.1: siro_draft_copied (Siro's suggested text is a reference; handoff v2 ruling 2).
-  assert.equal(INVARIANTS_VERSION, '2026-10-19.1');
+  // 2026-10-24.1: sms_too_long exempts the approved "are you AI?" script, as the generator does.
+  assert.equal(INVARIANTS_VERSION, '2026-10-24.1');
   assert.equal(SMS_MAX_CHARS, 320);
 });
 
@@ -92,4 +93,15 @@ test('decideSmsLength never shortens the text: the decision carries no replaceme
       assert.ok(!('text' in d) && !('message' in d), 'no truncated text may come out of the guard');
     }
   }
+});
+
+test('invariants: the approved "are you AI?" script is exempt from the SMS cap, as in the generator (2026-10-24)', async () => {
+  const { checkReply } = await import('../src/eval/reply-invariants.js');
+  const { APPROVED_DISCLOSURE_VARIANTS } = await import('../src/prompts/response-generator/system-core.js');
+  const long = `${APPROVED_DISCLOSURE_VARIANTS.standard} On your question about the frames, ${'they hold up well in the Florida heat and never need painting. '.repeat(2)}`;
+  assert.ok(long.length > 320);
+  const r = checkReply(long, { channel: 'sms' });
+  assert.ok(!r.violations.some((v) => v.code === 'sms_too_long'), JSON.stringify(r.violations));
+  const plain = checkReply('x'.repeat(330), { channel: 'sms' });
+  assert.ok(plain.violations.some((v) => v.code === 'sms_too_long'));
 });

@@ -19,7 +19,7 @@ export const NEPQ_PLAN_HEADER = '═══════ NEPQ TURN PLAN (binding: 
 export const NEPQ_NO_CALL_OFFER = 'Never offer or suggest a phone call (no "quick call", no "want someone to give you a call?"): the free visit at their home is the next step. A call only if they ask for one.';
 
 export const NEPQ_ALWAYS = [
-  'Never in this reply: a price, a range, a savings figure, a monthly payment or any financing figure (the one exception: you may say 0% APR financing is available when they ask about financing); pressure or fake urgency; a stat that is not in the KB PACK; more than one question.',
+  'Never in this reply: a price, a range, a savings figure, a monthly payment or any financing figure (when they ask about financing, name the options, no-interest and PACE, never a number: the user, 2026-10-24); pressure or fake urgency; a stat that is not in the KB PACK; more than one question.',
   'Write it in their words. One short question at most.',
   'Never repeat a sentence or an opener you already sent in this conversation (no second "Based on what you told me", "Great question", "Happy to help"); say it a new way.',
 ];

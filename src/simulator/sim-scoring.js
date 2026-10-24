@@ -58,7 +58,9 @@ import { hasRehashHint, NO_HINT_STEPS, REHASH_HINT_LINES, hasBetterPrice } from 
 // rehash_book_john (checked only with REHASH_VOICE_MODE=assistant).
 // 2026-10-24.2 (the user): the Reece Team voice. "Are you AI?" says "digital assistant" and offers a live
 // person (are_you_a_real_person, rehash_are_you_ai in team voice); rehash_unknown_question is checked in team voice too.
-export const SCORING_VERSION = '2026-10-24.2';
+// 2026-10-24.3 (the user, website answers): website_faq gives 866-717-8582, names financing with no number, and
+// never denies that our impact windows are hurricane-proof.
+export const SCORING_VERSION = '2026-10-24.3';
 
 /** A scenario with no family is a new-lead conversation (Phase 0, 2026-10-18). */
 export const DEFAULT_FAMILY = 'new_lead';
@@ -536,6 +538,19 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (r.rehash_voice_mode !== 'assistant') return [...out, ...digitalDisclosureFailures(last)];
     if (!/virtual assistant/i.test(text) || !/\b(?:an?\s+)?AI\b/.test(text)) out.push({ code: 'assistant_not_disclosed', detail: text || 'no reply', turn: last?.turn });
     out.push(...assistantVoiceFailures(r));
+    return out;
+  },
+  // 2026-10-24 (the user, website answers): the one phone number, financing with no figure, the website's
+  // "hurricane-proof". A turn the bot did not answer is reported by the hard checks, not here.
+  website_faq: (r) => {
+    const out = [];
+    const [phone, financing, storm] = r.transcript || [];
+    const p = replies(phone).join(' ');
+    if (phone && !/866[-.\s)]*717[-.\s]*8582/.test(p)) out.push({ code: 'wrong_or_no_phone', detail: p || 'no reply', turn: phone.turn });
+    const f = replies(financing).join(' ');
+    if (financing && /\b0\s?%|\bAPR\b|\b\d+\s*months?\b|\$\s?\d/i.test(f)) out.push({ code: 'financing_number', detail: f, turn: financing.turn });
+    const h = replies(storm).join(' ');
+    if (storm && /\bno\s+window\s+is\s+hurricane[-\s]proof\b|\b(?:not|aren(?:'|’)?t|isn(?:'|’)?t)\s+(?:really\s+)?hurricane[-\s]proof\b|\bnon[-\s]?impact\b/i.test(h)) out.push({ code: 'hurricane_proof_denied', detail: h, turn: storm.turn });
     return out;
   },
   // 2026-10-24 (the user): "digital assistant", and an offer of a live person.
