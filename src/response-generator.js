@@ -18,6 +18,8 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.17.1 — 2026-10-24. The assistant voice never gives the rep a pronoun ("if he could", "a quick call with
+ *   him" in the F.0 assistant previews): the rehash assistant branch says to name the rep again.
  * v2.17.0 — 2026-10-24. JOHN'S VIRTUAL ASSISTANT (the user). REHASH_VOICE_MODE=assistant: a post-demo
  *   reply speaks as the rehash rep's virtual assistant ("I" is the assistant, the rep is third person), says
  *   plainly it is an AI when asked, never guesses ("I don't know, I'll leave John a note") and returns
@@ -515,11 +517,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.17.0 — the header version above, as a value. Stamped (with the deployed
+ * v2.17.1 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.17.0';
+export const RESPONSE_GENERATOR_VERSION = 'v2.17.1';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy

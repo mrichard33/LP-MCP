@@ -50,3 +50,10 @@ test('the picker reads version 4 only in the assistant voice', () => {
   assert.ok(!f0FormulaAllows(row(4), F0, { siro: { formula: 'v1' } }));
   assert.equal(siroModes({ F0_TEXT_VOICE: 'assistant' }).f0TextVoice, 'assistant');
 });
+
+test('assistant checks: the rep is named again, never "him" or "if he could" (preview 2026-10-24)', () => {
+  assert.ok(check("Carla, this is John's assistant at Reece. Wanting your grandson's input makes sense. Would a call with John make sense if he could help fit this into your budget?", 1).includes('rep_pronoun'));
+  assert.ok(check('Carla, sorting your funding first makes sense. John may be able to get you a better deal, so is a quick call with him worth it?', 2).includes('rep_pronoun'));
+  // The lead's spouse may be "she": that is not the rep.
+  assert.ok(!check('Carla, wanting your wife to see it first is fair, once she has looked it over. John may be able to fit this into your budget. Would a quick call with John help?', 2).includes('rep_pronoun'));
+});

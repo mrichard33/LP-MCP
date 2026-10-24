@@ -20,6 +20,8 @@ John's virtual assistant (the user), behind two switches: `REHASH_VOICE_MODE=ass
   says who is writing, the last signs "- John's assistant". The emails stay the Reece Team's.
 - Three new test scenarios for the bot gate: are-you-AI, an unknown question, booking on
   John's calendar.
+- **John's assistant never calls John "he" or "him".** It says "John" again (the F.0
+  assistant previews said "if he could" and "a quick call with him").
 - **A repeated F.0 close gets a clearer second try.** The re-write note now lists the
   opening words already used in this lead's thread, and the F.0 preview can try the
   assistant voice (`text_voice`) without changing Railway.
