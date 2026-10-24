@@ -561,8 +561,8 @@ export const SCENARIO_EXPECTATIONS = Object.freeze({
     if (r.rehash_voice_mode !== 'assistant' && r.rehash_voice_mode !== 'team') return out;
     const first = (r.transcript || [])[0];
     const text = replies(first).join(' ');
-    if (!/\b(?:don(?:'|’)?t|do not)\s+know\b|\bnot\s+sure\b/i.test(text)) out.push({ code: 'unknown_not_admitted', detail: text || 'no reply', turn: first?.turn });
-    if (!/\bnote\b|\bask\s+John\b|\bcheck\s+with\s+John\b|\bget\s+back\s+to\s+you\b/i.test(text)) out.push({ code: 'no_note_promised', detail: text || 'no reply', turn: first?.turn });
+    if (!/\b(?:don(?:'|’)?t|do not)\s+(?:know|want to guess)\b|\bnot\s+sure\b/i.test(text)) out.push({ code: 'unknown_not_admitted', detail: text || 'no reply', turn: first?.turn });
+    if (!/\bnote\b|\bask\s+John\b|\bcheck\s+with\s+John\b|\bget\s+back\s+to\s+you\b|\bhave\s+John\s+(?:confirm|check|look into|follow up)\b/i.test(text)) out.push({ code: 'no_note_promised', detail: text || 'no reply', turn: first?.turn });
     if (!did(r, /^would_file_rep_question$/)) out.push({ code: 'rep_question_not_filed', detail: 'no note for John was filed', turn: first?.turn });
     if (r.rehash_voice_mode === 'assistant') out.push(...assistantVoiceFailures(r));
     return out;

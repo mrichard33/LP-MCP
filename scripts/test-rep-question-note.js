@@ -78,3 +78,10 @@ test('a failed card is an ops line, and the task still files', async () => {
   assert.match(r.card, /not_in_channel/);
   assert.equal(calls.ops.length, 1);
 });
+
+test('2026-10-24 gate: "I\'ll have John confirm that detail" is a promise a note must back', async () => {
+  const { promisesRepNote } = await import('../src/services/rep-question.js');
+  assert.ok(promisesRepNote("I don't want to guess on the exact salt spray wording, so I'll have John confirm that detail for you."));
+  assert.ok(promisesRepNote("We'll have John look into that and get back to you."));
+  assert.ok(!promisesRepNote('John will give you a call then.'));
+});

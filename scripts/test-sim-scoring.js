@@ -574,3 +574,11 @@ test('2026-10-24 (the user, website answers): website_faq checks the phone, the 
   ]));
   for (const c of ['wrong_or_no_phone', 'financing_number', 'hurricane_proof_denied']) assert.ok(bad.failures.some(f => f.code === c), c);
 });
+
+test('2026-10-24 gate: "I don\'t want to guess … I\'ll have John confirm" counts as an honest "I don\'t know" with a note', () => {
+  const honest = "Our frames are vinyl. I don't want to guess on the exact salt spray wording, so I'll have John confirm that detail for you.";
+  const r = scoreResult(sms('rehash_unknown_question', [turn(1, 'Does the warranty cover salt spray?', honest, { ...pd('post_demo'), would_do: [{ kind: 'would_file_rep_question' }] })], { rehash_voice_mode: 'team' }));
+  assert.ok(!r.failures.some(f => ['unknown_not_admitted', 'no_note_promised'].includes(f.code)), JSON.stringify(r.failures));
+  const guess = scoreResult(sms('rehash_unknown_question', [turn(1, 'Does the warranty cover salt spray?', "Since that's wear from the elements, not a storm, it's covered.", pd('post_demo'))], { rehash_voice_mode: 'team' }));
+  assert.ok(guess.failures.some(f => f.code === 'unknown_not_admitted'));
+});
