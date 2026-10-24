@@ -521,8 +521,12 @@ export const postDemoRehash = (repName, { callTimes = false, betterPrice = false
           `NEVER GUESS. If the LEAD FACTS, the PRESENTATION and the knowledge base do not answer their question, say plainly that you don't know, that you'll leave ${assistantRep} a note, and that ${assistantRep} will get back to them on it. It is fine not to know. Then add a top-level "ask_rep" string to your JSON with their question in their words (the system files the note for ${assistantRep}); otherwise "ask_rep": null.`,
         ].join(' ')
     : teamVoiceRep
-      ? `Write as the Reece Team, never as ${teamVoiceRep}: name ${teamVoiceRep} only in the third person ("${teamVoiceRep} can give you a quick call"), never "I'm ${teamVoiceRep}", never "I'll call you", never a "— ${teamVoiceRep}" sign-off. Short, warm, plain.`
-      : 'Write in our team voice.';
+      ? [
+          `Write as the Reece Team, never as ${teamVoiceRep}: name ${teamVoiceRep} only in the third person ("${teamVoiceRep} can give you a quick call"), never "I'm ${teamVoiceRep}", never "I'll call you", never a "— ${teamVoiceRep}" sign-off. Short, warm, plain.`,
+          // 2026-10-24 (the user chose the Reece Team voice, and kept "never guess").
+          `NEVER GUESS. If the LEAD FACTS, the PRESENTATION and the knowledge base do not answer their question, say plainly that you don't know and that you'll have ${teamVoiceRep} get back to them on it. It is fine not to know. Then add a top-level "ask_rep" string to your JSON with their question in their words (the system files the note for ${teamVoiceRep}); otherwise "ask_rep": null.`,
+        ].join(' ')
+      : 'Write in our team voice. NEVER GUESS: if the LEAD FACTS, the PRESENTATION and the knowledge base do not answer their question, say plainly that you don\'t know and that someone on our team will get back to them on it, and add a top-level "ask_rep" string to your JSON with their question in their words; otherwise "ask_rep": null.';
   // The assistant is never the one who could get a better price: the rep is.
   const asRep = (t) => (assistantRep ? t.replaceAll('If I could', `If ${assistantRep} could`).replaceAll('if I could, would you?', `if ${assistantRep} could, would you?`) : t);
   return [

@@ -3675,8 +3675,8 @@ async function executeSendMessageInner(action, context, turnState = { held: null
     message = ownedAnswer.message;
     console.log(`[SendMessage] 💬 owned rehash lead ${contactId}: answer only (${ownedAnswer.kind}${ownedAnswer.used_fallback ? `, backup line: ${ownedAnswer.reason}` : ''})`);
     // 2026-10-24 (the user): "John will cover that on your call" is a question
-    // John must know about. In the assistant voice it is filed for him.
-    if (ownedAnswer.used_fallback && ownedAnswer.kind === 'question' && rehashVoiceMode() === 'assistant') {
+    // John must know about. In the team or assistant voice it is filed for the rep.
+    if (ownedAnswer.used_fallback && ownedAnswer.kind === 'question' && ['team', 'assistant'].includes(rehashVoiceMode())) {
       trackBackground(fileRepQuestion({ contactId, question: ownedInboundText, source: 'owned_answer' })
         .catch(err => console.warn(`[SendMessage] owned rep question filing failed for ${contactId}: ${err.message}`)));
     }

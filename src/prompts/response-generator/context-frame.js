@@ -755,7 +755,8 @@ export const spouseAdvocacySpent = (ourWords) => [
 // HANDOFF PENDING — a person is already on the way (2026-09-23)
 // ═══════════════════════════════════════════════════════════════════
 //
-// The AI-disclosure script offers "just say the word and I'll have them reach
+// The AI-disclosure script offers a person (since 2026-10-24 "If you'd like to speak to a real person, I can get
+// you a live person"; before, "just say the word and I'll have them reach
 // out". When the lead takes that offer, HOT_CALL_IMMEDIATE pushes the callback
 // to LP (the dial trigger, ~4s to LP_ASAP) and tags intent:callback-requested.
 //

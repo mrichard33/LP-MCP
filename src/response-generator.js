@@ -18,6 +18,11 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.18.0 — 2026-10-24. "ARE YOU AI?" SAYS DIGITAL ASSISTANT AND OFFERS A LIVE PERSON; THE REECE TEAM NEVER GUESSES
+ *   (the user). The approved script is "Fair question. I'm Reece's digital assistant. … If you'd like to speak to
+ *   a real person, I can get you a live person." (guardDisclosure reads an OFFER of a person out before its claim
+ *   check). The rehash Reece Team voice (REHASH_VOICE_MODE=team, the user's pick) now says plainly when it does not
+ *   know and returns ask_rep, filed for the rep like the assistant voice.
  * v2.17.1 — 2026-10-24. The assistant voice never gives the rep a pronoun ("if he could", "a quick call with
  *   him" in the F.0 assistant previews): the rehash assistant branch says to name the rep again.
  * v2.17.0 — 2026-10-24. JOHN'S VIRTUAL ASSISTANT (the user). REHASH_VOICE_MODE=assistant: a post-demo
@@ -517,11 +522,11 @@ import {
 } from './agentic/service-area-turn.js';
 
 /**
- * v2.17.1 — the header version above, as a value. Stamped (with the deployed
+ * v2.18.0 — the header version above, as a value. Stamped (with the deployed
  * git sha) onto every fingerprint so a replay knows which generator wrote the
  * reply. Bump it with the header note.
  */
-export const RESPONSE_GENERATOR_VERSION = 'v2.17.1';
+export const RESPONSE_GENERATOR_VERSION = 'v2.18.0';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy

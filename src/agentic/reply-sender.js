@@ -386,14 +386,19 @@ const HUMAN_CLAIM_PATTERNS = [
   /talking to a (human|person)/i,
 ];
 
+// The offer of a person, read out before the claim check: "speak/talk/chat to/with a
+// real/live person", "get/connect/transfer you (to/with) a live person".
+const HUMAN_OFFER_RX = /\b(?:speak|talk|chat)\s+(?:to|with)\s+a\s+(?:real|live)\s+(?:person|human|rep|agent)\b|\b(?:get|connect|transfer)\s+you\s+(?:to\s+|with\s+)?a\s+(?:real|live)\s+(?:person|human|rep|agent)\b/gi;
+
 // 2026-09-26 — opener changed from "Good question —" to "Fair question —", the
 // owner-approved disclosure opener (system-core.js APPROVED_DISCLOSURE_VARIANTS).
 // "Good question" is now a banned opener everywhere else; the guard's own
 // replacement body must not be the one message that still uses it.
 // 2026-10-06 (the user): no em dash in any bot line, so "Fair question." now.
+// 2026-10-24 (the user): "digital assistant", as the approved script.
 export const DISCLOSURE_FALLBACK =
-  "Fair question. I'm an AI assistant helping the Reece Windows & Doors team respond quickly. " +
-  'A human team member reviews these conversations and can follow up directly.';
+  "Fair question. I'm Reece's digital assistant, helping the Reece Windows & Doors team respond quickly. " +
+  'Someone on our team reviews these conversations and can follow up directly.';
 
 /**
  * Hard output guard. Pure — runs on EVERY agentic outbound body, regardless
@@ -407,8 +412,14 @@ export const DISCLOSURE_FALLBACK =
  */
 export function guardDisclosure(body) {
   const text = String(body || '');
+  // 2026-10-24 (the user): the approved script now OFFERS a person ("If you'd
+  // like to speak to a real person, I can get you a live person"). An offer is
+  // not a claim, so offer shapes are taken out before the claim patterns run;
+  // "I'm a real person", "real person here", "our live person will help" and
+  // "you're talking to a live rep" are still blocked.
+  const claims = text.replace(HUMAN_OFFER_RX, ' ');
   for (const re of HUMAN_CLAIM_PATTERNS) {
-    if (re.test(text)) {
+    if (re.test(claims)) {
       return { body: DISCLOSURE_FALLBACK, blocked: true, pattern: re.source };
     }
   }

@@ -10,7 +10,11 @@ test('the model\'s ask_rep is filed; a note promised with no ask_rep is filed fr
   assert.deepEqual(repQuestionFor({ voice: 'assistant', askRep: ' Is the glass laminated? ', reply: 'x' }), { question: 'Is the glass laminated?', source: 'model' });
   assert.deepEqual(repQuestionFor({ voice: 'assistant', askRep: null, reply: "I don't know that one, so I'll leave John a note and he'll get back to you.", trigger: 'Does the warranty cover salt air?' }),
     { question: 'Does the warranty cover salt air?', source: 'promise_backed' });
-  assert.equal(repQuestionFor({ voice: 'team', askRep: 'Is the glass laminated?' }), null, 'never outside the assistant voice');
+  // 2026-10-24 (the user picked the Reece Team voice): team files too; the rep voice and no rehash line do not.
+  assert.deepEqual(repQuestionFor({ voice: 'team', askRep: 'Is the glass laminated?' }), { question: 'Is the glass laminated?', source: 'model' });
+  assert.equal(repQuestionFor({ voice: 'team', reply: "Good question, I don't know. We'll have John get back to you on it.", trigger: 'Is it laminated?' })?.source, 'promise_backed');
+  assert.equal(repQuestionFor({ voice: 'rep', askRep: 'Is the glass laminated?' }), null, 'never in the rep voice');
+  assert.equal(repQuestionFor({ voice: null, askRep: 'Is the glass laminated?' }), null, 'never off the rehash line');
   assert.equal(repQuestionFor({ voice: 'assistant', askRep: 'null', reply: 'Happy to help.' }), null);
 });
 

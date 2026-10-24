@@ -7,6 +7,15 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-10-24
 
+**The Reece Team stays the voice (the user).** The "John's assistant" voice is built but stays switched off.
+
+- **"Are you AI?" now gets:** "Fair question. I'm Reece's digital assistant. I handle first replies so
+  nobody's left waiting, and someone on our team sees every conversation. If you'd like to speak to a real
+  person, I can get you a live person." Both the texts and the website chat. The safety check still blocks the
+  bot from ever claiming to be a person; it now lets the OFFER of a person through.
+- **The Reece Team never guesses either.** On a post-demo lead's question it cannot answer, it says it doesn't
+  know and that John will get back to them, and John gets the task, note and card.
+
 John's virtual assistant (the user), behind two switches: `REHASH_VOICE_MODE=assistant`
 (replies) and `F0_TEXT_VOICE=assistant` (the F.0 texts). Nothing changes until they are set.
 
