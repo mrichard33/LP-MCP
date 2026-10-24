@@ -140,3 +140,13 @@ test('in team voice the call reason counts as the conditional offer', async () =
   assert.ok(!checkF0Copy(text, opts).includes('no_conditional_offer'));
   assert.ok(checkF0Copy(text.replace(' to see about fitting this into your budget or finding a better deal', ''), opts).includes('no_conditional_offer'));
 });
+
+test('2026-10-24: the close_repeated re-write note names the openers already used', async () => {
+  const { f0RetryNote } = await import('../src/siro/f0-copy-checks.js');
+  const { earlierCloseOpeners } = await import('../src/siro/f0-four-step.js');
+  const earlier = ['Mark, it fits. Would a quick call with John be worth it?', 'Hi. We may be able to fit your budget, could a quick call with John help?'];
+  assert.deepEqual(earlierCloseOpeners(earlier), ['Would a quick call', 'could a quick call']);
+  const note = f0RetryNote(['close_repeated'], { position: 3, formula: 'four_step', voice: 'team', earlierMessages: earlier });
+  assert.match(note, /Do not start the call question with any of these: "Would a quick call", "could a quick call"\./);
+  assert.doesNotMatch(f0RetryNote(['close_repeated'], { position: 3, formula: 'four_step', voice: 'team' }), /any of these/);
+});

@@ -20,6 +20,9 @@ John's virtual assistant (the user), behind two switches: `REHASH_VOICE_MODE=ass
   says who is writing, the last signs "- John's assistant". The emails stay the Reece Team's.
 - Three new test scenarios for the bot gate: are-you-AI, an unknown question, booking on
   John's calendar.
+- **A repeated F.0 close gets a clearer second try.** The re-write note now lists the
+  opening words already used in this lead's thread, and the F.0 preview can try the
+  assistant voice (`text_voice`) without changing Railway.
 
 - **F.0 texts with a reason no longer fail as repeats.** The check for a repeated
   closing line now reads the question itself, not the budget / better-deal reason

@@ -237,6 +237,22 @@ export function closeRepeats(draft, earlier = []) {
   });
 }
 
+/**
+ * The opening words of each earlier close's question, as written (2026-10-24:
+ * Mark Test's GHL 4 repeated "Would a quick call with John be worth …" after
+ * a re-write that only said "word it a new way"). For the re-write note. Pure.
+ */
+export function earlierCloseOpeners(earlier = []) {
+  const out = [];
+  for (const e of Array.isArray(earlier) ? earlier : []) {
+    const q = closingQuestion(e);
+    if (!q) continue;
+    const words = closingClause(q).replace(/[?.!]+$/, '').split(/\s+/).filter(Boolean).slice(0, 4).join(' ');
+    if (words && !out.some(o => o.toLowerCase() === words.toLowerCase())) out.push(words);
+  }
+  return out;
+}
+
 /** The closes of our earlier messages, for the prompt's EARLIER CLOSES line. Pure. */
 export function earlierClosesLine(earlier = []) {
   const qs = [...new Set((Array.isArray(earlier) ? earlier : []).map(closingQuestion).filter(Boolean))];

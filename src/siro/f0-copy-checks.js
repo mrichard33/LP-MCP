@@ -26,7 +26,7 @@ import { POST_DEMO_REBUTTAL_RX, UNPROMISED_FOLLOW_UP_RX } from '../agentic/nepq-
 import { enforceRehashCallTiming } from '../agentic/team-hours.js';
 import { hasSensitiveDetail } from './text-guards.js';
 import { copiesSiroDraft, repQuoteRx } from './presentation-guard.js';
-import { groundingSources, FOUR_STEP_SLOTS, CONDITIONAL_OFFER_RX, closeRepeats, closeGivesReason } from './f0-four-step.js';
+import { groundingSources, FOUR_STEP_SLOTS, CONDITIONAL_OFFER_RX, closeRepeats, closeGivesReason, earlierCloseOpeners } from './f0-four-step.js';
 import { findExclamations } from '../agentic/discovery-discipline.js';
 import { F0_EMAIL_SUBJECT_MAX, F0_EMAIL_PREHEADER_MAX, F0_EMAIL_BODY_WORDS, F0_TEAM_SIGNATURE, F0_TEAM_CALL_FALLBACK } from './f0-email.js';
 
@@ -407,11 +407,13 @@ export function checkF0Copy(text, { facts = null, position = 1, repFirstName = n
 }
 
 /** One line per failure for the re-write note. Pure. */
-export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' }) {
+export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep', earlierMessages = [] }) {
   const email = formula === 'email';
   const teamEmail = email && voice === 'team';
   const teamText = formula === 'four_step' && voice === 'team';
   const assistantText = formula === 'four_step' && voice === 'assistant';
+  // 2026-10-24: the opening words already used, so a re-write cannot repeat them.
+  const usedOpeners = failures.includes('close_repeated') ? earlierCloseOpeners(earlierMessages) : [];
   const why = {
     too_long: `Keep it under ${F0_SMS_MAX} characters.`,
     question_count: email ? 'Ask exactly one question in the whole email (subject, preheader, body and P.S.): the call invite at the end of the body.'
@@ -443,7 +445,8 @@ export function f0RetryNote(failures, { position, formula = 'v1', voice = 'rep' 
     first_name_not_first: 'Start the text with their first name.',
     no_conditional_offer: 'Before the call question, offer to make it work better for them, in your own words (for example "if there\'s a way to …", "we may be able to …"). It does not have to say "If I could".',
     no_call_reason: 'Say WHY the call is worth it, right before or inside the call question: we may be able to fit this into their budget, or get them a better price (never "deal", never a number).',
-    close_repeated: 'The close repeats one we already sent this lead. Word the call question a new way, and do not use "if I could" or "if we could" again.',
+    close_repeated: 'The close repeats one we already sent this lead. Word the call question a new way, and do not use "if I could" or "if we could" again.'
+      + (usedOpeners.length ? ` Do not start the call question with any of these: ${usedOpeners.map(u => `"${u}"`).join(', ')}.` : ''),
     no_call_question: teamEmail ? 'End the email on one question asking for a quick call with <CALL WITH>, in your own words, and nothing after it.'
       : teamText ? 'End with one question asking for a quick call with <CALL WITH>, in your own words, and nothing after it.'
         : 'End with one question asking for a quick call with <rep first name>, in your own words.',

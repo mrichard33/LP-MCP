@@ -486,7 +486,7 @@ async function runNurtureGenerationInner(request) {
         ...prompt,
         system_prompt: prompt.system_prompt +
           `\n\nIMPORTANT: A previous attempt failed these safety checks: ${safety.failures.join(', ')}. Details: ${safety.details.join('; ')}. You MUST fix all of them in this attempt. These are non-negotiable compliance and trust requirements.` +
-          (safety.f0Failures?.length ? `\n\n${f0RetryNote(safety.f0Failures, { position: request.sequence_position, formula: f0CheckFormula(f0, request), voice: f0VoiceFor(f0, request) })}` : ''),
+          (safety.f0Failures?.length ? `\n\n${f0RetryNote(safety.f0Failures, { position: request.sequence_position, formula: f0CheckFormula(f0, request), voice: f0VoiceFor(f0, request), earlierMessages: f0?.earlierMessages || [] })}` : ''),
       };
       genResult = await generateNurtureContent(constrainedPrompt, context);
       if (isF0) genResult = { ...genResult, output: f0Output(genResult.output, f0, request) };

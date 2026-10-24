@@ -27,14 +27,16 @@ import { emailGate, f0EmailOutput, F0_EMAIL_POSITION, F0_EMAIL_POSITIONS } from 
  *   the position-0 email (its row read even while inactive), and reports what
  *   the live path would do first: awaiting_siro, no_recording or a suppression.
  */
-export async function previewF0Generation(contactId, position, { deps = {}, formula = null, channel = 'sms' } = {}) {
+// 2026-10-24: `textVoice` previews the texts in another F0_TEXT_VOICE (the
+// assistant's version-4 rows) without changing Railway.
+export async function previewF0Generation(contactId, position, { deps = {}, formula = null, channel = 'sms', textVoice = null } = {}) {
   const email = channel === 'email';
   // 2026-10-23: internal 6 / 7 are the day-4 and day-11 emails.
   const pos = email ? (F0_EMAIL_POSITIONS.includes(Number(position)) ? Number(position) : F0_EMAIL_POSITION) : Math.min(5, Math.max(1, Number(position) || 1));
   const fourStepPreview = formula === 'four_step';
   const request = { contact_id: contactId, workflow_code: 'F.0', sequence_position: pos, channel: email ? 'email' : 'sms', ...((fourStepPreview || email) ? { include_inactive: true } : {}) };
   const context = await (deps.buildLeadContext || buildLeadContext)(contactId, { skipCache: true, workflow_code: 'F.0' });
-  const env = formula ? { ...process.env, F0_FORMULA_MODE: formula } : process.env;
+  const env = { ...process.env, ...(formula ? { F0_FORMULA_MODE: formula } : {}), ...(textVoice ? { F0_TEXT_VOICE: textVoice } : {}) };
   const f0 = await loadF0Context(context, request, { deps, allowEnsure: false, env });
   const fourStep = !email && f0.vars.formula === 'four_step';
   context.siro = { ...f0.vars, selector_objection: email ? null : fourStep ? (f0.vars.objection_type || 'none') : (f0.facts ? null : 'no-visit-data') };
@@ -93,7 +95,7 @@ export async function previewF0Generation(contactId, position, { deps = {}, form
     retried = await attempt({
       ...prompt,
       system_prompt: `${prompt.system_prompt}\n\nIMPORTANT: A previous attempt failed these checks: ${[...first.safety.failures, ...first.f0Failures].join(', ')}.` +
-        (first.f0Failures.length ? `\n\n${f0RetryNote(first.f0Failures, { position: pos, formula: email ? 'email' : fourStep ? 'four_step' : 'v1', voice: (email ? f0.vars.email_voice : f0.vars.text_voice) || 'rep' })}` : ''),
+        (first.f0Failures.length ? `\n\n${f0RetryNote(first.f0Failures, { position: pos, formula: email ? 'email' : fourStep ? 'four_step' : 'v1', voice: (email ? f0.vars.email_voice : f0.vars.text_voice) || 'rep', earlierMessages: f0.earlierMessages || [] })}` : ''),
     });
   }
   const final = retried || first;
