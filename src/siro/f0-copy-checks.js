@@ -132,7 +132,9 @@ function fourStepFailures(body, { facts, position, repFirstName, slots, firstNam
   if (position < CLOSE_POSITION) {
     // 2026-10-22 (the user): "if I could, would you" is the strategy, not the
     // words. Any conditional offer to make it work better counts.
-    if (!CONDITIONAL_OFFER_RX.test(body)) fail.push('no_conditional_offer');
+    // 2026-10-24: in team voice the reason ("to see about fitting this into
+    // your budget", "a better deal") IS the conditional offer.
+    if (!CONDITIONAL_OFFER_RX.test(body) && !(voice === 'team' && closeGivesReason(body))) fail.push('no_conditional_offer');
     // 2026-10-23 (the user): the Reece Team close says WHY: a budget fit or a
     // better price (closeGivesReason). The rep voice is the rollback, unchanged.
     if (voice === 'team' && !closeGivesReason(body)) fail.push('no_call_reason');

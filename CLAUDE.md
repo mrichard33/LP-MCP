@@ -960,7 +960,9 @@ home: `src/siro/f0-email.js` (position, mode, hold cap, output shape); the copy 
   text with the position's wait (`generated_meta.fallback_text`). A real stop still suppresses and ends. The Reece Team
   close names the reason for the call, a budget fit or a better deal (`closeGivesReason`, checkF0Copy
   `no_call_reason`); "deal" is fine on team copy ("a better deal" passes the offer test; the rep-voice rollback keeps
-  the ban). Tests: `scripts/test-f0-text-fallback.js`.
+  the ban). Tests: `scripts/test-f0-text-fallback.js`. A close's opener is read from its question clause
+  (`closingClause`, the part after the last comma when it starts with a question word), so the reason in front of it
+  never counts as a repeat, and in team voice the reason counts as the conditional offer (2026-10-24 previews).
 - **Every unsold demo gets an email (the user, 2026-10-23; replaces "a quiet exit, never a fixed email" for this one
   email, and Part 7's "no static messages" for it).** When the email ends with no AI email and no rule against one
   (`emailFallbackTag`, `F0_EMAIL_FALLBACK_REASONS` in `f0-email.js`: no_recording, F.0 / the email off, the prompt

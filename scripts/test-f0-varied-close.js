@@ -119,3 +119,24 @@ test('the varied-close seed: every good example passes, and no two examples clos
   assert.ok(ifCould <= 1, `"if I could" in ${ifCould} examples`);
   assert.ok(openers.size >= 7, `only ${openers.size} different closes`);
 });
+
+// 2026-10-24 (Mark Test previews): the reason rides in front of the question,
+// so the opener is read from the question clause, not from the reason.
+test('the opener is the question clause, never the reason in front of it', async () => {
+  const { closingClause, closeRepeats } = await import('../src/siro/f0-four-step.js');
+  assert.equal(closingClause('We may be able to fit this into your budget, could a quick call with John make that happen?'),
+    'could a quick call with John make that happen?');
+  assert.equal(closingClause('Would a quick call with John make sense?'), 'Would a quick call with John make sense?');
+  const earlier = ['Mark, we may be able to make it easier to share with him, would a quick call with John make sense?'];
+  assert.equal(closeRepeats('Mark, we may be able to fit this into your budget, could a quick call with John help?', earlier), false);
+  assert.equal(closeRepeats('Mark, there may be a way, would a quick call with John be worth it?', earlier), true);
+  assert.equal(closeRepeats('If we could fit your budget, would a short call help?', ['If we could, is a call worth it?']), true);
+});
+
+test('in team voice the call reason counts as the conditional offer', async () => {
+  const { checkF0Copy } = await import('../src/siro/f0-copy-checks.js');
+  const text = 'Mark, the door is still open on protecting the home for your family before Christmas. Would a quick call with John be worth it to see about fitting this into your budget or finding a better deal?';
+  const opts = { position: 4, formula: 'four_step', voice: 'team', callWith: 'John', repFirstName: 'John', firstName: 'Mark' };
+  assert.ok(!checkF0Copy(text, opts).includes('no_conditional_offer'));
+  assert.ok(checkF0Copy(text.replace(' to see about fitting this into your budget or finding a better deal', ''), opts).includes('no_conditional_offer'));
+});
