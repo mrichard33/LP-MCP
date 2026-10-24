@@ -131,6 +131,7 @@ export function registerSiroTools(server) {
       numbering: z.enum(['ghl', 'internal']).optional().describe('ghl (default, what the workflow sends since 2026-10-21) or internal (the old numbering, kept for one release).'),
       channel: z.enum(['sms', 'email']).optional().describe('F.0 preview channel. Optional: the position decides it; when given it must match.'),
       formula: z.enum(['v1', 'four_step']).optional().describe('F.0 preview formula (default: Railway\'s F0_FORMULA_MODE). four_step reads the version-2 Four-Step prompts even while they are inactive.'),
+      text_voice: z.enum(['team', 'rep', 'assistant']).optional().describe('F.0 text voice for the preview (default: Railway\'s F0_TEXT_VOICE). assistant reads the version-4 rows (the rehash rep\'s virtual assistant).'),
     },
     async (a) => {
       if (!a.lp_lead_id && !a.lp_prospect_id && !a.ghl_contact_id) return ok({ error: 'give lp_lead_id, lp_prospect_id or ghl_contact_id' });
@@ -147,7 +148,7 @@ export function registerSiroTools(server) {
         const contactId = a.ghl_contact_id || rows.find(r => r.ghl_contact_id)?.ghl_contact_id;
         const pos = previewF0Position(a);
         if (pos.error) out.f0_preview = { error: pos.error };
-        else out.f0_preview = contactId ? await previewF0Generation(contactId, pos.position, { formula: a.formula || null, channel: pos.channel }) : { error: 'no GHL contact for this lead' };
+        else out.f0_preview = contactId ? await previewF0Generation(contactId, pos.position, { formula: a.formula || null, channel: pos.channel, textVoice: a.text_voice || null }) : { error: 'no GHL contact for this lead' };
       }
       return ok(out);
     },
