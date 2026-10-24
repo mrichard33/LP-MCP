@@ -204,19 +204,36 @@ export function closeOpener(question) {
   return words.length >= 4 ? words.slice(0, 4).join(' ') : '';
 }
 
+// 2026-10-24 (Mark Test previews after the call-reason rule): the reason now
+// rides in front of the question ("We may be able to fit this into your
+// budget, could a quick call with John …?"), so the whole sentence's first four
+// words were the REASON's, and every close opening "We may be able to …"
+// collided. The opener is read from the question clause: the part after the
+// last comma / semicolon / colon / dash when it starts with a question word.
+const QUESTION_WORD_RX = /^(?:would|could|can|is|are|how|what|does|do|should|will|may|might|shall|isn'?t|wouldn'?t)\b/i;
+
+/** The question clause of a closing question (the reason in front of it dropped). Pure. */
+export function closingClause(question) {
+  const q = String(question || '').trim();
+  const parts = q.split(/[,;:\u2013\u2014]\s+/);
+  const last = (parts[parts.length - 1] || '').trim();
+  return parts.length > 1 && QUESTION_WORD_RX.test(last) ? last : q;
+}
+
 /**
  * The draft's close repeats one we already sent: both use "if I/we could", or
- * both open with the same four words. `earlier` = our earlier messages. Pure.
+ * both question clauses open with the same four words. `earlier` = our earlier
+ * messages. Pure.
  */
 export function closeRepeats(draft, earlier = []) {
   const q = closingQuestion(draft);
   if (!q) return false;
-  const op = closeOpener(q);
+  const op = closeOpener(closingClause(q));
   return (Array.isArray(earlier) ? earlier : []).some((e) => {
     const eq = closingQuestion(e);
     if (!eq) return false;
     if (IF_COULD_RX.test(q) && IF_COULD_RX.test(eq)) return true;
-    return !!op && op === closeOpener(eq);
+    return !!op && op === closeOpener(closingClause(eq));
   });
 }
 

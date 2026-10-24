@@ -5,6 +5,12 @@ Notable behavioral changes to the LP MCP server. Newest first.
 Rule-layer (`agent_rules`) changes ship through the database, not through this
 repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
+## 2026-10-24
+
+- **F.0 texts with a reason no longer fail as repeats.** The check for a repeated
+  closing line now reads the question itself, not the budget / better-deal reason
+  in front of it, and that reason counts as the offer.
+
 ## 2026-10-23
 
 F.0 v2: every unsold demo gets an email (the user).
