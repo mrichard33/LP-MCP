@@ -7,6 +7,20 @@ repo — they are recorded in `sql/seeds/` on the date they were applied live.
 
 ## 2026-10-24
 
+John's virtual assistant (the user), behind two switches: `REHASH_VOICE_MODE=assistant`
+(replies) and `F0_TEXT_VOICE=assistant` (the F.0 texts). Nothing changes until they are set.
+
+- **Post-demo replies speak as John's virtual assistant.** Asked "is this a real person?",
+  the bot says it is John's virtual assistant, an AI, not a person. It never speaks as John,
+  and a better-price offer is John's ("If John could …"), never the assistant's own.
+- **"I don't know, I'll leave John a note", and the note is real.** A question the bot
+  cannot answer from what it knows gets an honest "I don't know", and John gets a GHL task
+  (due the next business day), a contact note and a card in #contact-rehash.
+- **The F.0 texts can come from John's assistant too.** 35 new prompt rows: the first text
+  says who is writing, the last signs "- John's assistant". The emails stay the Reece Team's.
+- Three new test scenarios for the bot gate: are-you-AI, an unknown question, booking on
+  John's calendar.
+
 - **F.0 texts with a reason no longer fail as repeats.** The check for a repeated
   closing line now reads the question itself, not the budget / better-deal reason
   in front of it, and that reason counts as the offer.

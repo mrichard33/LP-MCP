@@ -28,7 +28,8 @@ import { F0_EMAIL_PROMPT_VERSION } from '../siro/f0-email.js';
  * F.0 only (2026-10-19): F0_FORMULA_MODE=v1 reads the version-1 rows (the
  * 2026-10-16 copy) and never a Four-Step row, even an active one; four_step
  * reads only version 2, or version 3 when context.siro.text_voice is 'team'
- * (the Reece Team texts, 2026-10-23). context.siro.formula is set by
+ * (the Reece Team texts, 2026-10-23), or version 4 when it is 'assistant' (the
+ * rep's virtual assistant, 2026-10-24). context.siro.formula is set by
  * loadF0Context from the mode. Every other workflow is untouched. Pure.
  */
 export function f0FormulaAllows(p, request, context) {
@@ -46,8 +47,10 @@ export function f0FormulaAllows(p, request, context) {
   const fourStep = context?.siro?.formula === 'four_step';
   // 2026-10-23 (the user): the Four-Step texts in the Reece Team voice are
   // version 3 (F0_TEXT_VOICE=team), the rep's version 2. v1 reads neither.
-  if (!fourStep) return ![2, 3].includes(Number(p?.version ?? 1));
-  return Number(p?.version) === (context?.siro?.text_voice === 'team' ? 3 : 2);
+  // 2026-10-24 (the user): the rep's virtual assistant is version 4 (F0_TEXT_VOICE=assistant).
+  if (!fourStep) return ![2, 3, 4].includes(Number(p?.version ?? 1));
+  const voice = context?.siro?.text_voice;
+  return Number(p?.version) === (voice === 'assistant' ? 4 : voice === 'team' ? 3 : 2);
 }
 
 export async function selectPrompt(context, request) {

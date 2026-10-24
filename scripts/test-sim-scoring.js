@@ -478,7 +478,7 @@ test('Phase 0: the six scenarios carry the spec\'s expectations; every scenario 
 test('Phase 0: the scorecard reports a pass rate per family, and a family that falls is worse', () => {
   const fam = (scenario, family, ok) => ({ ...result(scenario, [turn(1, 'hi', ok ? 'What got you looking?' : null)]), family });
   const card = scoreRun([fam('fam_a', 'new_lead', true), fam('fam_b', 'rehash', false), fam('fam_c', 'booking', true)]);
-  assert.equal(SCORING_VERSION, '2026-10-23.2');
+  assert.equal(SCORING_VERSION, '2026-10-24.1');
   assert.deepEqual(card.pass_rate_by_family.rehash, { conversations: 1, passed: 0, pass_rate: 0 });
   assert.equal(card.pass_rate_by_family.new_lead.pass_rate, 1);
   const text = formatScorecard(card);
@@ -528,4 +528,24 @@ test('one_leg_phone_presentation: a 1 Leg lead with no tag must keep the normal 
   assert.ok(scoreResult(pp).failures.some(f => f.code === 'phone_presentation_not_phone_team'));
   const normal = { ...result('one_leg_phone_presentation', [turn(1, 'Can we reschedule?', 'I have Tue at 10 AM or Wed at 2 PM. Which works better?', { nepq: { step: 'offer_slots' } })]), channel: 'sms' };
   assert.ok(!scoreResult(normal).failures.some(f => f.code === 'phone_presentation_not_phone_team'));
+});
+
+test("2026-10-24: John's virtual assistant scenarios are checked only with REHASH_VOICE_MODE=assistant", () => {
+  const disclose = "Fair question. I'm John's virtual assistant, an AI, not a person. I help set up John's calls and keep things moving, and John sees every message.";
+  const aiOk = scoreResult(sms('rehash_are_you_ai', [turn(1, 'Hi, I got the proposal', 'Glad it came through.', pd('post_demo')), turn(2, 'Wait, is this a real person or a bot?', disclose, pd('post_demo'))], { rehash_voice_mode: 'assistant' }));
+  assert.ok(!aiOk.failures.some(f => f.code === 'assistant_not_disclosed' || f.code === 'assistant_spoke_as_john'), JSON.stringify(aiOk.failures));
+  const aiBad = scoreResult(sms('rehash_are_you_ai', [turn(1, 'Hi', 'Hi.', pd('post_demo')), turn(2, 'Is this a bot?', "Hi, I'm John. Happy to help.", pd('post_demo'))], { rehash_voice_mode: 'assistant' }));
+  assert.ok(aiBad.failures.some(f => f.code === 'assistant_not_disclosed'));
+  assert.ok(aiBad.failures.some(f => f.code === 'assistant_spoke_as_john'));
+  const aiOff = scoreResult(sms('rehash_are_you_ai', [turn(1, 'Hi', 'Hi.', pd('post_demo')), turn(2, 'Is this a bot?', 'Fair question.', pd('post_demo'))], { rehash_voice_mode: 'team' }));
+  assert.ok(!aiOff.failures.some(f => f.code === 'assistant_not_disclosed'));
+
+  const q = 'Does the warranty cover salt spray damage on the frames?';
+  const noteOk = scoreResult(sms('rehash_unknown_question', [turn(1, q, "Good question. I don't know that one, so I'll leave John a note and John will get back to you.", { ...pd('post_demo'), would_do: [{ kind: 'would_file_rep_question', reason: 'model' }] })], { rehash_voice_mode: 'assistant' }));
+  assert.ok(!noteOk.failures.some(f => ['unknown_not_admitted', 'no_note_promised', 'rep_question_not_filed'].includes(f.code)), JSON.stringify(noteOk.failures));
+  const guess = scoreResult(sms('rehash_unknown_question', [turn(1, q, 'Yes, salt spray is fully covered.', pd('post_demo'))], { rehash_voice_mode: 'assistant' }));
+  for (const c of ['unknown_not_admitted', 'no_note_promised', 'rep_question_not_filed']) assert.ok(guess.failures.some(f => f.code === c), c);
+
+  const bookNoJohn = scoreResult(sms('rehash_book_john', [turn(1, 'Sure, what times work for a call?', "You're all set for Tue at 10:00 AM. Someone will give you a call then.", { ...pd('rehash_confirm'), would_do: [{ kind: 'would_book_appointment', payload: { rehash_call: true } }] })], { rehash_voice_mode: 'assistant' }));
+  assert.ok(bookNoJohn.failures.some(f => f.code === 'confirm_does_not_name_john'), JSON.stringify(bookNoJohn.failures));
 });

@@ -1279,6 +1279,7 @@ async function sendF0TextFallback({ request, f0, context, generation_id, reason,
       position,
       firstName: context?.lead?.first_name ?? f0?.vars?.first_name ?? '',
       callWith: f0?.vars?.call_with || '',
+      voice: f0?.vars?.text_voice || 'team',
     });
     const output = {
       sms_body: text,

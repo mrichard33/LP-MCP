@@ -83,6 +83,13 @@ export const directLineIdentity = (signature) => [
   `If the customer asks who they are talking to or asks for your name, the answer is ${signature} — say it in the BODY of the message. Do not describe this as a shared or team number; it is not.`,
 ];
 
+// 2026-10-24 (the user): REHASH_VOICE_MODE=assistant. The line is the rep's,
+// answered by the rep's virtual assistant.
+export const assistantLineIdentity = (rep) => [
+  `This reply goes out from ${rep}'s line, written by ${rep}'s virtual assistant (you).`,
+  `If the customer asks who they are talking to or for your name, you are ${rep}'s virtual assistant — say it in the BODY of the message. You are never ${rep} and never a person. Sign off, when you sign, as "— ${rep}'s assistant".`,
+];
+
 // Opens the line-identity block; the branches below fill it in.
 // Was response-generator.js:1213.
 export const LINE_IDENTITY_HEADER = [

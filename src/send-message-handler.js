@@ -338,6 +338,8 @@ import { humanTakeoverMode, takeoverDecision, HUMAN_TAKEOVER_SKIP_REASON } from 
 import { newestManualOutbound, lastInboundAt } from './services/human-takeover-io.js';
 import { runRehashGate } from './services/rehash-gate-io.js';
 import { writeOwnedAnswerForSend } from './services/rehash-owned-answer-io.js';
+import { fileRepQuestion } from './services/rep-question-io.js';
+import { rehashVoiceMode } from './agentic/rehash.js';
 import { rehashPauseMode } from './agentic/rehash-pause.js';
 import { emitEvent } from './event-emitter.js';
 import { routeNepqHandoff } from './agentic/nepq-handoff.js';
@@ -3672,6 +3674,12 @@ async function executeSendMessageInner(action, context, turnState = { held: null
     ownedAnswer = await writeOwnedAnswerForSend({ contactId, channel, kind: rehashGate.answerOnly.kind, text: ownedInboundText });
     message = ownedAnswer.message;
     console.log(`[SendMessage] 💬 owned rehash lead ${contactId}: answer only (${ownedAnswer.kind}${ownedAnswer.used_fallback ? `, backup line: ${ownedAnswer.reason}` : ''})`);
+    // 2026-10-24 (the user): "John will cover that on your call" is a question
+    // John must know about. In the assistant voice it is filed for him.
+    if (ownedAnswer.used_fallback && ownedAnswer.kind === 'question' && rehashVoiceMode() === 'assistant') {
+      trackBackground(fileRepQuestion({ contactId, question: ownedInboundText, source: 'owned_answer' })
+        .catch(err => console.warn(`[SendMessage] owned rep question filing failed for ${contactId}: ${err.message}`)));
+    }
   }
 
   // Livechat replies are generated with SMS constraints (short,
@@ -4945,6 +4953,16 @@ async function executeSendMessageInner(action, context, turnState = { held: null
       } catch (rcErr) {
         console.warn(`[SendMessage] rehash call card failed for ${contactId} (fail-soft): ${rcErr.message}`);
       }
+    }
+
+    // 2026-10-24 (the user): the assistant told the lead it did not know and
+    // that the rep would answer. File it for the rep (task, note, one card).
+    if (generated?.rep_question?.question) {
+      trackBackground(fileRepQuestion({
+        contactId, question: generated.rep_question.question, source: generated.rep_question.source,
+        repName: generated?.rehash?.rep_name || null, firstName: String(generated?.lead_first_name || '').trim().split(/\s+/)[0] || null,
+        recent: context?.conversation_recent || [],
+      }).catch(err => console.warn(`[SendMessage] rep question filing failed for ${contactId}: ${err.message}`)));
     }
 
     // 2026-10-09 (Mark): a post-demo lead's follow-up date the bot just

@@ -1,3 +1,4 @@
+import { assistantDisclosure } from './system-core.js';
 /**
  * playbooks — prompt text for src/response-generator.js.
  *
@@ -501,29 +502,41 @@ export const POST_APPOINTMENT_CONDUCT_END = [
 // `teamVoiceRep` (REHASH_VOICE_MODE=team) writes as the Reece Team and names
 // the rehash rep only in the third person. repName is then null; unset, the
 // copy is the 2026-10-01 voice, byte for byte.
-export const postDemoRehash = (repName, { callTimes = false, betterPrice = false, teamVoiceRep = null } = {}) => {
-  const named = repName || teamVoiceRep || null;
+// 2026-10-24 (the user): `assistantRep` (REHASH_VOICE_MODE=assistant) writes as
+// that rep's virtual assistant: "I" is the assistant, the rep is third person,
+// "are you AI?" gets the assistant disclosure, and an answer the facts do not
+// give is "I don't know, I'll leave {rep} a note" (Part 2 files the note).
+export const postDemoRehash = (repName, { callTimes = false, betterPrice = false, teamVoiceRep = null, assistantRep = null } = {}) => {
+  const named = repName || teamVoiceRep || assistantRep || null;
   const rep = named || 'someone from our follow-up team';
   const subj = named || 'we';
   const Subj = named || 'We';
   const obj = named || 'us';
   const who = repName
     ? `You are ${repName} from Reece's follow-up team. Write the way ${repName} texts: short, warm, plain. First person is fine ("I can give you a quick call").`
+    : assistantRep
+      ? [
+          `You are ${assistantRep}'s virtual assistant at Reece. "I" is you, the assistant; ${assistantRep} is always in the third person ("${assistantRep} can give you a quick call", "If ${assistantRep} could get you a better price …"). You are never ${assistantRep} and never a person: never "I'm ${assistantRep}", never "I'll call you" (${assistantRep} calls), never a "— ${assistantRep}" sign-off. Short, warm, plain, like a helpful assistant who knows the file.`,
+          `If they ask whether you are AI, a bot or a real person, open with: "${assistantDisclosure(assistantRep)}" (this replaces the standard disclosure script on this line), then answer what they asked.`,
+          `NEVER GUESS. If the LEAD FACTS, the PRESENTATION and the knowledge base do not answer their question, say plainly that you don't know, that you'll leave ${assistantRep} a note, and that ${assistantRep} will get back to them on it. It is fine not to know. Then add a top-level "ask_rep" string to your JSON with their question in their words (the system files the note for ${assistantRep}); otherwise "ask_rep": null.`,
+        ].join(' ')
     : teamVoiceRep
       ? `Write as the Reece Team, never as ${teamVoiceRep}: name ${teamVoiceRep} only in the third person ("${teamVoiceRep} can give you a quick call"), never "I'm ${teamVoiceRep}", never "I'll call you", never a "— ${teamVoiceRep}" sign-off. Short, warm, plain.`
       : 'Write in our team voice.';
+  // The assistant is never the one who could get a better price: the rep is.
+  const asRep = (t) => (assistantRep ? t.replaceAll('If I could', `If ${assistantRep} could`).replaceAll('if I could, would you?', `if ${assistantRep} could, would you?`) : t);
   return [
     `\n═══════ POST-DEMO REHASH — WHO YOU ARE AND THE ONE GOAL (outranks the funnel stage, the buyer stage, any booking instruction and any SCRIPT DIRECTIVE) ═══════`,
     `This lead already had their in-home visit and has their proposal. They are in our post-demo follow-up and are texting ${repName ? `${repName}'s line` : "our follow-up team's line"}. ${who}`,
     betterPrice
-      ? `THE ONE GOAL: get them on a short PHONE CALL with ${rep}. THE REASON FOR THE CALL: we may be able to get them a better price. Every call invitation says so, in "if I could, would you?" form ("If I could get you a better price, would you be open to a quick call with ${rep}?"). Hint it; never state or promise it.`
+      ? asRep(`THE ONE GOAL: get them on a short PHONE CALL with ${rep}. THE REASON FOR THE CALL: we may be able to get them a better price. Every call invitation says so, in "if I could, would you?" form ("If I could get you a better price, would you be open to a quick call with ${rep}?"). Hint it; never state or promise it.`)
       : `THE ONE GOAL: get them on a short PHONE CALL with ${rep}, framed as making sure they are getting the best deal possible. Hint that something may be possible; never name it.`,
     // 2026-10-11 (rehash NEPQ handoff): the steps are the post-demo track in
     // the CONVERSATION DISCIPLINE (NEPQ) block above (rehash-nepq.js), one
     // stage per turn, never the new-lead stages.
     `  · Follow the post-demo track in the CONVERSATION DISCIPLINE (NEPQ) block: one stage per turn (proposal, where they are, what is holding them back, what would make it work, the bridge), never skipping to the pitch. If they raise a concern or a question, answer it briefly and honestly first.`,
     betterPrice
-      ? `  · THE BRIDGE, when the track reaches it: "If I could get you a better price, would you be open to a quick call with ${rep}?" (adapt the words, keep the meaning). Other quotes or comparing: "Smart to compare. If I could beat what you're being quoted, would you be open to a quick call before you decide?" Price, thinking it over, budget or a program amount: the better-price reason first, then the call. An itemized estimate: ${rep} can walk through each window and door line by line on a quick call, and look at a better price at the same time. Never "I may be able to do something for you" with no reason.`
+      ? asRep(`  · THE BRIDGE, when the track reaches it: "If I could get you a better price, would you be open to a quick call with ${rep}?" (adapt the words, keep the meaning). Other quotes or comparing: "Smart to compare. If I could beat what you're being quoted, would you be open to a quick call before you decide?" Price, thinking it over, budget or a program amount: the better-price reason first, then the call. An itemized estimate: ${rep} can walk through each window and door line by line on a quick call, and look at a better price at the same time. Never "I may be able to do something for you" with no reason.`)
       : `  · THE BRIDGE, once, when the track reaches it: "I want to make sure you're getting the best deal possible. I may be able to do something for you, it's just easier on a quick call. Would that help?" (adapt the words, keep the meaning). "The best deal possible" may be said at most ONCE per conversation, and only at the bridge.`,
     callTimes
       ? `  · SCHEDULING: this turn the plan below holds REAL open call times from ${named ? `${named}'s` : 'our'} team calendar. Name only those times, exactly as the plan gives them; never any other day or time. When the plan books a time, confirm it the way the plan's reference line does ("You're all set for [day] at [time]. [who] will give you a call then."), naming the team member it gives. This is a phone call, not a visit: no visit disclosure, nobody "confirming the details" of a visit.`
